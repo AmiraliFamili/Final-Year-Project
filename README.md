@@ -23,4 +23,12 @@ logbook on hackmd -> date, cleaner, short descriptions of papers, errors, good g
 
 
 
-!!! How to load the data in batches and workthrough it batch size times 
+TODO : 
+
+    - more plots for comparing the accuracy
+    - more datasets ? 
+    - QWEN models -> 0.5, 7 and QwQ 2025
+    - update the logbook
+    - email to supervisor 
+    - best hyperparameter setting -> try different probe designs
+    - 

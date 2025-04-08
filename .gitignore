@@ -1,5 +1,12 @@
 .venv/
-__pycache__/
-.pytest_cache/
+__pycache__
 .vscode/
 hidden_states/
+hidden_states/*
+wokspace/
+Unofficial_Datasets/
+*.png
+*.json
+Trials/
+probe_logs/
+BERT_Results
