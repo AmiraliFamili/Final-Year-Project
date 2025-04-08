@@ -290,6 +290,7 @@ class ISEARDataset:
         """Apply all preprocessing steps to the dataset."""
         # Clean text
         self.df['clean_text'] = self.df['SIT'].apply(self._preprocess_text)
+        self.df = self.df[['EMOT', 'clean_text']]
     
     def get_data(self) -> pd.DataFrame:
         """Return the processed DataFrame."""

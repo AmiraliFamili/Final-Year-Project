@@ -105,12 +105,12 @@ class GoEmotionDataset:
         
         # Process labels and emotions
         self.df['labels'] = self.df['labels'].apply(self._string_to_list)
-        self.df['emotions'] = self.df['labels'].apply(
-            lambda x: [self.EMOTIONS[i] for i in x]
-        )
+        self.df = self.df.drop(columns=['text'])
+        self.df = self.df.drop(columns=['id'])
+        #self.df['emotions'] = self.df['labels'].apply(lambda x: [self.EMOTIONS[i] for i in x])
         
         # Add sentiment category
-        self.df['sentiment'] = self.df['emotions'].apply(self._get_sentiment_category)
+        #self.df['sentiment'] = self.df['emotions'].apply(self._get_sentiment_category)
     
     def _get_sentiment_category(self, emotion_list: List[str]) -> str:
         """Categorize the overall sentiment of a text based on its emotions."""
