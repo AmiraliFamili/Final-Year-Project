@@ -16,7 +16,7 @@ def analyze_hidden_states(directory='hidden_states'):
     
     # Iterate through all JSON files in the directory
     for filename in os.listdir(directory):
-        if filename.endswith('.json') and not filename.startswith('all_hidden_states_'):
+        if filename.endswith('.json') and not filename.startswith('all_hidden_states'):
             filepath = os.path.join(directory, filename)
             print(f"\nAnalyzing {filename}...")
             
