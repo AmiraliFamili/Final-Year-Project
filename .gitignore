@@ -10,5 +10,4 @@ Unofficial_Datasets/
 Trials/
 probe_logs/
 BERT_Results/
-QWEN_hidden_states/
 Training-Validating_probs_MLP_old.ipynb
