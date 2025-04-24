@@ -6,8 +6,8 @@ hidden_states/*
 wokspace/
 Unofficial_Datasets/
 *.png
-*.json
 Trials/
 probe_logs/
+hparam_results/
 BERT_Results/
 Training-Validating_probs_MLP_old.ipynb
