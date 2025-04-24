@@ -8,6 +8,6 @@ Unofficial_Datasets/
 *.png
 Trials/
 probe_logs/
-hparam_results/
+hparam_results/*
 BERT_Results/
 Training-Validating_probs_MLP_old.ipynb
