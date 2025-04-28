@@ -8,6 +8,7 @@ Unofficial_Datasets/
 *.png
 *.json
 *.pt
+*.pptx
 Trials/
 probe_logs/
 hparam_results/*
