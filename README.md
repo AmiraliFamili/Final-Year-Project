@@ -31,4 +31,7 @@ TODO :
     - update the logbook
     - email to supervisor 
     - best hyperparameter setting -> try different probe designs
-    - 
+    - Logbook :::: 
+    	-- The text for each cell should be longer, more detailed and it should have the links of the articles and resources used
+	-- Write the main structure of the log book (generally what happened around that date). 
+	-- logbook : some editor next to you that you put everything you did, what you learned and was important, summaries, MMMMOOOORRRRREEEEE detail, all the detail. 
