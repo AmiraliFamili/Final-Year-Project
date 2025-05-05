@@ -103,8 +103,7 @@ class GoEmotionDataset:
         # Clean text
         self.df['clean_text'] = self.df['text'].apply(self._preprocess_text)
         
-        # Process labels and emotions
-        
+        # Process labels and emotions: convert the labels to proper lists.
         # self.df['labels'] = self.df['labels'].apply(self._string_to_list)
         
         self.df = self.df.drop(columns=['text', 'id'])
@@ -125,11 +124,11 @@ class GoEmotionDataset:
 
 
 # Example usage:
-def get_go():
+def get_go(device_path=''):
     dataset = GoEmotionDataset(
-        train_path='Go_Emotion_Google/go_emotions_train.csv',
-        test_path='Go_Emotion_Google/go_emotions_test.csv',
-        val_path='Go_Emotion_Google/go_emotions_validation.csv'
+        train_path=device_path+'Go_Emotion_Google/go_emotions_train.csv',
+        test_path=device_path+'Go_Emotion_Google/go_emotions_test.csv',
+        val_path=device_path+'Go_Emotion_Google/go_emotions_validation.csv'
     )
     
     return dataset.get_data()
