@@ -1022,7 +1022,7 @@ def build_dataset_storage_paths(dataset_dir: str | Path) -> dict[str, Path]:
 
 
 def flush_array(array: np.ndarray) -> None:
-    """Flush memmap data and force it to physical storage using fsync."""
+    """Flush memmap data and force it to physical storage using fsync on the file only."""
     if not isinstance(array, np.memmap):
         return
     array.flush()
@@ -1033,11 +1033,7 @@ def flush_array(array: np.ndarray) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
-    dir_fd = os.open(str(path.parent), os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+            
 
 
 def _metadata_matches_completion_signature(metadata: Mapping[str, Any], expected: Mapping[str, Any] | None) -> bool:
@@ -1151,6 +1147,268 @@ def is_v2_sample_ids(path: Path) -> bool:
         return arr.dtype == object
     except Exception:
         return False
+
+
+
+# =============================================================================
+# RUNTIME REPORTER (for progress and telemetry)
+# =============================================================================
+
+class RuntimeReporter:
+    """INFO=speed/state, VERBOSE=forensics, DEBUG=batch records, CRITICAL=failures/completion."""
+    def __init__(self, dataset_name: str, total: int, initial_completed: int,
+                 show_verbose: bool, show_info: bool, show_critical: bool, show_debug: bool,
+                 events_path: Path, runtime_path: Path, context: Mapping[str, Any]):
+        self.dataset_name = dataset_name
+        self.total = int(total)
+        self.initial_completed = int(initial_completed)
+        self.completed = int(initial_completed)
+        self.show_verbose = show_verbose
+        self.show_info = show_info
+        self.show_critical = show_critical
+        self.show_debug = show_debug
+        self.events_path = events_path
+        self.runtime_path = runtime_path
+        self.context = dict(context)
+        self.start = time.perf_counter()
+        self.last_report = self.start
+        self.last_report_completed = self.completed
+        self.last_stage = "initialising"
+        self.last_stage_started = self.start
+        self.successful_batches = 0
+        self.last_batch = {}
+        self.recent_batches = deque(maxlen=DEBUG_RECENT_BATCHES)
+        self.batch_durations = deque(maxlen=DIAGNOSTIC_WINDOW)
+        self.stage_totals = {}
+        self.peak_rss_gb = 0.0
+        self.minimum_available_ram_gb = math.inf
+        self.anomaly_count = 0
+        self.slow_batch_count = 0
+        self._events_file = None
+        self.progress = tqdm(
+            total=self.total, initial=self.completed,
+            desc=dataset_name, unit="sample",
+            dynamic_ncols=True, mininterval=PROGRESS_REFRESH,
+            disable=not show_info
+        )
+
+    @property
+    def elapsed(self):
+        return max(1e-9, time.perf_counter() - self.start)
+
+    @property
+    def new_samples(self):
+        return max(0, self.completed - self.initial_completed)
+
+    @property
+    def samples_per_sec(self):
+        return self.new_samples / self.elapsed
+
+    @property
+    def rolling_mean(self):
+        return sum(self.batch_durations) / len(self.batch_durations) if self.batch_durations else 0.0
+
+    @property
+    def rolling_median(self):
+        return float(median(self.batch_durations)) if self.batch_durations else 0.0
+
+    @property
+    def rolling_max(self):
+        return max(self.batch_durations) if self.batch_durations else 0.0
+
+    @property
+    def rolling_p95(self):
+        if not self.batch_durations:
+            return 0.0
+        v = sorted(self.batch_durations)
+        return float(v[min(len(v)-1, max(0, math.ceil(.95*len(v))-1))])
+
+    def __enter__(self):
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        self._events_file = self.events_path.open("a", encoding="utf-8")
+        self.write_runtime_snapshot("running")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close_current_stage()
+        self.write_runtime_snapshot("error" if exc_type else "finished")
+        self._flush()
+        if self._events_file is not None:
+            self._events_file.close()
+            self._events_file = None
+        self.progress.close()
+
+    def _flush(self):
+        if self._events_file is not None:
+            self._events_file.flush()
+
+    def close_current_stage(self):
+        now = time.perf_counter()
+        self.stage_totals[self.last_stage] = self.stage_totals.get(self.last_stage, 0.0) + now - self.last_stage_started
+        self.last_stage_started = now
+
+    def set_stage(self, stage: str):
+        now = time.perf_counter()
+        self.stage_totals[self.last_stage] = self.stage_totals.get(self.last_stage, 0.0) + now - self.last_stage_started
+        self.last_stage = stage
+        self.last_stage_started = now
+
+    def event(self, kind: str, message: str, *, force: bool = False, debug: bool = False, **fields: Any):
+        record = {
+            **self.context,
+            "time": time.time(),
+            "elapsed_seconds": self.elapsed,
+            "dataset": self.dataset_name,
+            "kind": kind,
+            "message": message,
+            "completed": self.completed,
+            "stage": self.last_stage,
+            **fields
+        }
+        if self._events_file is not None:
+            self._events_file.write(json.dumps(record, ensure_ascii=False, default=str, sort_keys=True) + "\n")
+            self._flush()
+        if debug and not self.show_debug:
+            return
+        if kind == "batch" and not (self.show_debug or force):
+            return
+        if self.show_info or force:
+            self.progress.write(f"[{kind}] {message}") if self.show_info else print(f"[{kind}] {message}")
+
+    def write_runtime_snapshot(self, status: str = "running"):
+        write_runtime_diagnostic(
+            self.runtime_path,
+            runtime_diagnostic_snapshot(
+                stage=self.last_stage,
+                model_name=self.context.get("model"),
+                dataset_name=self.dataset_name,
+                experiment_id=self.context.get("experiment_id"),
+                hyperparameter_hash=self.context.get("hyperparameter_hash"),
+                extra={
+                    "status": status,
+                    "completed": self.completed,
+                    "total": self.total,
+                    "new_samples": self.new_samples,
+                    "samples_per_second": self.samples_per_sec,
+                    "last_batch": self.last_batch,
+                    "recent_batches": list(self.recent_batches),
+                    "stage_totals_seconds": self.stage_totals,
+                    "rolling_mean_batch_seconds": self.rolling_mean,
+                    "rolling_median_batch_seconds": self.rolling_median,
+                    "rolling_p95_batch_seconds": self.rolling_p95,
+                    "rolling_max_batch_seconds": self.rolling_max,
+                    "anomaly_count": self.anomaly_count,
+                    "slow_batch_count": self.slow_batch_count,
+                }
+            )
+        )
+
+    def batch_finished(self, *, start: int, end: int, newly_completed: int,
+                       batch_size: int, metrics: Mapping[str, Any]):
+        self.completed += int(newly_completed)
+        self.successful_batches += 1
+        rec = {
+            "start": start,
+            "end": end,
+            "batch_size": batch_size,
+            "newly_completed": newly_completed,
+            **dict(metrics)
+        }
+        self.last_batch = rec
+        self.recent_batches.append(rec)
+        self.batch_durations.append(float(metrics["total_seconds"]))
+        if self.show_info:
+            self.progress.update(int(newly_completed))
+            self.progress.set_postfix(
+                sp=f"{self.samples_per_sec:.1f}",
+                fw=f"{metrics['forward_seconds']:.2f}s",
+                last=f"{metrics['total_seconds']:.2f}s",
+                ram=f"{metrics.get('available_gb',0):.2f}G"
+            )
+        self.event("batch", f"{start}:{end} processed", debug=True, batch=rec)
+        self.maybe_runtime_report()
+
+    def maybe_runtime_report(self, force: bool = False):
+        now = time.perf_counter()
+        sample_delta = self.completed - self.last_report_completed
+        if not force and now - self.last_report < RUNTIME_REPORT_INTERVAL_SECONDS and sample_delta < RUNTIME_REPORT_INTERVAL_SAMPLES:
+            return
+        memory, storage, rss = get_memory_info(), get_external_storage_usage(), get_process_rss_gb()
+        if rss is not None:
+            self.peak_rss_gb = max(self.peak_rss_gb, rss)
+        self.minimum_available_ram_gb = min(self.minimum_available_ram_gb, memory["available_gb"])
+        last = self.last_batch
+        rate = self.samples_per_sec
+        remaining = max(0, self.total - self.completed)
+        eta = remaining / rate if rate > 0 else math.inf
+        anomaly = False
+        ratio = 0.0
+        if len(self.batch_durations) >= 5 and self.rolling_median > 0:
+            ratio = float(last.get("total_seconds", 0.0)) / self.rolling_median
+            anomaly = ratio >= SLOW_BATCH_MULTIPLIER
+            if anomaly:
+                self.anomaly_count += 1
+                self.slow_batch_count += 1
+        panel = (
+            "\n" + _separator("─") +
+            f"\nRUNTIME / SPEED TELEMETRY :: {self.dataset_name}\n" +
+            _separator("─") + "\n" +
+            f"  Progress             : {self.completed:,}/{self.total:,} ({100*self.completed/max(1,self.total):.2f}%)\n"
+            f"  Newly computed       : {self.new_samples:,}\n"
+            f"  Wall time            : {_format_duration(self.elapsed)}\n"
+            f"  Throughput           : {rate:.2f} samples/s\n"
+            f"  ETA                  : {_format_duration(eta) if math.isfinite(eta) else 'unknown'}\n"
+            f"  Current stage        : {self.last_stage}\n\n"
+            "  LAST BATCH\n"
+            f"    Range              : {last.get('start','?')}:{last.get('end','?')}\n"
+            f"    New samples        : {last.get('newly_completed','?')}\n"
+            f"    Total              : {_format_duration(last.get('total_seconds',0.0))}\n"
+            f"    Forward            : {_format_duration(last.get('forward_seconds',0.0))}\n"
+            f"    Tokenization       : {_format_duration(last.get('tokenize_seconds',0.0))}\n"
+            f"    Input transfer     : {_format_duration(last.get('transfer_seconds',0.0))}\n"
+            f"    Pooling            : {_format_duration(last.get('pooling_seconds',0.0))}\n"
+            f"    Conversion         : {_format_duration(last.get('convert_seconds',0.0))}\n"
+            f"    Memmap write       : {_format_duration(last.get('write_seconds',0.0))}\n"
+            f"    Flush              : {_format_duration(last.get('flush_seconds',0.0))}\n"
+            f"    Sequence length    : {last.get('seq_len','?')}\n"
+            f"    Tokens             : {last.get('actual_tokens','?')}\n"
+            f"    Token throughput   : {last.get('tokens_per_second',0.0):.2f} tokens/s\n\n"
+            "  ROLLING PERFORMANCE\n"
+            f"    Mean batch         : {self.rolling_mean:.3f}s\n"
+            f"    Median batch       : {self.rolling_median:.3f}s\n"
+            f"    P95 batch          : {self.rolling_p95:.3f}s\n"
+            f"    Max batch          : {self.rolling_max:.3f}s\n"
+            f"    Slow batches       : {self.slow_batch_count:,}\n"
+            f"    Current anomaly    : {'YES (x%.2f)' % ratio if anomaly else 'NO'}\n\n"
+            "  MEMORY / STORAGE\n"
+            f"    RAM available      : {memory['available_gb']:.2f} GiB\n"
+            f"    Process RSS        : {rss if rss is not None else 'unavailable'}\n"
+            f"    Peak RSS           : {self.peak_rss_gb:.2f} GiB\n"
+            f"    Minimum RAM        : {self.minimum_available_ram_gb:.2f} GiB\n"
+            f"    External free      : {storage['available_gb']:.2f} GiB\n"
+            f"    Successful batches : {self.successful_batches:,}\n"
+            f"    Debug batch output : {'ON' if self.show_debug else 'OFF'}\n" +
+            _separator("─")
+        )
+        if self.show_info:
+            self.progress.write(panel)
+        elif self.show_verbose:
+            print(panel)
+        self.event(
+            "runtime", "periodic runtime telemetry",
+            throughput_samples_per_sec=rate,
+            eta_seconds=None if not math.isfinite(eta) else eta,
+            available_ram_gb=memory["available_gb"],
+            process_rss_gb=rss,
+            external_free_gb=storage["available_gb"],
+            anomaly=anomaly,
+            last_batch=dict(last)
+        )
+        self.write_runtime_snapshot()
+        self.last_report = now
+        self.last_report_completed = self.completed
+
+
 
 
 # ---- repair / ensure auxiliary files ----
@@ -1513,22 +1771,17 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
                     if pooled_np.shape != expected_batch: raise RuntimeError(f"Unexpected pooled shape: actual={pooled_np.shape} expected={expected_batch}")
                     if not np.isfinite(pooled_np).all(): raise RuntimeError("Pooled hidden states contain NaN/Inf")
 
-                    reporter.set_stage("memmap_write"); t = time.perf_counter()
+                    reporter.set_stage("memmap_write")
+                    t = time.perf_counter()
                     pooled_final = pooled_np.astype(storage_dtype, copy=False)
-                    # Validate batch before writing
-                    temp_path = paths["data_dir"] / f"batch_{batch_start}_{end}.npy"
-                    np.save(temp_path, pooled_final)
-                    temp_data = np.load(temp_path)
-                    if not np.array_equal(temp_data, pooled_final):
-                        raise RuntimeError("Temporary batch file verification failed")
                     states[batch_start:end] = pooled_final
                     completed[batch_start:end] = True
-                    write_s = time.perf_counter()-t
+                    write_s = time.perf_counter() - t
 
-                    # Update global checksum
-                    update_checksum(pooled_final)
+                    # If you keep incremental checksum:
+                    # checksum_hasher.update(pooled_final.tobytes())
 
-                    # Write batch integrity hash (existing)
+                    # Write batch integrity hash
                     batch_hash = hashlib.sha256(pooled_final.tobytes()).hexdigest()
                     with paths["integrity"].open("a", encoding="utf-8") as f:
                         f.write(json.dumps({"batch_start": batch_start, "batch_end": end, "hash": batch_hash, "timestamp": time.time()}) + "\n")
