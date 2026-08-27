@@ -17,6 +17,7 @@ Key features:
 import json
 import hashlib
 import os
+import pandas as pd
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
