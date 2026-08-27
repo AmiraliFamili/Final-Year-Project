@@ -16,3 +16,29 @@ BERT_Results/
 Training-Validating_probs_MLP_old.ipynb
 results/
 Result Trials/
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Environment/secrets
+.env
+.env.*
+
+# Python build files
+*.egg-info/
+dist/
+build/
