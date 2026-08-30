@@ -1613,18 +1613,42 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
         if cand in dataset_cols:
             label_column = cand
             break
-    if label_column:
-        labels = np.asarray(dataset[label_column])
-        if labels.dtype.kind in ("U", "S", "O"):
-            unique_labels, encoded = np.unique(labels, return_inverse=True)
-            np.save(paths["label_codes"], unique_labels)
-            labels = encoded.astype(np.int32)
-        else:
-            # Ensure label_codes exists for numeric labels
-            labels = labels.astype(np.int64)      # force consistent dtype
-            if not paths["label_codes"].exists():
-                unique_labels = np.unique(labels)
-                np.save(paths["label_codes"], unique_labels)
+    # Convert labels to a consistent integer encoding.
+    raw_label_fingerprint = stable_hash({"values": [str(v) for v in dataset[label_column]]}, 24)
+    labels_raw = np.asarray(dataset[label_column], dtype=object)
+    # Determine if multi-label (any element is a list/tuple)
+    is_multi = any(isinstance(x, (list, tuple, set, np.ndarray)) for x in labels_raw[:100])
+
+    if is_multi:
+        # For multi-label, flatten all labels to get class set
+        all_labels = []
+        for x in labels_raw:
+            if isinstance(x, (list, tuple, set, np.ndarray)):
+                all_labels.extend(x)
+            else:
+                all_labels.append(x)
+        unique_labels = sorted(set(all_labels))
+        label_to_id = {lbl: i for i, lbl in enumerate(unique_labels)}
+        # Save as object array of lists of ints (cannot be memory-mapped, use np.save)
+        labels = np.empty(len(labels_raw), dtype=object)
+        for i, x in enumerate(labels_raw):
+            if isinstance(x, (list, tuple, set, np.ndarray)):
+                labels[i] = [label_to_id[y] for y in x]
+            else:
+                labels[i] = [label_to_id[x]]
+        np.save(paths["label_codes"], np.array(unique_labels, dtype=object))
+        np.save(paths["labels"], labels)   # object array, not memmap
+        labels_info = {"label_column": label_column, "labels_dtype": "object", "label_codes_path": str(paths["label_codes"])}
+    else:
+        # Single-label: existing logic
+        unique_labels, encoded = np.unique(labels_raw, return_inverse=True)
+        labels = encoded.astype(np.int64)
+        np.save(paths["label_codes"], unique_labels)
+        # Save as memmap
+        labels_mmap = np.lib.format.open_memmap(paths["labels"], mode="w+", dtype=labels.dtype, shape=(len(labels),))
+        labels_mmap[:] = labels
+        flush_array(labels_mmap)
+        labels_info = {"label_column": label_column, "labels_dtype": str(labels.dtype), "label_codes_path": str(paths["label_codes"])}
         if paths["labels"].exists():
             labels_mmap = np.load(paths["labels"], mmap_mode="r+")
             if labels_mmap.shape != (n_samples,) or labels_mmap.dtype != labels.dtype:
@@ -1638,16 +1662,16 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
                 )
                 labels_mmap[:] = labels
                 flush_array(labels_mmap)
+            else:
+                labels_mmap = np.lib.format.open_memmap(
+                    paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,)
+                )
+                labels_mmap[:] = labels
+                flush_array(labels_mmap)
+            labels_info = {"label_column": label_column, "labels_dtype": str(labels.dtype), "label_codes_path": str(paths["label_codes"]) if paths["label_codes"].exists() else None}
         else:
-            labels_mmap = np.lib.format.open_memmap(
-                paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,)
-            )
-            labels_mmap[:] = labels
-            flush_array(labels_mmap)
-        labels_info = {"label_column": label_column, "labels_dtype": str(labels.dtype), "label_codes_path": str(paths["label_codes"]) if paths["label_codes"].exists() else None}
-    else:
-        labels_mmap = None
-        labels_info = {"label_column": None, "labels_dtype": None, "label_codes_path": None}
+            labels_mmap = None
+            labels_info = {"label_column": None, "labels_dtype": None, "label_codes_path": None}
 
     # Sample IDs (v2) – ensure they exist
     if not paths["sample_ids"].exists() or not is_v2_sample_ids(paths["sample_ids"]):

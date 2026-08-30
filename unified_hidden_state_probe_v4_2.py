@@ -281,11 +281,14 @@ def sample_indices(n: int, max_n: int, seed: int) -> np.ndarray:
 
 
 def fingerprint_values(values: Sequence[Any], *, length: int = 20) -> str:
+    """Mirror the extraction pipeline's dataset_fingerprint.
+    Uses first/last 16 samples to match extraction's stable_hash input.
+    """
     vals = one_dim_strings(values)
     return stable_hash({
         "n": len(vals),
-        "head": vals[:128],
-        "tail": vals[-128:] if vals else [],
+        "head": vals[:16],
+        "tail": vals[-16:] if vals else [],
     }, length)
 
 
@@ -1124,36 +1127,58 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
 
 def canonical_isear_target(df: pd.DataFrame, contract: DatasetContract):
     label_col, resolution = resolve_column(
-        df, contract.label_column,
-        ["emotion", "label", "labels", "category", "emotion_label"],
-        role="label",
-    )
+            df, contract.label_column,
+            ["emotion", "label", "labels", "category", "emotion_label"],
+            role="label",
+        )
+    raw_values = df[label_col].tolist()
     aliases = {
         "joy": "joy", "fear": "fear", "anger": "anger", "sadness": "sadness",
         "disgust": "disgust", "shame": "shame", "guilt": "guilt",
     }
-    raw = [_normalise_name(x) for x in df[label_col].tolist()]
-    normalised: list[str] = []
-    for i, x in enumerate(raw):
-        key = aliases.get(x)
-        if key is None:
-            raise ValueError(f"ISEAR row {i} has unknown emotion {x!r}; expected {ISEAR_CLASSES}")
-        normalised.append(key)
-    order = contract.class_order or ISEAR_CLASSES
-    mapping = {_normalise_name(name): i for i, name in enumerate(order)}
-    unknown = sorted(set(normalised) - set(_normalise_name(x) for x in order))
-    if unknown:
-        raise ValueError(f"ISEAR labels missing from class_order: {unknown}")
-    y = np.asarray([mapping[_normalise_name(x)] for x in normalised], dtype=np.int64)
-    return y, order, {
-        "adapter": "isear",
-        "task_type": "single_label",
-        "raw_label_column": label_col,
-        "label_resolution": resolution,
-        "class_names": order,
-        "class_count": len(order),
-        "normalisation": "lowercase categorical canonicalisation",
-    }
+    # Detect if labels are integers
+    if all(isinstance(x, (int, np.integer)) for x in raw_values):
+        # Map integer to class names using the class_order list positions
+        order = contract.class_order or ISEAR_CLASSES
+        if len(order) != 7:
+            raise ValueError("ISEAR class_order must contain 7 emotions for numeric mapping.")
+        # Convert to integer indices (0-based)
+        y = np.asarray([int(x) - 1 for x in raw_values], dtype=np.int64)
+        # Optional: ensure indices are within range
+        if np.any(y < 0) or np.any(y >= len(order)):
+            raise ValueError("ISEAR numeric labels out of range.")
+        return y, order, {
+            "adapter": "isear",
+            "task_type": "single_label",
+            "raw_label_column": label_col,
+            "label_resolution": resolution,
+            "class_names": order,
+            "class_count": len(order),
+            "normalisation": "numeric index to class_order",
+        }
+    else:
+        raw = [_normalise_name(x) for x in df[label_col].tolist()]
+        normalised: list[str] = []
+        for i, x in enumerate(raw):
+            key = aliases.get(x)
+            if key is None:
+                raise ValueError(f"ISEAR row {i} has unknown emotion {x!r}; expected {ISEAR_CLASSES}")
+            normalised.append(key)
+        order = contract.class_order or ISEAR_CLASSES
+        mapping = {_normalise_name(name): i for i, name in enumerate(order)}
+        unknown = sorted(set(normalised) - set(_normalise_name(x) for x in order))
+        if unknown:
+            raise ValueError(f"ISEAR labels missing from class_order: {unknown}")
+        y = np.asarray([mapping[_normalise_name(x)] for x in normalised], dtype=np.int64)
+        return y, order, {
+            "adapter": "isear",
+            "task_type": "single_label",
+            "raw_label_column": label_col,
+            "label_resolution": resolution,
+            "class_names": order,
+            "class_count": len(order),
+            "normalisation": "lowercase categorical canonicalisation",
+        }
 
 
 def canonical_custom_target(df: pd.DataFrame, contract: DatasetContract):
