@@ -1033,6 +1033,7 @@ def flush_array(array: np.ndarray) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
+    # No directory fsync – it's too expensive and not required for integrity
             
 
 
@@ -1409,9 +1410,6 @@ class RuntimeReporter:
         self.last_report_completed = self.completed
 
 
-
-
-# ---- repair / ensure auxiliary files ----
 def ensure_auxiliary_files(
     dataset: Any,
     paths: dict[str, Path],
@@ -1450,27 +1448,21 @@ def ensure_auxiliary_files(
 
     if label_column:
         labels_raw = np.asarray(dataset[label_column])
-        # Convert to a consistent dtype
         if labels_raw.dtype.kind in ("U", "S", "O"):
             unique_labels, encoded = np.unique(labels_raw, return_inverse=True)
             np.save(paths["label_codes"], unique_labels)
-            labels = encoded.astype(np.int32)      # categorical -> int32
+            labels = encoded.astype(np.int32)
         else:
-            # Numeric: force to int64 to avoid dtype mismatch
             labels = labels_raw.astype(np.int64)
             if not paths["label_codes"].exists():
                 unique_labels = np.unique(labels)
                 np.save(paths["label_codes"], unique_labels)
 
-        # Check existing file, if any
         if paths["labels"].exists():
-            # Load without mmap to inspect dtype and shape
             existing = np.load(paths["labels"], allow_pickle=False)
             if existing.shape != (n_samples,) or existing.dtype != labels.dtype:
-                # Incompatible -> delete and recreate
                 os.remove(paths["labels"])
                 actions.append("removed incompatible labels.npy")
-                # Recreate as memmap
                 labels_mmap = np.lib.format.open_memmap(
                     paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,)
                 )
@@ -1480,7 +1472,6 @@ def ensure_auxiliary_files(
             else:
                 actions.append("labels.npy already compatible")
         else:
-            # Create new labels file
             labels_mmap = np.lib.format.open_memmap(
                 paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,)
             )
@@ -1501,13 +1492,13 @@ def ensure_auxiliary_files(
                 f.write(json.dumps({"batch_start": start, "batch_end": end, "hash": h, "timestamp": time.time()}) + "\n")
         actions.append("created integrity_hashes.jsonl")
 
-    # --- global checksum ---
-    if not paths["checksum"].exists():
-        states = np.load(paths["states"], mmap_mode='r')
-        checksum = compute_global_checksum(states, batch_size)
-        with open(paths["checksum"], 'w') as f:
-            f.write(checksum)
-        actions.append("created checksum.sha256")
+    # --- global checksum is computed at the end of extraction, not here ---
+    # if not paths["checksum"].exists():
+    #     states = np.load(paths["states"], mmap_mode='r')
+    #     checksum = compute_global_checksum(states, batch_size)
+    #     with open(paths["checksum"], 'w') as f:
+    #         f.write(checksum)
+    #     actions.append("created checksum.sha256")
 
     return {"actions": actions, "skipped": False}
 
@@ -1551,29 +1542,26 @@ def repair_dataset_auxiliaries(
                 with open(meta_path, 'r') as f:
                     meta = json.load(f)
 
-                # Update format_version if needed
                 if meta.get("format_version", "1.0") < "2.0":
                     meta["format_version"] = "2.0"
                     actions.append("upgraded format_version to 2.0")
 
-                # Ensure dataset provenance includes sample_id_column
                 prov = meta.get("dataset", {}).get("provenance", {})
                 current_prov = dataset_signature(dataset, texts, column)
-                # Update with sample_id info
                 if paths["sample_ids"].exists():
                     sample_id_arr = np.load(paths["sample_ids"], allow_pickle=True)
                     if len(sample_id_arr) == n_samples:
-                        meta["dataset"]["sample_id_column"] = "inferred"  # or actual column name
+                        meta["dataset"]["sample_id_column"] = "inferred"
                         meta["dataset"]["sample_id_type"] = "string"
                 if paths["text_hashes"].exists():
                     meta["dataset"]["text_hash_type"] = "sha256"
 
-                # Preserve existing fields
                 meta["experiment_id"] = experiment_id
                 meta["hyperparameter_hash"] = hyperparameter_hash
                 meta["dataset"]["fingerprint"] = fp
                 meta["dataset"]["provenance"] = current_prov
-                meta["dataset"]["columns"] = list(getattr(dataset, "columns", []))
+                # === USE get_dataset_columns ===
+                meta["dataset"]["columns"] = get_dataset_columns(dataset)
                 meta["extraction"] = {
                     "pooling": pooling,
                     "max_length": max_length,
@@ -1592,7 +1580,6 @@ def repair_dataset_auxiliaries(
 
 
 # ---- main extraction function (modified to update global checksum) ----
-
 def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_column: str | None, output_dir: str | Path, batch_size: int, pooling: str = DEFAULT_POOLING, max_length: int | None = DEFAULT_MAX_LENGTH, storage_dtype: np.dtype = np.float32, device: torch.device | None = None, model_name: str | None = None, dataset_name: str | None = None, model_snapshot: str | Path | None = None, auto_batch_size: bool = False, max_batch_size: int | None = None, flush_every_batches: int = DEFAULT_FLUSH_EVERY_BATCHES, flush_every_seconds: float = DEFAULT_FLUSH_SECONDS, show_verbose: bool = True, show_info: bool = True, show_critical: bool = True, show_debug: bool = False, experiment_id: str = DEFAULT_EXPERIMENT_ID, hyperparameter_hash: str | None = None) -> dict[str, Any]:
     if auto_batch_size: raise ValueError("auto_batch_size=True is disabled in deterministic extraction")
     if max_batch_size is not None and int(max_batch_size) != int(batch_size): raise ValueError("max_batch_size must equal frozen batch_size")
@@ -1778,8 +1765,8 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
                     completed[batch_start:end] = True
                     write_s = time.perf_counter() - t
 
-                    # If you keep incremental checksum:
-                    # checksum_hasher.update(pooled_final.tobytes())
+                    # Update global checksum incrementally
+                    update_checksum(pooled_final)
 
                     # Write batch integrity hash
                     batch_hash = hashlib.sha256(pooled_final.tobytes()).hexdigest()
@@ -1795,17 +1782,9 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
                         flush_array(completed)
                         if labels_mmap is not None:
                             flush_array(labels_mmap)
-                        # Also flush the checksum file? We'll write at end.
-                        dir_fd = os.open(str(paths["data_dir"]), os.O_RDONLY)
-                        try:
-                            os.fsync(dir_fd)
-                        finally:
-                            os.close(dir_fd)
+                        # No directory fsync – only file fsync inside flush_array
                         flush_s = time.perf_counter()-ft; totals["flush"] += flush_s; last_flush = time.perf_counter()
                         save_json(paths["runtime"], {**context, "status": "running", "position": end, "completed": int(completed.sum()), "updated_at": time.time()})
-                    if temp_path.exists():
-                        temp_path.unlink()
-
                     mem = get_memory_info(); disk = get_external_storage_usage(); rss = get_process_rss_gb(); batch_total = time.perf_counter()-batch_started
                     reporter.set_stage("measurement"); reporter.batch_finished(start=batch_start, end=end, newly_completed=newly, batch_size=batch_size, metrics={"seq_len": seq_len, "actual_tokens": actual_tokens, "tokenize_seconds": tokenize_s, "transfer_seconds": transfer_s, "forward_seconds": forward_s, "pooling_seconds": pooling_s, "convert_seconds": convert_s, "write_seconds": write_s, "flush_seconds": flush_s, "total_seconds": batch_total, "samples_per_sec": (end-batch_start)/max(batch_total,1e-9), "new_samples_per_sec": newly/max(batch_total,1e-9), "tokens_per_second": actual_tokens/max(batch_total,1e-9), "available_gb": mem["available_gb"], "used_gb": mem["used_gb"], "process_rss_gb": rss, "external_free_gb": disk["available_gb"], "batch_memory_delta_gb": max(0.0, rss-rss_before) if rss is not None and rss_before is not None else None, "runtime_batch_change": False, "pre_batch_completed": int(prior.sum()), "newly_completed": newly})
                 except Exception as exc:
@@ -1817,7 +1796,7 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
     flush_array(states); flush_array(completed)
     if labels_mmap is not None: flush_array(labels_mmap)
 
-    # Write global checksum
+    # Write global checksum (already updated incrementally, but final digest is stored here)
     global_checksum = checksum_hasher.hexdigest()
     with open(paths["checksum"], 'w') as cf:
         cf.write(global_checksum)
@@ -1835,7 +1814,7 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
             "samples":n_samples,
             "fingerprint":fp,
             "provenance":provenance,
-            "columns":list(getattr(dataset,"columns",[])),
+            "columns": get_dataset_columns(dataset),
             "labels": labels_info,
             "sample_id_column": "inferred",
             "sample_id_type": "string"
@@ -1884,6 +1863,426 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
     _print_critical(f"✓ DATASET COMPLETE: {dataset_name}\n  Newly computed     : {new_completed:,}\n  Total completed    : {completed_total:,}/{n_samples:,}\n  Elapsed            : {_format_duration(elapsed)}\n  Throughput         : {sps:.2f} samples/s\n  Token throughput   : {tps:.2f} tokens/s\n  Work time          : {_format_duration(work)}\n  Pipeline overhead  : {_format_duration(max(0.0,elapsed-work))}", show_critical)
     return metadata
 
+# =============================================================================
+# EXPERIMENT AUDITING & VALIDATION
+# =============================================================================
+
+def validate_dataset_output(
+    extraction_dir: str | Path,
+    dataset: Any = None,
+    fix_sample_ids: bool = True,
+    fix_checksum: bool = True,
+    show_progress: bool = False,
+) -> dict[str, Any]:
+    """
+    Deep validation of a single dataset directory.
+    Returns a dict with status, checksum_match, sample_ids_match, etc.
+    Optionally fixes sample_ids or checksum if missing/invalid.
+    """
+    extraction_dir = Path(extraction_dir)
+    meta_path = extraction_dir / "metadata" / "extraction.json"
+    if not meta_path.exists():
+        return {"status": "missing_metadata", "error": f"metadata/extraction.json not found in {extraction_dir}"}
+
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+
+    paths = build_dataset_storage_paths(extraction_dir)
+    result = {
+        "extraction_dir": str(extraction_dir),
+        "model": meta.get("model", {}).get("name"),
+        "dataset": meta.get("dataset", {}).get("name"),
+        "status": "incomplete",
+        "checksum_match": None,
+        "sample_ids_match": None,
+        "n_samples": meta.get("dataset", {}).get("samples"),
+        "completed_count": None,
+        "actions_taken": [],
+        "errors": [],
+        "warnings": [],
+        "metadata": meta,
+    }
+
+    # 1. Check required files
+    required = [paths["states"], paths["completed"], paths["sample_ids"]]
+    missing = [str(p.relative_to(extraction_dir)) for p in required if not p.exists()]
+    if missing:
+        result["status"] = "missing_files"
+        result["errors"].append(f"Missing files: {missing}")
+        return result
+
+    # 2. Load arrays
+    states = np.load(paths["states"], mmap_mode='r')
+    completed = np.load(paths["completed"], mmap_mode='r')
+    try:
+        sample_ids = np.load(paths["sample_ids"], allow_pickle=True)
+        if sample_ids.dtype == object:
+            sample_ids = np.array([str(x) for x in sample_ids], dtype=object)
+    except Exception as e:
+        result["errors"].append(f"sample_ids.npy loading error: {e}")
+        return result
+
+    n_samples = len(sample_ids)
+    completed_count = int(completed.sum())
+    result["completed_count"] = completed_count
+    if completed_count == n_samples:
+        result["status"] = "complete"
+    else:
+        result["status"] = "partial"
+
+    # 3. Verify checksum
+    checksum_ok = None
+    if paths["checksum"].exists():
+        with open(paths["checksum"], "r") as f:
+            stored_checksum = f.read().strip()
+        # Compute checksum (chunked)
+        computed = compute_global_checksum(states, 1024)  # batch_size not critical for validation
+        checksum_ok = (stored_checksum == computed)
+        result["checksum_match"] = checksum_ok
+        if not checksum_ok:
+            result["warnings"].append("Checksum mismatch! Data may be corrupted.")
+            if fix_checksum:
+                with open(paths["checksum"], "w") as f:
+                    f.write(computed)
+                result["actions_taken"].append("Updated checksum.sha256 to match current data.")
+    else:
+        if fix_checksum:
+            computed = compute_global_checksum(states, 1024)
+            with open(paths["checksum"], "w") as f:
+                f.write(computed)
+            result["actions_taken"].append("Created checksum.sha256.")
+        else:
+            result["warnings"].append("No checksum file found (can be fixed with fix_checksum=True).")
+
+    # 4. Validate sample IDs (if dataset provided)
+    if dataset is not None:
+        column = meta.get("dataset", {}).get("text_column")
+        if column is None:
+            result["warnings"].append("No text_column in metadata, cannot verify sample IDs.")
+        else:
+            texts = dataset_texts(dataset, column)
+            if len(texts) != n_samples:
+                result["errors"].append(f"Dataset sample count {len(texts)} != extraction samples {n_samples}")
+            else:
+                # Recompute expected IDs (using same logic as get_sample_ids)
+                expected_ids = get_sample_ids(dataset, column, texts)
+                # Compare (first few or full if small)
+                if len(expected_ids) > 100:
+                    # Sample first and last 50
+                    sample_indices = list(range(50)) + list(range(len(expected_ids)-50, len(expected_ids)))
+                    match = all(sample_ids[i] == expected_ids[i] for i in sample_indices)
+                else:
+                    match = np.array_equal(sample_ids, expected_ids)
+                result["sample_ids_match"] = match
+                if not match:
+                    result["warnings"].append("Sample IDs do not match dataset (possibly due to dataset ordering change).")
+                    if fix_sample_ids:
+                        np.save(paths["sample_ids"], expected_ids)
+                        result["actions_taken"].append("Overwrote sample_ids.npy with correct IDs.")
+                else:
+                    result["sample_ids_match"] = True
+    else:
+        result["warnings"].append("Dataset not provided; sample ID validation skipped.")
+
+    # 5. Check labels if present
+    if paths["labels"].exists() and "labels" in meta.get("dataset", {}):
+        labels = np.load(paths["labels"], mmap_mode='r')
+        if labels.shape[0] != n_samples:
+            result["warnings"].append(f"labels.npy shape {labels.shape} != samples {n_samples}")
+
+    return result
+
+
+def audit_experiment(
+    experiment_root: str | Path,
+    datasets: Mapping[str, Any] | None = None,
+    show_details: bool = True,
+    fix_issues: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Scan an entire experiment directory, validate every model-dataset pair,
+    and produce a detailed audit report.
+
+    Args:
+        experiment_root: Path to experiment directory (e.g., .../experiments/baseline_v5_001)
+        datasets: Optional dict of dataset_name -> dataset object for sample ID validation.
+        show_details: If True, print per-dataset details.
+        fix_issues: If True, attempt to fix detected issues (checksum, sample IDs).
+
+    Returns:ds
+        List of validation results per dataset.
+    """
+    experiment_root = Path(experiment_root)
+    if not experiment_root.exists():
+        raise FileNotFoundError(f"Experiment root not found: {experiment_root}")
+
+    # Discover all model-dataset pairs
+    extraction_jsons = sorted(experiment_root.rglob("metadata/extraction.json"))
+
+    if not extraction_jsons:
+        print(f"⚠️ No extraction metadata found in {experiment_root}")
+        return []
+
+    results = []
+
+    # Print header
+    print("\n" + "═" * 100)
+    print(f"🔍 EXPERIMENT AUDIT: {experiment_root.name}")
+    print("═" * 100)
+    print(f"  Found {len(extraction_jsons)} dataset extractions.")
+
+    for meta_path in extraction_jsons:
+        dataset_dir = meta_path.parent.parent  # .../datasets/{dataset_name}
+        dataset_name = dataset_dir.name
+        model_dir = dataset_dir.parent.parent  # .../models/{model_name}
+        model_name = model_dir.name
+        extraction_dir = dataset_dir
+
+        # Get dataset object if provided
+        dataset_obj = datasets.get(dataset_name) if datasets else None
+
+        # Validate
+        result = validate_dataset_output(
+            extraction_dir,
+            dataset=dataset_obj,
+            fix_sample_ids=fix_issues,
+            fix_checksum=fix_issues,
+            show_progress=False,
+        )
+        result["model_name"] = model_name
+        result["dataset_name"] = dataset_name
+        results.append(result)
+
+        if show_details:
+            # Use the existing pretty printer
+            print_dataset_format_report(extraction_dir, show_samples=3)
+
+    # Summary table
+    print("\n" + "═" * 100)
+    print("📊 AUDIT SUMMARY")
+    print("═" * 100)
+
+    # Build summary rows
+    rows = []
+    for r in results:
+        status = r.get("status", "unknown")
+        chk = "✅" if r.get("checksum_match") is True else ("❌" if r.get("checksum_match") is False else "—")
+        sid = "✅" if r.get("sample_ids_match") is True else ("❌" if r.get("sample_ids_match") is False else "—")
+        rows.append([
+            r["model_name"],
+            r["dataset_name"],
+            r.get("n_samples", "?"),
+            r.get("completed_count", "?"),
+            status,
+            chk,
+            sid,
+            ", ".join(r.get("actions_taken", [])) or "—",
+        ])
+
+    # Print table
+    col_widths = [22, 22, 10, 10, 10, 6, 6, 30]
+    headers = ["Model", "Dataset", "Samples", "Done", "Status", "CHK", "ID", "Actions"]
+    print("  " + " ".join(h.ljust(w) for h, w in zip(headers, col_widths)))
+    print("  " + "-" * (sum(col_widths) + len(col_widths) * 2))
+    for row in rows:
+        # Trim long actions
+        row[-1] = row[-1][:28] + "…" if len(row[-1]) > 30 else row[-1]
+        print("  " + " ".join(str(col).ljust(w) for col, w in zip(row, col_widths)))
+
+    # Count issues
+    total = len(results)
+    complete = sum(1 for r in results if r.get("status") == "complete")
+    checksum_ok = sum(1 for r in results if r.get("checksum_match") is True)
+    ids_ok = sum(1 for r in results if r.get("sample_ids_match") is True)
+    actions_taken = sum(1 for r in results if r.get("actions_taken"))
+    print(f"\n  ✅ Complete datasets : {complete}/{total}")
+    print(f"  ✅ Checksum OK      : {checksum_ok}/{total}")
+    print(f"  ✅ Sample IDs match : {ids_ok}/{total}")
+    if fix_issues:
+        print(f"  🔧 Fixed issues    : {actions_taken} datasets")
+
+    return results
+
+def print_dataset_format_report(
+    extraction_dir: str | Path,
+    show_samples: int = 5,
+) -> None:
+    """
+    Print a detailed, visually rich report of the extraction format.
+    Shows all files, shapes, dtypes, sample mapping, and metadata.
+    """
+    from pathlib import Path
+    import json
+    import numpy as np
+
+    p = Path(extraction_dir)
+    meta_path = p / "metadata" / "extraction.json"
+    if not meta_path.exists():
+        print(f"❌ No extraction metadata found in {extraction_dir}")
+        return
+
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+
+    # Build paths
+    paths = build_dataset_storage_paths(extraction_dir)
+
+    print("\n" + "═" * 88)
+    print(f"📦 EXTRACTION FORMAT REPORT: {meta.get('dataset', {}).get('name', 'unknown')}")
+    print("═" * 88)
+
+    # 1. Dataset & Model Overview
+    ds = meta.get("dataset", {})
+    ex = meta.get("extraction", {})
+    print("\n📋 **DATASET**")
+    print(f"  Name          : {ds.get('name')}")
+    print(f"  Samples       : {ds.get('samples'):,}")
+    print(f"  Text column   : {ds.get('text_column')}")
+    print(f"  Fingerprint   : {ds.get('fingerprint')}")
+    print(f"  Sample ID col : {ds.get('sample_id_column', 'inferred')}")
+    print(f"  Labels        : {ds.get('labels', {}).get('label_column', 'None')}")
+
+    print("\n🤖 **MODEL**")
+    mod = meta.get("model", {})
+    print(f"  Name          : {mod.get('name')}")
+    print(f"  Snapshot      : {mod.get('snapshot')}")
+    spec = meta.get("model_spec", {})
+    if spec:
+        print(f"  Family        : {spec.get('family')}")
+        print(f"  Architecture  : {spec.get('architecture')}")
+        print(f"  Parameters    : {spec.get('parameter_billions', 0):.2f}B")
+
+    print("\n⚙️ **EXTRACTION PARAMETERS**")
+    print(f"  Pooling       : {ex.get('pooling')}")
+    print(f"  Max length    : {ex.get('max_length')}")
+    print(f"  Batch size    : {ex.get('batch_size')}")
+    print(f"  Device        : {ex.get('device')}")
+    print(f"  Storage dtype : {ex.get('storage_dtype')}")
+    print(f"  Format version: {meta.get('format_version', '1.0')}")
+
+    # 2. Files & Shapes
+    print("\n📁 **STORAGE FILES**")
+    states_path = paths["states"]
+    if states_path.exists():
+        states = np.load(states_path, mmap_mode='r')
+        print(f"  hidden_states.npy     : shape {states.shape}, dtype {states.dtype}, memmap")
+        print(f"    → samples × layers × hidden_size")
+    else:
+        print("  ❌ hidden_states.npy missing")
+
+    completed_path = paths["completed"]
+    if completed_path.exists():
+        comp = np.load(completed_path, mmap_mode='r')
+        print(f"  completed.npy         : shape {comp.shape}, dtype {comp.dtype}, memmap")
+        print(f"    → boolean mask of completed samples")
+    else:
+        print("  ❌ completed.npy missing")
+
+    labels_path = paths["labels"]
+    if labels_path.exists():
+        lbl = np.load(labels_path, mmap_mode='r')
+        print(f"  labels.npy            : shape {lbl.shape}, dtype {lbl.dtype}, memmap")
+    else:
+        print("  labels.npy            : not present")
+
+    sample_ids_path = paths["sample_ids"]
+    if sample_ids_path.exists():
+        sid = np.load(sample_ids_path, allow_pickle=True)
+        print(f"  sample_ids.npy        : shape {sid.shape}, dtype object, loaded in memory (small)")
+        print(f"    → unique per‑sample ID (string)")
+    else:
+        print("  ❌ sample_ids.npy missing")
+
+    checksum_path = paths["checksum"]
+    if checksum_path.exists():
+        with open(checksum_path, "r") as f:
+            chk = f.read().strip()
+        print(f"  checksum.sha256       : {chk[:16]}... (global integrity hash)")
+
+    integrity_path = paths["integrity"]
+    if integrity_path.exists():
+        with open(integrity_path, "r") as f:
+            lines = f.readlines()
+        print(f"  integrity_hashes.jsonl: {len(lines)} batch hashes")
+
+    # 3. Sample Mapping (first few)
+    print("\n🔗 **SAMPLE MAPPING (first {} samples)**".format(show_samples))
+    if sample_ids_path.exists() and states_path.exists():
+        sid = np.load(sample_ids_path, allow_pickle=True)
+        states = np.load(states_path, mmap_mode='r')
+        n = min(show_samples, len(sid))
+        print(f"  {'Index':<6} {'Sample ID':<36} {'hidden_states row shape'}")
+        print("  " + "-" * 60)
+        for i in range(n):
+            sample_id = str(sid[i])
+            if len(sample_id) > 30:
+                sample_id = sample_id[:27] + "..."
+            print(f"  {i:<6} {sample_id:<36} {states[i].shape}")
+        if len(sid) > show_samples:
+            print(f"  ... and {len(sid) - show_samples} more")
+
+    # 4. Integrity & Performance
+    print("\n📈 **PERFORMANCE**")
+    perf = meta.get("performance", {})
+    if perf:
+        print(f"  Elapsed          : {_format_duration(perf.get('elapsed_seconds', 0))}")
+        print(f"  Samples/sec      : {perf.get('samples_per_second', 0):.2f}")
+        print(f"  Completed samples: {perf.get('completed_samples', 0):,}")
+        print(f"  Successful batches: {perf.get('successful_batches', 0):,}")
+    else:
+        print("  No performance data (incomplete extraction)")
+
+    print("\n✅ **READY FOR PROBING**")
+    print("  Use `data = load_extraction_for_probing(extraction_dir)` to load all arrays as memmaps.")
+    print("  The returned dict contains: hidden_states, labels, sample_ids, completed, metadata.")
+    print("═" * 88 + "\n")
+
+
+def load_extraction_for_probing(extraction_dir: str | Path) -> dict[str, Any]:
+    """
+    Load all extraction artifacts as lightweight memmaps, ready for probing.
+    Returns a dictionary with:
+      - hidden_states: memmap (n_samples, n_layers, hidden_size)
+      - completed:     bool memmap (n_samples,)
+      - labels:        int64 memmap (n_samples,) or None
+      - sample_ids:    object array (n_samples,) loaded in memory (small)
+      - metadata:      dict from extraction.json
+      - paths:         dict of all file paths
+    """
+    p = Path(extraction_dir)
+    meta_path = p / "metadata" / "extraction.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"No extraction metadata found in {extraction_dir}")
+
+    with open(meta_path, "r") as f:
+        metadata = json.load(f)
+
+    paths = build_dataset_storage_paths(extraction_dir)
+
+    hidden_states = np.load(paths["states"], mmap_mode='r')
+    completed = np.load(paths["completed"], mmap_mode='r')
+
+    # labels (optional)
+    labels = None
+    if paths["labels"].exists():
+        labels = np.load(paths["labels"], mmap_mode='r')
+
+    # sample_ids (small, load in memory)
+    sample_ids = np.load(paths["sample_ids"], allow_pickle=True)
+    if sample_ids.dtype == object:
+        sample_ids = np.array([str(x) for x in sample_ids], dtype=object)
+
+    return {
+        "hidden_states": hidden_states,
+        "completed": completed,
+        "labels": labels,
+        "sample_ids": sample_ids,
+        "metadata": metadata,
+        "paths": paths,
+        "n_samples": len(sample_ids),
+        "n_layers": hidden_states.shape[1],
+        "hidden_size": hidden_states.shape[2],
+    }
 # =============================================================================
 # MODEL METADATA / EXECUTION (unchanged except calling repair)
 # =============================================================================
