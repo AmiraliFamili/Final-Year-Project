@@ -169,10 +169,10 @@ MODEL_REGISTRY = (
     ModelSpec("Qwen/Qwen2-0.5B", "Qwen", "Qwen2", .500, "decoder", "pretrained_base", "03_tiny_modern", 32),
     ModelSpec("Qwen/Qwen2.5-0.5B", "Qwen", "Qwen2.5", .500, "decoder", "pretrained_base", "03_tiny_modern", 32),
     ModelSpec("Qwen/Qwen3-0.6B-Base", "Qwen", "Qwen3", .600, "decoder", "pretraining_base", "03_tiny_modern", 16, min_transformers="4.51.0"),
-    ModelSpec("Qwen/Qwen2-1.5B", "Qwen", "Qwen2", 1.500, "decoder", "pretrained_base", "04_qwen_scaling", 8),
-    ModelSpec("Qwen/Qwen2.5-1.5B", "Qwen", "Qwen2.5", 1.540, "decoder", "pretrained_base", "04_qwen_scaling", 8),
-    ModelSpec("Qwen/Qwen2.5-3B", "Qwen", "Qwen2.5", 3.090, "decoder", "pretrained_base", "04_qwen_scaling", 2),
-    ModelSpec("Qwen/Qwen3-1.7B-Base", "Qwen", "Qwen3", 1.700, "decoder", "pretraining_base", "04_qwen_scaling", 8, min_transformers="4.51.0"),
+    ModelSpec("Qwen/Qwen2-1.5B", "Qwen", "Qwen2", 1.500, "decoder", "pretrained_base", "04_qwen_scaling", 1),
+    ModelSpec("Qwen/Qwen2.5-1.5B", "Qwen", "Qwen2.5", 1.540, "decoder", "pretrained_base", "04_qwen_scaling", 1),
+    ModelSpec("Qwen/Qwen2.5-3B", "Qwen", "Qwen2.5", 3.090, "decoder", "pretrained_base", "04_qwen_scaling", 1),
+    ModelSpec("Qwen/Qwen3-1.7B-Base", "Qwen", "Qwen3", 1.700, "decoder", "pretraining_base", "04_qwen_scaling", 1, min_transformers="4.51.0"),
     ModelSpec("HuggingFaceTB/SmolLM2-1.7B", "SmolLM2", "2024", 1.700, "decoder", "pretrained", "05_independent_small", 8),
     ModelSpec("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T", "TinyLlama", "2024", 1.100, "decoder", "pretrained_intermediate", "05_independent_small", 8),
     ModelSpec("google/gemma-3-1b-pt", "Gemma", "2025", 1.000, "decoder", "pretrained", "05_independent_small", 8, min_transformers="4.50.0", gated=True),
@@ -439,7 +439,7 @@ class HyperParameters:
     pooling: str = DEFAULT_POOLING
     max_length: int = DEFAULT_MAX_LENGTH
     storage_dtype: str = DEFAULT_STORAGE_DTYPE
-    cpu_dtype: str = "float32"
+    cpu_dtype: str = "float16"
     accelerator_dtype: str = "float16"
     batch_sizes: dict[str, int] = field(default_factory=dict)
     cpu_threads: int | None = None
@@ -621,11 +621,23 @@ def _download_patterns(model_name: str, revision: str | None = None) -> tuple[li
 
 
 def _is_transient_download_error(exc: BaseException) -> bool:
-    if isinstance(exc, (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError)): return False
-    text = str(exc).lower()
-    markers = ("remote end closed connection", "connection aborted", "connection reset", "connection refused", "timed out", "timeout", "temporarily unavailable", "502", "503", "504", "connection error", "protocolerror", "server disconnected")
-    return isinstance(exc, (ConnectionError, TimeoutError, HfHubHTTPError, IncompleteSnapshotError, LocalEntryNotFoundError)) or any(m in text for m in markers)
-
+    # Traverse the cause chain to find original network errors
+    current = exc
+    while current is not None:
+        if isinstance(current, (ConnectionError, TimeoutError, HfHubHTTPError,
+                                IncompleteSnapshotError, LocalEntryNotFoundError)):
+            return True
+        text = str(current).lower()
+        markers = (
+            "remote end closed connection", "connection aborted", "connection reset",
+            "connection refused", "timed out", "timeout", "temporarily unavailable",
+            "502", "503", "504", "connection error", "protocolerror",
+            "server disconnected"
+        )
+        if any(m in text for m in markers):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 def _snapshot_download_compat(model_name: str, revision: str, allow_patterns: list[str], ignore_patterns: list[str], workers: int) -> Path:
     kwargs = {"repo_id": model_name, "revision": revision, "cache_dir": str(HF_HUB_CACHE), "allow_patterns": allow_patterns, "ignore_patterns": ignore_patterns, "max_workers": workers, "etag_timeout": DOWNLOAD_ETAG_TIMEOUT_SECONDS}
@@ -2320,6 +2332,20 @@ def check_transformers_version(spec: ModelSpec) -> tuple[bool, str | None]:
     ok = Version(transformers.__version__) >= Version(spec.min_transformers) if Version is not None else tuple(map(int, transformers.__version__.split(".")[:3])) >= tuple(map(int, spec.min_transformers.split(".")[:3]))
     return (True, None) if ok else (False, f"requires transformers>={spec.min_transformers}; installed={transformers.__version__}")
 
+def _prepare_environment(params: HyperParameters) -> tuple[torch.device, dict[str, Any]]:
+    device = get_best_device()
+    if device.type == "cpu" and params.cpu_dtype == "bfloat16":
+        # Check if bfloat16 is supported
+        try:
+            torch.tensor([1.0], dtype=torch.bfloat16)
+        except Exception:
+            # Fallback to float32
+            params = HyperParameters(**{**params.as_dict(), "cpu_dtype": "float32"})
+    configure_cpu_threads(params.cpu_threads)
+    configure_cpu_interop_threads(params.cpu_interop_threads)
+    environment = {"system_fingerprint":system_fingerprint(),"system":{"cpu":get_cpu_info(),"memory":get_memory_info(),"platform":platform.platform()},"torch_version":torch.__version__,"transformers_version":transformers.__version__,"numpy_version":np.__version__,"device":str(device)}
+    
+    return device, environment
 
 def _prepare_environment(params: HyperParameters) -> tuple[torch.device, dict[str, Any]]:
     device = get_best_device(); configure_cpu_threads(params.cpu_threads); configure_cpu_interop_threads(params.cpu_interop_threads)
