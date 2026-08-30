@@ -11,6 +11,7 @@ import copy
 import hashlib
 import importlib
 import json
+import seaborn
 import math
 import os
 import random
@@ -520,8 +521,18 @@ def load_config(path: Path) -> AnalysisConfig:
     return cfg
 
 
-def load_complete_metadata(run_dir: Path) -> dict:
-    path = Path(run_dir) / "complete_run_metadata.json"
+def load_complete_metadata(run_dir_or_file: Path) -> dict:
+    """Load complete_run_metadata.json from either the run directory or the file itself."""
+    path = Path(run_dir_or_file)
+    if path.is_dir():
+        path = path / "complete_run_metadata.json"
+    # If path is a file but not named 'complete_run_metadata.json', we assume it's the metadata file.
+    # If it's neither, we append the expected filename (best effort).
+    elif path.name != "complete_run_metadata.json":
+        # If it has a .json suffix but different name, treat as metadata? 
+        # For safety, append standard name if it doesn't exist
+        if not path.exists():
+            path = path / "complete_run_metadata.json"
     with open(path, "r") as f:
         return json.load(f)
     
@@ -704,13 +715,25 @@ class ExtractionArtifact:
             raise RuntimeError(f"Checksum mismatch! Stored: {self.checksum_stored}, Computed: {computed}")
 
     @property
-    def model_name(self) -> str:
-        return str(self.metadata.get("model", {}).get("name", "unknown"))
+    def model_name(self):
+        name = self.metadata.get("model", {}).get("name")
+        if not name:
+            # Fallback: derive from dataset_dir path (e.g., .../models/<provider>/<model>/datasets/<ds>)
+            parts = self.dataset_dir.parts
+            # find 'models' and take next two parts
+            try:
+                idx = parts.index('models')
+                name = '/'.join(parts[idx+1:idx+3])
+            except ValueError:
+                name = "unknown"
+        return name
 
     @property
-    def dataset_name(self) -> str:
-        return str(self.metadata.get("dataset", {}).get("name", self.dataset_dir.name))
-
+    def dataset_name(self):
+        name = self.metadata.get("dataset", {}).get("name")
+        if not name:
+            name = self.dataset_dir.name
+        return name
     @property
     def sample_count(self) -> int:
         return int(self.metadata.get("dataset", {}).get("samples", self.states.shape[0]))
@@ -1628,9 +1651,9 @@ def evaluate_single(
     if include_per_class:
         result["per_class"] = {
             name: {
-                "precision": float(precision_score(y_true, y_pred, labels=[i], average="macro", zero_division=0)),
-                "recall": float(recall_score(y_true, y_pred, labels=[i], average="macro", zero_division=0)),
-                "f1": float(f1_score(y_true, y_pred, labels=[i], average="macro", zero_division=0)),
+                "precision": float(precision_score(y_true, y_pred, labels=[i], average='binary', zero_division=0)),
+                "recall": float(recall_score(y_true, y_pred, labels=[i], average='binary', zero_division=0)),
+                "f1": float(f1_score(y_true, y_pred, labels=[i], average='binary', zero_division=0)),
                 "support": int(np.sum(y_true == i)),
             }
             for i, name in enumerate(classes)
@@ -2833,6 +2856,8 @@ def run_matrix(
     max_samples: int | None = 5000,
     verbose: int = 0,
     checkpoint_dir: Path | None = None,
+    shuffled_label_control: bool = True,
+    shuffled_control_repeats: int = 3,
 ) -> pd.DataFrame:
     """
     Run the same probe benchmark across arbitrary frozen model artifacts, with
@@ -2918,9 +2943,8 @@ def run_matrix(
                 split=split,
                 repeats=repeats,
                 max_samples=max_samples,
-                shuffled_label_control=True,
-                shuffled_control_repeats=3,
-                run_control_on_all_layers=True,
+                shuffled_label_control=shuffled_label_control,
+                shuffled_control_repeats=shuffled_control_repeats,
                 pca_enabled=True,
                 silhouette_enabled=True,
                 pca_samples=min(3000, max_samples or 3000),
