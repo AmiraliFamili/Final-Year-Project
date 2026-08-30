@@ -1,4 +1,4 @@
--- TODO 
+-- TODO: pip freeze > requirements.txt
 
 - create a valid file structure for the projects
     - A python script which returns the processed datasets. 
