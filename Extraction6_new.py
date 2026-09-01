@@ -31,9 +31,10 @@ from pathlib import Path
 import platform
 import subprocess
 import time
+import ast
 import traceback
 from statistics import median
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, Dict
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
@@ -1608,106 +1609,109 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
     config = model.config; num_layers = get_model_num_layers(config) + 1; hidden_size = get_model_hidden_size(config); expected_shape = (n_samples, num_layers, hidden_size)
     paths = build_dataset_storage_paths(output_dir); paths["dataset_dir"].resolve().relative_to(EXTERNAL_ROOT); fp = dataset_fingerprint(dataset, texts); provenance = dataset_signature(dataset, texts, column)
     _print_info("\n" + _separator("─") + f"\nDATASET {dataset_name}\n" + _separator("─") + "\n" + f"  Text column         : {column}\n  Samples             : {n_samples:,}\n  Dataset fingerprint : {fp}\n  Hidden layers       : {num_layers}\n  Hidden size         : {hidden_size}\n  Output size est.    : {(n_samples*num_layers*hidden_size*np.dtype(storage_dtype).itemsize)/(1024**3):.2f} GiB\n  Pooling             : {pooling}\n  Max length          : {max_length}\n  FROZEN batch        : {batch_size}\n  Device              : {device}\n  Runtime diagnostics : {paths['runtime']}", show_info)
+
+    # ---- Load or create memmaps for states and completed ----
     if paths["states"].exists():
         states = np.load(paths["states"], mmap_mode="r+")
-        if not isinstance(states, np.memmap) or states.shape != expected_shape or states.dtype != storage_dtype: raise ValueError(f"Existing hidden_states.npy incompatible: {getattr(states,'shape',None)}/{getattr(states,'dtype',None)} vs {expected_shape}/{storage_dtype}")
+        if not isinstance(states, np.memmap) or states.shape != expected_shape or states.dtype != storage_dtype:
+            raise ValueError(f"Existing hidden_states.npy incompatible: {getattr(states,'shape',None)}/{getattr(states,'dtype',None)} vs {expected_shape}/{storage_dtype}")
     else:
         states = np.lib.format.open_memmap(paths["states"], mode="w+", dtype=storage_dtype, shape=expected_shape)
+
     if paths["completed"].exists():
         completed = np.load(paths["completed"], mmap_mode="r+")
-        if not isinstance(completed, np.memmap) or completed.shape != (n_samples,) or completed.dtype != np.bool_: raise ValueError("Existing completed.npy incompatible")
+        if not isinstance(completed, np.memmap) or completed.shape != (n_samples,) or completed.dtype != np.bool_:
+            raise ValueError("Existing completed.npy incompatible")
     else:
-        completed = np.lib.format.open_memmap(paths["completed"], mode="w+", dtype=np.bool_, shape=(n_samples,)); completed[:] = False; flush_array(completed)
-    # Labels and sample IDs
+        completed = np.lib.format.open_memmap(paths["completed"], mode="w+", dtype=np.bool_, shape=(n_samples,))
+        completed[:] = False
+        flush_array(completed)
+
+    # ---- Label handling (clean, no duplication) ----
     label_column = None
-    dataset_cols = get_dataset_columns(dataset)   # use helper
+    dataset_cols = get_dataset_columns(dataset)
     for cand in ("labels", "label", "target", "emotion"):
         if cand in dataset_cols:
             label_column = cand
             break
-    # Convert labels to a consistent integer encoding.
-    raw_label_fingerprint = stable_hash({"values": [str(v) for v in dataset[label_column]]}, 24)
-    labels_raw = np.asarray(dataset[label_column], dtype=object)
-    # Determine if multi-label (any element is a list/tuple)
-    is_multi = any(isinstance(x, (list, tuple, set, np.ndarray)) for x in labels_raw[:100])
 
-    if is_multi:
-        # For multi-label, flatten all labels to get class set
-        all_labels = []
-        for x in labels_raw:
-            if isinstance(x, (list, tuple, set, np.ndarray)):
-                all_labels.extend(x)
-            else:
-                all_labels.append(x)
-        unique_labels = sorted(set(all_labels))
-        label_to_id = {lbl: i for i, lbl in enumerate(unique_labels)}
-        # Save as object array of lists of ints (cannot be memory-mapped, use np.save)
-        labels = np.empty(len(labels_raw), dtype=object)
-        for i, x in enumerate(labels_raw):
-            if isinstance(x, (list, tuple, set, np.ndarray)):
-                labels[i] = [label_to_id[y] for y in x]
-            else:
-                labels[i] = [label_to_id[x]]
-        np.save(paths["label_codes"], np.array(unique_labels, dtype=object))
-        np.save(paths["labels"], labels)   # object array, not memmap
-        labels_info = {"label_column": label_column, "labels_dtype": "object", "label_codes_path": str(paths["label_codes"])}
-    else:
-        # Single-label: existing logic
-        unique_labels, encoded = np.unique(labels_raw, return_inverse=True)
-        labels = encoded.astype(np.int64)
-        np.save(paths["label_codes"], unique_labels)
-        # Save as memmap
-        labels_mmap = np.lib.format.open_memmap(paths["labels"], mode="w+", dtype=labels.dtype, shape=(len(labels),))
-        labels_mmap[:] = labels
-        flush_array(labels_mmap)
-        labels_info = {"label_column": label_column, "labels_dtype": str(labels.dtype), "label_codes_path": str(paths["label_codes"])}
-        if paths["labels"].exists():
-            labels_mmap = np.load(paths["labels"], mmap_mode="r+")
-            if labels_mmap.shape != (n_samples,) or labels_mmap.dtype != labels.dtype:
-                # Fallback: recreate (should not happen if repair ran)
-                _print_critical(f"  Warning: existing labels.npy incompatible – recreating.", show_critical)
-                # Close and delete
-                del labels_mmap
-                os.remove(paths["labels"])
-                labels_mmap = np.lib.format.open_memmap(
-                    paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,)
-                )
-                labels_mmap[:] = labels
-                flush_array(labels_mmap)
-            else:
-                labels_mmap = np.lib.format.open_memmap(
-                    paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,)
-                )
-                labels_mmap[:] = labels
-                flush_array(labels_mmap)
-            labels_info = {"label_column": label_column, "labels_dtype": str(labels.dtype), "label_codes_path": str(paths["label_codes"]) if paths["label_codes"].exists() else None}
+    if label_column:
+        labels_raw = np.asarray(dataset[label_column], dtype=object)
+        is_multi = any(isinstance(x, (list, tuple, set, np.ndarray)) for x in labels_raw[:100])
+
+        if is_multi:
+            all_labels = []
+            for x in labels_raw:
+                if isinstance(x, (list, tuple, set, np.ndarray)):
+                    all_labels.extend(x)
+                else:
+                    all_labels.append(x)
+            unique_labels = sorted(set(all_labels))
+            label_to_id = {lbl: i for i, lbl in enumerate(unique_labels)}
+            labels = np.empty(len(labels_raw), dtype=object)
+            for i, x in enumerate(labels_raw):
+                if isinstance(x, (list, tuple, set, np.ndarray)):
+                    labels[i] = [label_to_id[y] for y in x]
+                else:
+                    labels[i] = [label_to_id[x]]
+            np.save(paths["label_codes"], np.array(unique_labels, dtype=object))
+            np.save(paths["labels"], labels)   # object array, plain .npy
+            labels_mmap = None   # no memmap for object arrays
+            labels_info = {
+                "label_column": label_column,
+                "labels_dtype": "object",
+                "label_codes_path": str(paths["label_codes"])
+            }
         else:
-            labels_mmap = None
-            labels_info = {"label_column": None, "labels_dtype": None, "label_codes_path": None}
+            unique_labels, encoded = np.unique(labels_raw, return_inverse=True)
+            labels = encoded.astype(np.int64)
+            np.save(paths["label_codes"], unique_labels)
+            labels_mmap = np.lib.format.open_memmap(
+                paths["labels"], mode="w+", dtype=labels.dtype, shape=(len(labels),)
+            )
+            labels_mmap[:] = labels
+            flush_array(labels_mmap)
+            labels_info = {
+                "label_column": label_column,
+                "labels_dtype": str(labels.dtype),
+                "label_codes_path": str(paths["label_codes"])
+            }
+    else:
+        labels_mmap = None
+        labels_info = {"label_column": None, "labels_dtype": None, "label_codes_path": None}
 
-    # Sample IDs (v2) – ensure they exist
+    # ---- Sample IDs (v2) – ensure they exist ----
     if not paths["sample_ids"].exists() or not is_v2_sample_ids(paths["sample_ids"]):
         ids = get_sample_ids(dataset, column, texts)
         np.save(paths["sample_ids"], ids)
-    # Load without mmap (object arrays cannot be memory-mapped)
     sample_ids = np.load(paths["sample_ids"], allow_pickle=True)
     if sample_ids.dtype == object:
         sample_ids = np.array([str(x) for x in sample_ids], dtype=object)
     if len(sample_ids) != n_samples:
         raise ValueError(f"sample_ids length {len(sample_ids)} != n_samples {n_samples}")
-    # Text hashes (optional)
+
     if not paths["text_hashes"].exists():
         hashes = get_text_hashes(texts)
         np.save(paths["text_hashes"], hashes)
-    # We don't load text_hashes unless needed for validation.
 
     completed_count = int(completed.sum())
-    signature = {"experiment_id": experiment_id, "hyperparameter_hash": hyperparameter_hash, "dataset_fingerprint": fp, "text_column": column, "sample_count": n_samples, "pooling": pooling, "max_length": max_length, "batch_size": batch_size}
+    signature = {
+        "experiment_id": experiment_id,
+        "hyperparameter_hash": hyperparameter_hash,
+        "dataset_fingerprint": fp,
+        "text_column": column,
+        "sample_count": n_samples,
+        "pooling": pooling,
+        "max_length": max_length,
+        "batch_size": batch_size
+    }
+
     if completed_count == n_samples:
-        # Attempt metadata repair before raising
+        # Already complete – repair metadata if needed
         if paths["metadata"].exists():
             try:
-                with paths["metadata"].open("r", encoding="utf-8") as f: meta = json.load(f)
+                with paths["metadata"].open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
                 core_match = (
                     meta.get("dataset", {}).get("fingerprint") == fp and
                     meta.get("dataset", {}).get("samples") == n_samples and
@@ -1726,7 +1730,7 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
                     meta["dataset"]["provenance"] = provenance
                     meta["dataset"]["columns"] = list(getattr(dataset, "columns", []))
                     meta["dataset"]["labels"] = labels_info
-                    meta["dataset"]["sample_id_column"] = "inferred"  # or actual
+                    meta["dataset"]["sample_id_column"] = "inferred"
                     meta["dataset"]["sample_id_type"] = "string"
                     meta["extraction"] = {
                         "pooling": pooling,
@@ -1736,7 +1740,6 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
                         "storage_dtype": str(storage_dtype),
                         "runtime_batch_change": False,
                     }
-                    # Compute global checksum if missing
                     if not paths["checksum"].exists():
                         chk = compute_global_checksum(states, batch_size)
                         with open(paths["checksum"], 'w') as cf:
@@ -1760,13 +1763,35 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
             except Exception:
                 pass
         raise RuntimeError("COMPLETION MAP IS FULL BUT DATASET PROVENANCE DOES NOT MATCH THE CURRENT EXPERIMENT")
-    _print_info(f"  Existing progress   : {completed_count:,}/{n_samples:,} ({100*completed_count/max(1,n_samples):.2f}%)", show_info)
-    position = _find_first_incomplete(completed)
-    accepted, accepts_kwargs = get_forward_input_keys(model)
-    context = {"experiment_id": experiment_id, "hyperparameter_hash": hyperparameter_hash, "model": model_name, "dataset": dataset_name, "dataset_fingerprint": fp, "batch_size": batch_size, "pooling": pooling, "max_length": max_length, "device": str(device), "storage_dtype": str(storage_dtype), "model_snapshot": str(model_snapshot) if model_snapshot else None, "dataset_provenance": provenance, "labels": labels_info}
-    totals = {k: 0.0 for k in ("tokenize", "transfer", "forward", "pooling", "convert", "write", "flush")}; total_tokens = 0; successful_batches = 0; started = time.perf_counter(); last_flush = started
 
-    # Global checksum calculator (incremental)
+    # ---- Resume: build list of incomplete sample indices ----
+    incomplete_indices = np.flatnonzero(~completed).tolist()
+    total_incomplete = len(incomplete_indices)
+    _print_info(f"  Existing progress   : {completed_count:,}/{n_samples:,} ({100*completed_count/max(1,n_samples):.2f}%)\n"
+                f"  Incomplete samples  : {total_incomplete:,}", show_info)
+
+    accepted, accepts_kwargs = get_forward_input_keys(model)
+    context = {
+        "experiment_id": experiment_id,
+        "hyperparameter_hash": hyperparameter_hash,
+        "model": model_name,
+        "dataset": dataset_name,
+        "dataset_fingerprint": fp,
+        "batch_size": batch_size,
+        "pooling": pooling,
+        "max_length": max_length,
+        "device": str(device),
+        "storage_dtype": str(storage_dtype),
+        "model_snapshot": str(model_snapshot) if model_snapshot else None,
+        "dataset_provenance": provenance,
+        "labels": labels_info
+    }
+    totals = {k: 0.0 for k in ("tokenize", "transfer", "forward", "pooling", "convert", "write", "flush")}
+    total_tokens = 0
+    successful_batches = 0
+    started = time.perf_counter()
+    last_flush = started
+
     checksum_hasher = hashlib.sha256()
     def update_checksum(batch_data: np.ndarray):
         checksum_hasher.update(batch_data.tobytes())
@@ -1774,128 +1799,217 @@ def extract_dataset(model: torch.nn.Module, tokenizer: Any, dataset: Any, text_c
     reporter = RuntimeReporter(dataset_name, n_samples, completed_count, show_verbose, show_info, show_critical, show_debug, paths["events"], paths["runtime"], context)
     try:
         with reporter, torch.inference_mode():
-            reporter.event("start", f"starting at absolute sample {position}", force=True, start_position=position, existing_completed=completed_count)
-            while position < n_samples:
-                while position < n_samples and bool(completed[position]): position += 1
-                if position >= n_samples: break
-                batch_start = position; end = min(n_samples, position + batch_size); batch_started = time.perf_counter(); prior = np.asarray(completed[batch_start:end], dtype=np.bool_); newly = int((~prior).sum()); rss_before = get_process_rss_gb()
-                try:
-                    reporter.set_stage("tokenization"); t = time.perf_counter(); tok = tokenizer(texts[batch_start:end], padding=True, truncation=True, max_length=max_length, return_tensors="pt", return_attention_mask=True); tokenize_s = time.perf_counter()-t; seq_len = int(tok["input_ids"].shape[1]); actual_tokens = int(tok["attention_mask"].sum().item())
-                    reporter.set_stage("input_transfer"); t = time.perf_counter(); inputs = prepare_model_inputs(tok, device, accepted, accepts_kwargs); mask = tok["attention_mask"].to(device, non_blocking=(device.type != "cpu")); inputs["attention_mask"] = mask; inputs["use_cache"] = False if ("use_cache" in accepted or accepts_kwargs) else inputs.get("use_cache"); inputs = {k:v for k,v in inputs.items() if v is not None}; transfer_s = time.perf_counter()-t
-                    reporter.set_stage("forward"); synchronize_device(device); t = time.perf_counter(); outputs = model(**inputs); synchronize_device(device); forward_s = time.perf_counter()-t; hidden = getattr(outputs, "hidden_states", None)
-                    if hidden is None: raise RuntimeError("Model returned no hidden_states")
-                    if len(hidden) != num_layers: raise RuntimeError(f"Unexpected hidden-state count: returned={len(hidden)} expected={num_layers}")
-                    for i, x in enumerate(hidden):
-                        if x.ndim != 3: raise RuntimeError(f"Hidden state {i} is not rank-3: {x.shape}")
-                        if not bool(torch.isfinite(x).all()): raise RuntimeError(f"Hidden state {i} contains NaN/Inf")
-                    reporter.set_stage("pooling"); t = time.perf_counter(); pooled = pool_hidden_states(hidden, mask, pooling); pooling_s = time.perf_counter()-t
-                    reporter.set_stage("cpu_conversion"); t = time.perf_counter(); pooled_np = pooled.detach().to(torch.float32).cpu().numpy(); convert_s = time.perf_counter()-t
-                    expected_batch = (end-batch_start, num_layers, hidden_size)
-                    if pooled_np.shape != expected_batch: raise RuntimeError(f"Unexpected pooled shape: actual={pooled_np.shape} expected={expected_batch}")
-                    if not np.isfinite(pooled_np).all(): raise RuntimeError("Pooled hidden states contain NaN/Inf")
+            reporter.event("start", f"starting with {total_incomplete} incomplete samples", force=True)
+            processed_incomplete = 0
+            while processed_incomplete < total_incomplete:
+                batch_indices = incomplete_indices[processed_incomplete : processed_incomplete + batch_size]
+                processed_incomplete += len(batch_indices)
+                batch_start = min(batch_indices)
+                batch_end = max(batch_indices) + 1
+                batch_texts = [texts[i] for i in batch_indices]
+                batch_started = time.perf_counter()
 
-                    reporter.set_stage("memmap_write")
-                    t = time.perf_counter()
-                    pooled_final = pooled_np.astype(storage_dtype, copy=False)
-                    states[batch_start:end] = pooled_final
-                    completed[batch_start:end] = True
-                    write_s = time.perf_counter() - t
+                reporter.set_stage("tokenization")
+                t = time.perf_counter()
+                tok = tokenizer(batch_texts, padding=True, truncation=True, max_length=max_length,
+                                return_tensors="pt", return_attention_mask=True)
+                tokenize_s = time.perf_counter() - t
+                seq_len = int(tok["input_ids"].shape[1])
+                actual_tokens = int(tok["attention_mask"].sum().item())
 
-                    # Update global checksum incrementally
-                    update_checksum(pooled_final)
+                reporter.set_stage("input_transfer")
+                t = time.perf_counter()
+                inputs = prepare_model_inputs(tok, device, accepted, accepts_kwargs)
+                mask = tok["attention_mask"].to(device, non_blocking=(device.type != "cpu"))
+                inputs["attention_mask"] = mask
+                inputs["use_cache"] = False if ("use_cache" in accepted or accepts_kwargs) else inputs.get("use_cache")
+                inputs = {k: v for k, v in inputs.items() if v is not None}
+                transfer_s = time.perf_counter() - t
 
-                    # Write batch integrity hash
-                    batch_hash = hashlib.sha256(pooled_final.tobytes()).hexdigest()
-                    with paths["integrity"].open("a", encoding="utf-8") as f:
-                        f.write(json.dumps({"batch_start": batch_start, "batch_end": end, "hash": batch_hash, "timestamp": time.time()}) + "\n")
+                reporter.set_stage("forward")
+                synchronize_device(device)
+                t = time.perf_counter()
+                outputs = model(**inputs)
+                synchronize_device(device)
+                forward_s = time.perf_counter() - t
+                hidden = getattr(outputs, "hidden_states", None)
+                if hidden is None: raise RuntimeError("Model returned no hidden_states")
+                if len(hidden) != num_layers: raise RuntimeError(f"Unexpected hidden-state count: returned={len(hidden)} expected={num_layers}")
+                for i, x in enumerate(hidden):
+                    if x.ndim != 3: raise RuntimeError(f"Hidden state {i} is not rank-3: {x.shape}")
+                    if not bool(torch.isfinite(x).all()): raise RuntimeError(f"Hidden state {i} contains NaN/Inf")
 
-                    successful_batches += 1; total_tokens += actual_tokens; totals["tokenize"] += tokenize_s; totals["transfer"] += transfer_s; totals["forward"] += forward_s; totals["pooling"] += pooling_s; totals["convert"] += convert_s; totals["write"] += write_s; position = end
+                reporter.set_stage("pooling")
+                t = time.perf_counter()
+                pooled = pool_hidden_states(hidden, mask, pooling)
+                pooling_s = time.perf_counter() - t
 
-                    flush_s = 0.0; now = time.perf_counter()
-                    if successful_batches % flush_every_batches == 0 or now-last_flush >= flush_every_seconds or end >= n_samples:
-                        reporter.set_stage("durable_flush"); ft = time.perf_counter()
-                        flush_array(states)
-                        flush_array(completed)
-                        if labels_mmap is not None:
-                            flush_array(labels_mmap)
-                        # No directory fsync – only file fsync inside flush_array
-                        flush_s = time.perf_counter()-ft; totals["flush"] += flush_s; last_flush = time.perf_counter()
-                        save_json(paths["runtime"], {**context, "status": "running", "position": end, "completed": int(completed.sum()), "updated_at": time.time()})
-                    mem = get_memory_info(); disk = get_external_storage_usage(); rss = get_process_rss_gb(); batch_total = time.perf_counter()-batch_started
-                    reporter.set_stage("measurement"); reporter.batch_finished(start=batch_start, end=end, newly_completed=newly, batch_size=batch_size, metrics={"seq_len": seq_len, "actual_tokens": actual_tokens, "tokenize_seconds": tokenize_s, "transfer_seconds": transfer_s, "forward_seconds": forward_s, "pooling_seconds": pooling_s, "convert_seconds": convert_s, "write_seconds": write_s, "flush_seconds": flush_s, "total_seconds": batch_total, "samples_per_sec": (end-batch_start)/max(batch_total,1e-9), "new_samples_per_sec": newly/max(batch_total,1e-9), "tokens_per_second": actual_tokens/max(batch_total,1e-9), "available_gb": mem["available_gb"], "used_gb": mem["used_gb"], "process_rss_gb": rss, "external_free_gb": disk["available_gb"], "batch_memory_delta_gb": max(0.0, rss-rss_before) if rss is not None and rss_before is not None else None, "runtime_batch_change": False, "pre_batch_completed": int(prior.sum()), "newly_completed": newly})
-                except Exception as exc:
-                    diag = runtime_diagnostic_snapshot(stage=reporter.last_stage, model_name=model_name, dataset_name=dataset_name, experiment_id=experiment_id, hyperparameter_hash=hyperparameter_hash, extra={"status":"error", "error_type":type(exc).__name__, "error":str(exc), "traceback":_truncate_traceback(traceback.format_exc()), "batch_start":batch_start, "batch_end":end, "batch_size":batch_size, "last_successful_batch":reporter.last_batch, "recent_batches":list(reporter.recent_batches)})
-                    write_runtime_diagnostic(paths["runtime"], diag); reporter.event("error", f"{type(exc).__name__}: {exc}", force=True, traceback=_truncate_traceback(traceback.format_exc()), batch_start=batch_start, batch_end=end, batch_size=batch_size); raise
+                reporter.set_stage("cpu_conversion")
+                t = time.perf_counter()
+                pooled_np = pooled.detach().to(torch.float32).cpu().numpy()
+                convert_s = time.perf_counter() - t
+                if pooled_np.shape != (len(batch_indices), num_layers, hidden_size):
+                    raise RuntimeError(f"Unexpected pooled shape: actual={pooled_np.shape} expected={(len(batch_indices), num_layers, hidden_size)}")
+                if not np.isfinite(pooled_np).all():
+                    raise RuntimeError("Pooled hidden states contain NaN/Inf")
+
+                reporter.set_stage("memmap_write")
+                t = time.perf_counter()
+                pooled_final = pooled_np.astype(storage_dtype, copy=False)
+                for j, orig_idx in enumerate(batch_indices):
+                    states[orig_idx] = pooled_final[j]
+                    completed[orig_idx] = True
+                write_s = time.perf_counter() - t
+
+                update_checksum(pooled_final)
+
+                batch_hash = hashlib.sha256(pooled_final.tobytes()).hexdigest()
+                with paths["integrity"].open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "batch_start": batch_start,
+                        "batch_end": batch_end,
+                        "batch_indices": batch_indices,  # store actual indices for audit
+                        "hash": batch_hash,
+                        "timestamp": time.time()
+                    }) + "\n")
+
+                successful_batches += 1
+                total_tokens += actual_tokens
+                totals["tokenize"] += tokenize_s
+                totals["transfer"] += transfer_s
+                totals["forward"] += forward_s
+                totals["pooling"] += pooling_s
+                totals["convert"] += convert_s
+                totals["write"] += write_s
+
+                flush_s = 0.0
+                now = time.perf_counter()
+                if successful_batches % flush_every_batches == 0 or now - last_flush >= flush_every_seconds or processed_incomplete >= total_incomplete:
+                    reporter.set_stage("durable_flush")
+                    ft = time.perf_counter()
+                    flush_array(states)
+                    flush_array(completed)
+                    if labels_mmap is not None:
+                        flush_array(labels_mmap)
+                    flush_s = time.perf_counter() - ft
+                    totals["flush"] += flush_s
+                    last_flush = time.perf_counter()
+                    save_json(paths["runtime"], {**context, "status": "running", "position": processed_incomplete, "completed": int(completed.sum()), "updated_at": time.time()})
+
+                mem = get_memory_info()
+                disk = get_external_storage_usage()
+                rss = get_process_rss_gb()
+                batch_total = time.perf_counter() - batch_started
+                reporter.set_stage("measurement")
+                reporter.batch_finished(
+                    start=batch_start,
+                    end=batch_end,
+                    newly_completed=len(batch_indices),
+                    batch_size=batch_size,
+                    metrics={
+                        "seq_len": seq_len,
+                        "actual_tokens": actual_tokens,
+                        "tokenize_seconds": tokenize_s,
+                        "transfer_seconds": transfer_s,
+                        "forward_seconds": forward_s,
+                        "pooling_seconds": pooling_s,
+                        "convert_seconds": convert_s,
+                        "write_seconds": write_s,
+                        "flush_seconds": flush_s,
+                        "total_seconds": batch_total,
+                        "samples_per_sec": len(batch_indices) / max(batch_total, 1e-9),
+                        "new_samples_per_sec": len(batch_indices) / max(batch_total, 1e-9),
+                        "tokens_per_second": actual_tokens / max(batch_total, 1e-9),
+                        "available_gb": mem["available_gb"],
+                        "used_gb": mem["used_gb"],
+                        "process_rss_gb": rss,
+                        "external_free_gb": disk["available_gb"],
+                        "batch_memory_delta_gb": None,
+                        "runtime_batch_change": False,
+                        "pre_batch_completed": 0,
+                        "newly_completed": len(batch_indices),
+                    }
+                )
     except RuntimeError as exc:
-        if is_oom_error(exc): raise RuntimeError(f"FROZEN HYPERPARAMETER OOM\nModel: {model_name}\nDataset: {dataset_name}\nBatch: {batch_size}\nBatch size was NOT changed") from exc
+        if is_oom_error(exc):
+            raise RuntimeError(f"FROZEN HYPERPARAMETER OOM\nModel: {model_name}\nDataset: {dataset_name}\nBatch: {batch_size}\nBatch size was NOT changed") from exc
         raise
-    flush_array(states); flush_array(completed)
-    if labels_mmap is not None: flush_array(labels_mmap)
 
-    # Write global checksum (already updated incrementally, but final digest is stored here)
+    flush_array(states)
+    flush_array(completed)
+    if labels_mmap is not None:
+        flush_array(labels_mmap)
+
     global_checksum = checksum_hasher.hexdigest()
     with open(paths["checksum"], 'w') as cf:
         cf.write(global_checksum)
 
-    elapsed = time.perf_counter()-started; completed_total = int(completed.sum()); new_completed = max(0, completed_total-completed_count); sps = new_completed/max(elapsed,1e-9); tps = total_tokens/max(elapsed,1e-9); work = sum(totals.values())
+    elapsed = time.perf_counter() - started
+    completed_total = int(completed.sum())
+    new_completed = max(0, completed_total - completed_count)
+    sps = new_completed / max(elapsed, 1e-9)
+    tps = total_tokens / max(elapsed, 1e-9)
+    work = sum(totals.values())
     metadata = {
         "format_version": "2.0",
-        "status":"complete" if completed_total == n_samples else "partial",
-        "experiment_id":experiment_id,
-        "hyperparameter_hash":hyperparameter_hash,
-        "model":{"name":model_name,"snapshot":str(model_snapshot) if model_snapshot else None},
-        "dataset":{
-            "name":dataset_name,
-            "text_column":column,
-            "samples":n_samples,
-            "fingerprint":fp,
-            "provenance":provenance,
+        "status": "complete" if completed_total == n_samples else "partial",
+        "experiment_id": experiment_id,
+        "hyperparameter_hash": hyperparameter_hash,
+        "model": {"name": model_name, "snapshot": str(model_snapshot) if model_snapshot else None},
+        "dataset": {
+            "name": dataset_name,
+            "text_column": column,
+            "samples": n_samples,
+            "fingerprint": fp,
+            "provenance": provenance,
             "columns": get_dataset_columns(dataset),
             "labels": labels_info,
             "sample_id_column": "inferred",
             "sample_id_type": "string"
         },
-        "extraction":{
-            "pooling":pooling,
-            "max_length":max_length,
-            "batch_size":batch_size,
-            "device":str(device),
-            "storage_dtype":str(storage_dtype),
-            "runtime_batch_change":False
+        "extraction": {
+            "pooling": pooling,
+            "max_length": max_length,
+            "batch_size": batch_size,
+            "device": str(device),
+            "storage_dtype": str(storage_dtype),
+            "runtime_batch_change": False
         },
-        "integrity":{
+        "integrity": {
             "global_checksum": global_checksum,
             "checksum_algorithm": "sha256"
         },
-        "performance":{
-            "elapsed_seconds":elapsed,
-            "new_completed_samples":new_completed,
-            "completed_samples":completed_total,
-            "samples_per_second":sps,
-            "tokens_per_second":tps,
-            "successful_batches":successful_batches,
-            "timing_seconds":{**totals,"work_time":work,"overhead":max(0.0,elapsed-work)},
-            "final_memory":get_memory_info(),
-            "final_storage":get_external_storage_usage(),
-            "final_process_rss_gb":get_process_rss_gb()
+        "performance": {
+            "elapsed_seconds": elapsed,
+            "new_completed_samples": new_completed,
+            "completed_samples": completed_total,
+            "samples_per_second": sps,
+            "tokens_per_second": tps,
+            "successful_batches": successful_batches,
+            "timing_seconds": {**totals, "work_time": work, "overhead": max(0.0, elapsed - work)},
+            "final_memory": get_memory_info(),
+            "final_storage": get_external_storage_usage(),
+            "final_process_rss_gb": get_process_rss_gb()
         },
-        "diagnostics":{
-            "stage_totals_seconds":reporter.stage_totals,
-            "last_batch":reporter.last_batch,
-            "recent_batches":list(reporter.recent_batches),
-            "rolling_mean_batch_seconds":reporter.rolling_mean,
-            "rolling_median_batch_seconds":reporter.rolling_median,
-            "rolling_p95_batch_seconds":reporter.rolling_p95,
-            "rolling_max_batch_seconds":reporter.rolling_max,
-            "anomaly_count":reporter.anomaly_count,
-            "slow_batch_count":reporter.slow_batch_count,
-            "peak_rss_gb":reporter.peak_rss_gb,
-            "minimum_available_ram_gb":reporter.minimum_available_ram_gb,
-            "verbosity":{"verbose":show_verbose,"info":show_info,"critical":show_critical,"debug":show_debug}
+        "diagnostics": {
+            "stage_totals_seconds": reporter.stage_totals,
+            "last_batch": reporter.last_batch,
+            "recent_batches": list(reporter.recent_batches),
+            "rolling_mean_batch_seconds": reporter.rolling_mean,
+            "rolling_median_batch_seconds": reporter.rolling_median,
+            "rolling_p95_batch_seconds": reporter.rolling_p95,
+            "rolling_max_batch_seconds": reporter.rolling_max,
+            "anomaly_count": reporter.anomaly_count,
+            "slow_batch_count": reporter.slow_batch_count,
+            "peak_rss_gb": reporter.peak_rss_gb,
+            "minimum_available_ram_gb": reporter.minimum_available_ram_gb,
+            "verbosity": {"verbose": show_verbose, "info": show_info, "critical": show_critical, "debug": show_debug}
         },
-        "storage":{k:str(v) for k,v in paths.items()}
+        "storage": {k: str(v) for k, v in paths.items()}
     }
-    save_json(paths["metadata"], metadata); save_json(paths["runtime"], metadata); append_jsonl(MEASUREMENT_LEDGER, metadata)
+    save_json(paths["metadata"], metadata)
+    save_json(paths["runtime"], metadata)
+    append_jsonl(MEASUREMENT_LEDGER, metadata)
     _print_critical(f"✓ DATASET COMPLETE: {dataset_name}\n  Newly computed     : {new_completed:,}\n  Total completed    : {completed_total:,}/{n_samples:,}\n  Elapsed            : {_format_duration(elapsed)}\n  Throughput         : {sps:.2f} samples/s\n  Token throughput   : {tps:.2f} tokens/s\n  Work time          : {_format_duration(work)}\n  Pipeline overhead  : {_format_duration(max(0.0,elapsed-work))}", show_critical)
     return metadata
 
@@ -2334,17 +2448,30 @@ def check_transformers_version(spec: ModelSpec) -> tuple[bool, str | None]:
 
 def _prepare_environment(params: HyperParameters) -> tuple[torch.device, dict[str, Any]]:
     device = get_best_device()
-    if device.type == "cpu" and params.cpu_dtype == "bfloat16":
-        # Check if bfloat16 is supported
-        try:
-            torch.tensor([1.0], dtype=torch.bfloat16)
-        except Exception:
-            # Fallback to float32
-            params = HyperParameters(**{**params.as_dict(), "cpu_dtype": "float32"})
+    # Optimize CPU settings
+    if device.type == "cpu":
+        # Use all logical cores, but cap at 8 for efficiency
+        num_threads = min(os.cpu_count() or 1, 8)
+        torch.set_num_threads(num_threads)
+        torch.backends.mkldnn.enabled = True
+        os.environ.setdefault("OMP_NUM_THREADS", str(num_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+        if params.cpu_dtype == "bfloat16":
+            # Check if bfloat16 is supported; fallback to float32
+            try:
+                torch.tensor([1.0], dtype=torch.bfloat16)
+            except Exception:
+                params = HyperParameters(**{**params.as_dict(), "cpu_dtype": "float32"})
     configure_cpu_threads(params.cpu_threads)
     configure_cpu_interop_threads(params.cpu_interop_threads)
-    environment = {"system_fingerprint":system_fingerprint(),"system":{"cpu":get_cpu_info(),"memory":get_memory_info(),"platform":platform.platform()},"torch_version":torch.__version__,"transformers_version":transformers.__version__,"numpy_version":np.__version__,"device":str(device)}
-    
+    environment = {
+        "system_fingerprint": system_fingerprint(),
+        "system": {"cpu": get_cpu_info(), "memory": get_memory_info(), "platform": platform.platform()},
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "numpy_version": np.__version__,
+        "device": str(device),
+    }
     return device, environment
 
 def _prepare_environment(params: HyperParameters) -> tuple[torch.device, dict[str, Any]]:
