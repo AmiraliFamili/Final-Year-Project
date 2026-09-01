@@ -1,7 +1,12 @@
 """
-Unified Hidden‑State Probe v4.2 – Compatible with v2 extraction format.
-Adds support for sample_ids, text_hashes, optional checksum verification,
-and robust error handling in the matrix run.
+Unified Hidden‑State Probe v4.3 – Fully deterministic trial folders, hyperparameter capture,
+and robust result management.
+
+This version builds on v4.2 and adds:
+- Deterministic output directory naming based on a full trial configuration hash.
+- Automatic skipping of already completed trials.
+- A complete `summary.json` that provides a concise overview of each run.
+- Enhanced logging for better observability.
 """
 
 from __future__ import annotations
@@ -12,7 +17,6 @@ import copy
 import hashlib
 import importlib
 import json
-import seaborn
 import math
 import os
 import random
@@ -22,12 +26,15 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from tqdm.auto import tqdm
 
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -50,15 +57,20 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from tqdm.auto import tqdm
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 import platform
 import sys
-import importlib
-import psutil  # optional, fallback if not installed
-import torch
+
+# Optional psutil for memory info
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+# -----------------------------------------------------------------------------
+# Environment helpers
+# -----------------------------------------------------------------------------
 
 def get_environment_info() -> dict:
     """Collect comprehensive environment details."""
@@ -88,9 +100,7 @@ def get_environment_info() -> dict:
         },
         "memory": {},
     }
-    # Add memory info if psutil is available
-    try:
-        import psutil
+    if psutil is not None:
         vm = psutil.virtual_memory()
         info["memory"] = {
             "total_gb": vm.total / (1024**3),
@@ -98,17 +108,16 @@ def get_environment_info() -> dict:
             "used_gb": vm.used / (1024**3),
             "percent_used": vm.percent,
         }
-    except ImportError:
-        pass
     return info
 
-# =============================================================================
+
+# -----------------------------------------------------------------------------
 # Constants
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/hidden_states")
 DEFAULT_SEED = 42
-SCRIPT_VERSION = "4.2.0-v2"
+SCRIPT_VERSION = "4.3.0"
 DEBUG_MODE = False
 VERBOSE_DEFAULT = 3 if DEBUG_MODE else 0
 
@@ -132,97 +141,9 @@ COMMON_LABEL_COLUMNS = [
 COMMON_ID_COLUMNS = {"id", "idx", "index", "user_id", "conv_id", "utterance_idx"}
 
 
-# =============================================================================
-# General helpers
-# =============================================================================
-
-def save_complete_run_metadata(
-    analyzer: UnifiedProbeAnalyzer,
-    results_df: pd.DataFrame,
-    best_df: pd.DataFrame,
-    control_df: pd.DataFrame | None = None,
-    extra_info: dict | None = None,
-) -> Path:
-    """
-    Save a comprehensive metadata file next to the run results.
-    Includes configuration, environment, validation, and final metrics.
-    """
-    output_dir = analyzer.output_dir
-    metadata_path = output_dir / "complete_run_metadata.json"
-
-    # 1. Base configuration
-    config_dict = {
-        "script_version": SCRIPT_VERSION,
-        "created_at": time.time(),
-        "dataset_contract": asdict(analyzer.config.dataset),
-        "probes": [asdict(p) for p in analyzer.config.probes],
-        "split": asdict(analyzer.config.split),
-        "repeats": analyzer.config.repeats,
-        "max_samples": analyzer.config.max_samples,
-        "layers": analyzer.layers,
-        "analysis": asdict(analyzer.config),  # includes all analysis flags
-        "score_weights": _normalise_weights(analyzer.config.score_weights),
-        "device": analyzer.device,
-    }
-
-    # 2. Artifact summary
-    artifact_summary = analyzer.artifact.analysis_summary()
-    # Remove potentially large provenance dict if needed (already stored)
-    artifact_summary.pop("provenance", None)
-
-    # 3. Target and validation
-    target_info = {
-        "target_metadata": analyzer.target_meta,
-        "target_validation": analyzer.target_validation,
-        "text_alignment": analyzer.text_alignment,
-        "label_alignment": analyzer.label_alignment,
-        "classes": analyzer.classes,
-        "label_entropy_bits": label_entropy(analyzer.y, analyzer.task_type),
-    }
-
-    # 4. Environment
-    environment = get_environment_info()
-
-    # 5. Results summary (aggregate metrics)
-    if not results_df.empty:
-        results_summary = {
-            "rows": len(results_df),
-            "columns": list(results_df.columns),
-            "best_per_probe": best_df.to_dict("records") if best_df is not None else [],
-            "layer_wise_metrics": {
-                "test_macro_f1_by_layer": results_df.groupby("layer_index")["test_macro_f1"].mean().to_dict(),
-                "probe_score_by_layer": results_df.groupby("layer_index")["probe_score"].mean().to_dict(),
-            },
-        }
-    else:
-        results_summary = {"rows": 0, "columns": [], "best_per_probe": [], "layer_wise_metrics": {}}
-
-    # 6. Control summary if available
-    control_summary = None
-    if control_df is not None and not control_df.empty:
-        control_summary = {
-            "rows": len(control_df),
-            "mean_control_macro_f1": float(control_df["control_test_macro_f1"].mean()),
-            "by_layer": control_df.groupby("layer_index")["control_test_macro_f1"].mean().to_dict(),
-        }
-
-    # 7. Extra user-provided info (e.g., command-line args, notebook cell id)
-    extra = extra_info or {}
-
-    full_metadata = {
-        "run_id": output_dir.name,
-        "output_directory": str(output_dir),
-        "configuration": config_dict,
-        "artifact": artifact_summary,
-        "target": target_info,
-        "environment": environment,
-        "results": results_summary,
-        "controls": control_summary,
-        "extra_info": extra,
-    }
-
-    save_json(metadata_path, full_metadata)
-    return metadata_path
+# -----------------------------------------------------------------------------
+# General utilities
+# -----------------------------------------------------------------------------
 
 def stable_hash(value: Any, length: int = 16) -> str:
     payload = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str).encode()
@@ -283,9 +204,6 @@ def sample_indices(n: int, max_n: int, seed: int) -> np.ndarray:
 
 
 def fingerprint_values(values: Sequence[Any], *, length: int = 20) -> str:
-    """Mirror the extraction pipeline's dataset_fingerprint.
-    Uses first/last 16 samples to match extraction's stable_hash input.
-    """
     vals = one_dim_strings(values)
     return stable_hash({
         "n": len(vals),
@@ -297,84 +215,6 @@ def fingerprint_values(values: Sequence[Any], *, length: int = 20) -> str:
 def sequence_hash(values: Sequence[Any], *, length: int = 20) -> str:
     return stable_hash(list(values), length)
 
-
-# In unified_hidden_state_probe_v4_2.py
-
-def build_trial_config(
-    artifact: ExtractionArtifact,
-    config: AnalysisConfig,
-    external_root: Path,
-    experiment_id: str,
-    dataset_name: str,
-) -> dict:
-    """Flatten all parameters that define a probe trial."""
-    cfg_dict = {
-        "extraction": {
-            "model_name": artifact.model_name,
-            "dataset_name": artifact.dataset_name,
-            "experiment_id": experiment_id,
-            "pooling": artifact.pooling,
-            "max_length": artifact.metadata.get("extraction", {}).get("max_length"),
-            "batch_size": artifact.metadata.get("extraction", {}).get("batch_size"),
-            "storage_dtype": artifact.metadata.get("extraction", {}).get("storage_dtype"),
-            "hidden_layers": artifact.hidden_layers,
-            "hidden_size": artifact.hidden_size,
-            "dataset_fingerprint": artifact.dataset_fingerprint,
-            "model_snapshot": artifact.metadata.get("model", {}).get("snapshot"),
-        },
-        "dataset_contract": asdict(config.dataset),
-        "probes": [asdict(p) for p in config.probes],
-        "split": asdict(config.split),
-        "analysis": {
-            # Layers selected
-            "layers": config.layers,
-            # Repetitions and sampling
-            "repeats": config.repeats,
-            "max_samples": config.max_samples,
-            # Controls
-            "shuffled_label_control": config.shuffled_label_control,
-            "shuffled_control_repeats": config.shuffled_control_repeats,
-            "run_control_on_all_layers": config.run_control_on_all_layers,
-            # Geometry
-            "pca_enabled": config.pca_enabled,
-            "pca_samples": config.pca_samples,
-            "silhouette_enabled": config.silhouette_enabled,
-            "silhouette_samples": config.silhouette_samples,
-            # Extra measurements
-            "enable_abstention": config.enable_abstention,
-            "enable_per_class_metrics": config.enable_per_class_metrics,
-            "enable_feature_statistics": config.enable_feature_statistics,
-            # Score weights and penalty
-            "score_weights": config.score_weights,
-            "complexity_penalty_scale": config.complexity_penalty_scale,
-            # Output subdir (not part of trial identity, but kept for record)
-            "output_subdir": config.output_subdir,
-            # Verbosity level (does not affect results, but included for completeness)
-            "verbose": config.verbose,
-        },
-        "probe_version": SCRIPT_VERSION,
-        # Environment fingerprint – optional but useful for reproducibility
-        "environment_fingerprint": stable_hash(get_environment_info(), 8),
-    }
-    return cfg_dict
-
-def generate_trial_hash(config_dict: dict) -> str:
-    return stable_hash(config_dict, length=12)
-
-def build_trial_dir_name(
-    config_dict: dict,
-    trial_hash: str,
-    max_path_length: int = 200,
-) -> str:
-    """Create a readable folder name that includes key parameters and hash."""
-    ext = config_dict["extraction"]
-    probes = "+".join([p["name"] for p in config_dict["probes"]])
-    max_samples = config_dict["analysis"]["max_samples"] or "full"
-    repeats = config_dict["analysis"]["repeats"]
-    return (
-        f"probe_run__{ext['model_name'].replace('/', '_')}__{ext['dataset_name']}"
-        f"__max{max_samples}__rep{repeats}__probes={probes}__hash{trial_hash}"
-    )
 
 def safe_relative_output(root: Path, candidate: Path) -> Path:
     root = root.resolve()
@@ -401,15 +241,14 @@ def clamp01(x: float) -> float:
     return float(np.clip(float(x), 0.0, 1.0))
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Configuration dataclasses
+# -----------------------------------------------------------------------------
 
 @dataclass
 class DatasetContract:
-    target_type: str = "auto"              # auto/goemotions/isear/custom
-    type: str = "python"                   # python/file
+    target_type: str = "auto"
+    type: str = "python"
     module: str | None = None
     function: str | None = None
     path: str | None = None
@@ -419,16 +258,14 @@ class DatasetContract:
     label_column: str | None = "auto"
     id_column: str | None = "auto"
 
-    task_type: str = "auto"                # auto/single_label/multi_label
-    label_format: str = "auto"             # auto/scalar/integer_id_list/string_list
-    single_label_policy: str | None = None # first_label/lowest_id/error_on_multi
+    task_type: str = "auto"
+    label_format: str = "auto"
+    single_label_policy: str | None = None
     class_order: list[str] | None = None
 
-    # Stronger alignment checks when extraction metadata contains row identifiers.
     require_provenance: bool = False
     require_label_fingerprint: bool = False
-    
-    lenient_provenance: bool = False 
+    lenient_provenance: bool = False
 
 
 @dataclass
@@ -454,14 +291,12 @@ class ProbeSpec:
     complexity: str = "linear"         # linear/1_hidden/2_hidden/3_hidden/custom
     standardize: bool = True
 
-    # Logistic complexity control.
     C: float = 1.0
     max_iter: int = 2000
 
-    # MLP complexity control. "0.5d" means half of the representation width D.
     hidden_dims: list[int | str] = field(default_factory=list)
     hidden_width_ratio: float = 0.5
-    width_schedule: str = "halving"    # halving/constant/custom
+    width_schedule: str = "halving"
 
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
@@ -483,23 +318,19 @@ class AnalysisConfig:
     repeats: int = 3
     max_samples: int | None = None
 
-    # Controls.
     shuffled_label_control: bool = True
     shuffled_control_repeats: int = 3
     run_control_on_all_layers: bool = True
 
-    # Geometry.
     pca_enabled: bool = True
     pca_samples: int = 3000
     silhouette_enabled: bool = True
     silhouette_samples: int = 3000
 
-    # Extra measurements.
     enable_abstention: bool = True
     enable_per_class_metrics: bool = True
     enable_feature_statistics: bool = True
 
-    # Final score. Weights are normalised internally.
     score_weights: dict[str, float] = field(default_factory=lambda: {
         "macro_f1": 0.25,
         "balanced_accuracy": 0.15,
@@ -510,11 +341,9 @@ class AnalysisConfig:
         "geometry": 0.05,
     })
 
-    # Complexity penalty is deliberately small; complexity is reported separately.
     complexity_penalty_scale: float = 0.02
     output_subdir: str = "analysis/probes"
 
-    # Runtime diagnostics. 0=clean runtime, 1=lifecycle, 2=layer/repeat, 3=per-probe.
     verbose: int = VERBOSE_DEFAULT
 
     def validate_verbose(self) -> None:
@@ -601,21 +430,16 @@ def load_config(path: Path) -> AnalysisConfig:
 
 
 def load_complete_metadata(run_dir_or_file: Path) -> dict:
-    """Load complete_run_metadata.json from either the run directory or the file itself."""
     path = Path(run_dir_or_file)
     if path.is_dir():
         path = path / "complete_run_metadata.json"
-    # If path is a file but not named 'complete_run_metadata.json', we assume it's the metadata file.
-    # If it's neither, we append the expected filename (best effort).
     elif path.name != "complete_run_metadata.json":
-        # If it has a .json suffix but different name, treat as metadata? 
-        # For safety, append standard name if it doesn't exist
         if not path.exists():
             path = path / "complete_run_metadata.json"
     with open(path, "r") as f:
         return json.load(f)
-    
-    
+
+
 def write_example_config(path: Path) -> None:
     example = {
         "dataset": {
@@ -712,7 +536,6 @@ def write_example_config(path: Path) -> None:
 
 
 class ProbeLogger:
-    """Centralised runtime diagnostics."""
     def __init__(self, level: int):
         self.level = int(level)
         self.t0 = time.perf_counter()
@@ -729,10 +552,9 @@ class ProbeLogger:
             self.emit("=" * 96, level)
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Extraction artifact (v2 compatible)
-# =============================================================================
-
+# -----------------------------------------------------------------------------
 
 class ExtractionArtifact:
     def __init__(self, dataset_dir: Path, verify_checksum: bool = False):
@@ -758,7 +580,6 @@ class ExtractionArtifact:
         self.states = np.load(self.states_path, mmap_mode="r")
         self.completed = np.load(self.completed_path, mmap_mode="r")
 
-        # Load optional v2 artifacts
         self.sample_ids = None
         if self.sample_ids_path.exists():
             self.sample_ids = np.load(self.sample_ids_path, allow_pickle=True)
@@ -774,18 +595,15 @@ class ExtractionArtifact:
             with open(self.checksum_path, "r") as f:
                 self.checksum_stored = f.read().strip()
 
-        # Optionally verify checksum (may be slow for large files)
         if verify_checksum and self.checksum_stored is not None:
             self._verify_checksum()
 
         self.validation = self._validate()
 
     def _verify_checksum(self) -> None:
-        """Compute SHA256 of the entire hidden_states array and compare."""
-        # Compute in chunks to avoid memory blow
         hasher = hashlib.sha256()
         n_samples, n_layers, n_hidden = self.states.shape
-        chunk = 1024 * n_layers * n_hidden  # ~1k samples per chunk
+        chunk = 1024 * n_layers * n_hidden
         for start in range(0, n_samples, chunk):
             end = min(start + chunk, n_samples)
             hasher.update(np.asarray(self.states[start:end]).tobytes())
@@ -797,9 +615,7 @@ class ExtractionArtifact:
     def model_name(self):
         name = self.metadata.get("model", {}).get("name")
         if not name:
-            # Fallback: derive from dataset_dir path (e.g., .../models/<provider>/<model>/datasets/<ds>)
             parts = self.dataset_dir.parts
-            # find 'models' and take next two parts
             try:
                 idx = parts.index('models')
                 name = '/'.join(parts[idx+1:idx+3])
@@ -812,12 +628,8 @@ class ExtractionArtifact:
         name = self.metadata.get("dataset", {}).get("name")
         if name:
             return name
-        # fallback: if the last part is 'datasets', use the parent model name + '_' + something?
-        parts = self.dataset_dir.parts
-        if parts[-1] == 'datasets':
-            # maybe return the experiment dataset identifier from metadata?
-            return self.metadata.get("dataset", {}).get("text_column", "unknown")
         return self.dataset_dir.name
+
     @property
     def sample_count(self) -> int:
         return int(self.metadata.get("dataset", {}).get("samples", self.states.shape[0]))
@@ -847,8 +659,8 @@ class ExtractionArtifact:
         return dict(self.metadata.get("dataset", {}).get("provenance", {}))
 
     def _validate(self) -> dict[str, Any]:
-        issues: list[str] = []
-        warnings: list[str] = []
+        issues = []
+        warnings = []
 
         if self.states.ndim != 3:
             issues.append(f"hidden_states.npy must be rank-3 [N,L,D], got {self.states.shape}")
@@ -870,15 +682,12 @@ class ExtractionArtifact:
         if not bool(np.all(self.completed)):
             issues.append("Completion map is incomplete; partial extraction is not scientifically safe to probe")
 
-        # Sample IDs check
         if self.sample_ids is not None and len(self.sample_ids) != self.sample_count:
             issues.append(f"sample_ids length {len(self.sample_ids)} != sample count {self.sample_count}")
 
-        # Text hashes check
         if self.text_hashes is not None and len(self.text_hashes) != self.sample_count:
             issues.append(f"text_hashes length {len(self.text_hashes)} != sample count {self.sample_count}")
 
-        # Sampled finite check avoids materialising the full mmap at validation time.
         idx = np.linspace(0, self.states.shape[0] - 1, num=min(8, self.states.shape[0]), dtype=int)
         sample = np.asarray(self.states[idx], dtype=np.float32)
         if not np.isfinite(sample).all():
@@ -928,10 +737,9 @@ class ExtractionArtifact:
         }
 
 
-# =============================================================================
-# Dataset loading and label adapters (unchanged)
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Dataset loading and label adapters
+# -----------------------------------------------------------------------------
 
 def import_callable(module_name: str, function_name: str):
     module = importlib.import_module(module_name)
@@ -1003,7 +811,7 @@ def resolve_column(
         return exact[0], {"mode": "auto", "column": exact[0], "candidates": exact, "ambiguous": len(exact) > 1}
 
     if role == "text" and allow_scored_text_guess:
-        scored: list[tuple[float, str]] = []
+        scored = []
         for c in available:
             if c.lower() in COMMON_ID_COLUMNS:
                 continue
@@ -1092,11 +900,10 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
     id_map = {i: name for i, name in enumerate(GOEMOTIONS_CLASSES)}
     by_name = {_normalise_name(k): k for k in GOEMOTIONS_CLASSES}
 
-    def decode_one_row(value: Any, row_index: int) -> tuple[list[int], list[str], str]:
+    def decode_one_row(value, row_index):
         value2 = _maybe_literal(value)
         if isinstance(value2, np.ndarray):
             value2 = value2.tolist()
-
         if isinstance(value2, (list, tuple, set)):
             seq = list(value2)
             source_mode = "sequence"
@@ -1120,22 +927,16 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
             seq = [value2]
             source_mode = "scalar"
 
-        current_ids: list[int] = []
-        current_names: list[str] = []
+        current_ids, current_names = [], []
         mode = source_mode
-
         for item in seq:
             if isinstance(item, (int, np.integer)):
                 idx = int(item)
                 if idx < 0 or idx >= len(GOEMOTIONS_CLASSES):
-                    raise ValueError(
-                        f"GoEmotions row {row_index} has invalid label ID {idx}; "
-                        f"valid IDs are 0..{len(GOEMOTIONS_CLASSES)-1}"
-                    )
+                    raise ValueError(f"GoEmotions row {row_index} has invalid label ID {idx}")
                 current_ids.append(idx)
                 current_names.append(id_map[idx])
                 continue
-
             if isinstance(item, str):
                 item_clean = item.strip()
                 if re.fullmatch(r"\d+", item_clean):
@@ -1145,31 +946,19 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
                     current_ids.append(idx)
                     current_names.append(id_map[idx])
                     continue
-
                 name = _normalise_name(item_clean)
                 if name not in by_name:
-                    raise ValueError(
-                        f"GoEmotions row {row_index} has unknown label name {item!r}. "
-                        f"Expected an ID in 0..{len(GOEMOTIONS_CLASSES)-1} or one of "
-                        f"{GOEMOTIONS_CLASSES}."
-                    )
+                    raise ValueError(f"GoEmotions row {row_index} has unknown label name {item!r}")
                 canonical = by_name[name]
                 current_names.append(canonical)
                 current_ids.append(GOEMOTIONS_CLASSES.index(canonical))
                 mode = "string_name"
                 continue
-
-            raise ValueError(
-                f"GoEmotions row {row_index} contains unsupported label value {item!r} "
-                f"of type {type(item).__name__}"
-            )
-
+            raise ValueError(f"GoEmotions row {row_index} contains unsupported label value {item!r}")
         if not current_ids:
             raise ValueError(f"GoEmotions row {row_index} has no labels")
-
-        seen: set[int] = set()
-        ids_unique: list[int] = []
-        names_unique: list[str] = []
+        seen = set()
+        ids_unique, names_unique = [], []
         for idx, name in zip(current_ids, current_names):
             if idx not in seen:
                 seen.add(idx)
@@ -1177,9 +966,7 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
                 names_unique.append(name)
         return ids_unique, names_unique, mode
 
-    parsed_ids: list[list[int]] = []
-    parsed_names: list[list[str]] = []
-    modes: set[str] = set()
+    parsed_ids, parsed_names, modes = [], [], set()
     for i, value in enumerate(raw):
         ids, names, mode = decode_one_row(value, i)
         parsed_ids.append(ids)
@@ -1211,14 +998,8 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
     if policy not in {"first_label", "lowest_id", "error_on_multi"}:
         raise ValueError(f"Unsupported GoEmotions single_label_policy={policy}")
     if policy == "error_on_multi" and any(len(x) != 1 for x in parsed_ids):
-        raise ValueError(
-            "GoEmotions contains multi-label examples. Set task_type='multi_label' "
-            "or explicitly choose a single_label_policy."
-        )
-    y = np.asarray([
-        labels[0] if policy == "first_label" else min(labels)
-        for labels in parsed_ids
-    ], dtype=np.int64)
+        raise ValueError("GoEmotions contains multi-label examples. Set task_type='multi_label' or choose a single_label_policy.")
+    y = np.asarray([labels[0] if policy == "first_label" else min(labels) for labels in parsed_ids], dtype=np.int64)
     return y, GOEMOTIONS_CLASSES, {
         "adapter": "goemotions",
         "task_type": "single_label",
@@ -1234,24 +1015,17 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
 
 def canonical_isear_target(df: pd.DataFrame, contract: DatasetContract):
     label_col, resolution = resolve_column(
-            df, contract.label_column,
-            ["emotion", "label", "labels", "category", "emotion_label"],
-            role="label",
-        )
+        df, contract.label_column,
+        ["emotion", "label", "labels", "category", "emotion_label"],
+        role="label",
+    )
     raw_values = df[label_col].tolist()
-    aliases = {
-        "joy": "joy", "fear": "fear", "anger": "anger", "sadness": "sadness",
-        "disgust": "disgust", "shame": "shame", "guilt": "guilt",
-    }
-    # Detect if labels are integers
+    aliases = {"joy": "joy", "fear": "fear", "anger": "anger", "sadness": "sadness", "disgust": "disgust", "shame": "shame", "guilt": "guilt"}
     if all(isinstance(x, (int, np.integer)) for x in raw_values):
-        # Map integer to class names using the class_order list positions
         order = contract.class_order or ISEAR_CLASSES
         if len(order) != 7:
             raise ValueError("ISEAR class_order must contain 7 emotions for numeric mapping.")
-        # Convert to integer indices (0-based)
         y = np.asarray([int(x) - 1 for x in raw_values], dtype=np.int64)
-        # Optional: ensure indices are within range
         if np.any(y < 0) or np.any(y >= len(order)):
             raise ValueError("ISEAR numeric labels out of range.")
         return y, order, {
@@ -1264,12 +1038,12 @@ def canonical_isear_target(df: pd.DataFrame, contract: DatasetContract):
             "normalisation": "numeric index to class_order",
         }
     else:
-        raw = [_normalise_name(x) for x in df[label_col].tolist()]
-        normalised: list[str] = []
+        raw = [_normalise_name(x) for x in raw_values]
+        normalised = []
         for i, x in enumerate(raw):
             key = aliases.get(x)
             if key is None:
-                raise ValueError(f"ISEAR row {i} has unknown emotion {x!r}; expected {ISEAR_CLASSES}")
+                raise ValueError(f"ISEAR row {i} has unknown emotion {x!r}")
             normalised.append(key)
         order = contract.class_order or ISEAR_CLASSES
         mapping = {_normalise_name(name): i for i, name in enumerate(order)}
@@ -1293,9 +1067,7 @@ def canonical_custom_target(df: pd.DataFrame, contract: DatasetContract):
     raw = df[label_col].tolist()
     task_type = contract.task_type
 
-    if task_type == "multi_label" or (
-        task_type == "auto" and any(isinstance(_maybe_literal(x), (list, tuple, set)) for x in raw)
-    ):
+    if task_type == "multi_label" or (task_type == "auto" and any(isinstance(_maybe_literal(x), (list, tuple, set)) for x in raw)):
         label_lists = [parse_string_list(x) for x in raw]
         classes = contract.class_order or sorted({x for row in label_lists for x in row})
         mapping = {str(name): i for i, name in enumerate(classes)}
@@ -1344,10 +1116,9 @@ def build_targets(df: pd.DataFrame, contract: DatasetContract):
     raise ValueError(f"Unsupported target_type={target_type}")
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Provenance and target validation
-# =============================================================================
-
+# -----------------------------------------------------------------------------
 
 def _get_metadata_text_hashes(artifact: ExtractionArtifact) -> dict[str, str | None]:
     prov = artifact.provenance
@@ -1359,20 +1130,12 @@ def _get_metadata_text_hashes(artifact: ExtractionArtifact) -> dict[str, str | N
         "native_fingerprint": prov.get("native_fingerprint"),
     }
 
-def validate_text_alignment(
-    artifact: ExtractionArtifact,
-    df: pd.DataFrame,
-    contract: DatasetContract,
-) -> dict[str, Any]:
-    text_col, resolution = resolve_column(
-        df, contract.text_column, COMMON_TEXT_COLUMNS,
-        role="text", allow_scored_text_guess=True,
-    )
+
+def validate_text_alignment(artifact, df, contract):
+    text_col, resolution = resolve_column(df, contract.text_column, COMMON_TEXT_COLUMNS, role="text", allow_scored_text_guess=True)
     texts = one_dim_strings(df[text_col].tolist())
     if len(texts) != artifact.sample_count:
-        raise RuntimeError(
-            f"Text row count={len(texts)} differs from hidden-state count={artifact.sample_count}"
-        )
+        raise RuntimeError(f"Text row count={len(texts)} differs from hidden-state count={artifact.sample_count}")
 
     observed = {
         "derived_fingerprint": fingerprint_values(texts),
@@ -1380,9 +1143,8 @@ def validate_text_alignment(
         "tail_hash": sequence_hash(texts[-100:]),
     }
     expected = _get_metadata_text_hashes(artifact)
-    checks: dict[str, bool] = {}
-    checked_fields: list[str] = []
-
+    checks = {}
+    checked_fields = []
     for key in ("derived_fingerprint", "head_hash", "tail_hash"):
         if expected[key] is not None:
             checked_fields.append(key)
@@ -1394,24 +1156,17 @@ def validate_text_alignment(
             head_ok = checks.get("head_hash", True)
             tail_ok = checks.get("tail_hash", True)
             if not (head_ok and tail_ok):
-                raise RuntimeError(
-                    "Dataset/text provenance mismatch (head/tail). Refusing to probe.\n"
-                    + json.dumps({"expected": expected, "observed": observed, "checks": checks}, indent=2, default=str)
-                )
-            # Accept if head and tail match, even if full derived_fingerprint differs
+                raise RuntimeError("Dataset/text provenance mismatch (head/tail).")
             if "derived_fingerprint" in checks and not checks["derived_fingerprint"]:
                 warning = "Derived fingerprint mismatch but head/tail match. Proceeding with lenient provenance."
         else:
             if not all(checks.values()):
-                raise RuntimeError(
-                    "Dataset/text provenance mismatch. Refusing to probe.\n"
-                    + json.dumps({"expected": expected, "observed": observed, "checks": checks}, indent=2, default=str)
-                )
+                raise RuntimeError("Dataset/text provenance mismatch.")
+
     provenance_available = bool(checked_fields)
     if contract.require_provenance and not provenance_available:
         raise RuntimeError("require_provenance=True but extraction metadata contains no usable text provenance hashes.")
 
-    # sample_ids check
     sample_ids_match = None
     if artifact.sample_ids is not None:
         id_col = contract.id_column
@@ -1421,7 +1176,6 @@ def validate_text_alignment(
                 sample_ids_match = bool(np.array_equal(df_ids, artifact.sample_ids))
             else:
                 sample_ids_match = False
-        # else can't verify
 
     return {
         "status": "verified" if provenance_available else "unverified",
@@ -1439,51 +1193,28 @@ def validate_text_alignment(
     }
 
 
-def validate_label_alignment(
-    artifact: ExtractionArtifact,
-    df: pd.DataFrame,
-    contract: DatasetContract,
-    y: np.ndarray,
-    classes: Sequence[str],
-) -> dict[str, Any]:
-    observed = stable_hash({
-        "classes": list(classes),
-        "labels": np.asarray(y).tolist(),
-    }, 24)
+def validate_label_alignment(artifact, df, contract, y, classes):
+    observed = stable_hash({"classes": list(classes), "labels": np.asarray(y).tolist()}, 24)
     expected = artifact.provenance.get("label_fingerprint") or artifact.provenance.get("target_fingerprint")
-
     if expected is not None and expected != observed:
-        raise RuntimeError(
-            "Label provenance mismatch. Refusing to probe because the stored target "
-            "fingerprint disagrees with the clean-dataset target.\n"
-            + json.dumps({"expected": expected, "observed": observed}, indent=2)
-        )
+        raise RuntimeError("Label provenance mismatch.")
     if expected is None and contract.require_label_fingerprint:
-        raise RuntimeError(
-            "require_label_fingerprint=True but extraction metadata contains no label/target fingerprint."
-        )
-
+        raise RuntimeError("require_label_fingerprint=True but extraction metadata contains no label/target fingerprint.")
     return {
         "status": "verified" if expected is not None else "unverified",
         "verified": expected is not None,
         "provenance_available": expected is not None,
         "label_fingerprint": observed,
         "metadata_label_fingerprint": expected,
-        "warning": None if expected is not None else (
-            "No label fingerprint was stored during extraction. Clean labels were "
-            "reconstructed deterministically, but extraction-time row identity is not "
-            "cryptographically proven by the existing artifact."
-        ),
+        "warning": None if expected is not None else "No label fingerprint was stored during extraction.",
     }
 
 
-def validate_targets(y: np.ndarray, classes: Sequence[str], task_type: str) -> dict[str, Any]:
-    issues: list[str] = []
-    warnings: list[str] = []
+def validate_targets(y, classes, task_type):
+    issues, warnings = [], []
     y = np.asarray(y)
     if len(classes) < 2:
         issues.append("At least two classes are required")
-
     if task_type == "single_label":
         if y.ndim != 1:
             issues.append(f"Single-label target must be rank-1, got {y.shape}")
@@ -1520,18 +1251,16 @@ def validate_targets(y: np.ndarray, classes: Sequence[str], task_type: str) -> d
                 issues.append("No positive labels are present")
     else:
         issues.append(f"Unsupported task type {task_type}")
-
     if issues:
         raise RuntimeError("Target validation failed:\n- " + "\n- ".join(issues))
     return {"status": "pass", "warnings": warnings, "class_count": len(classes)}
 
 
-# =============================================================================
-# Split logic (unchanged)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Split logic
+# -----------------------------------------------------------------------------
 
-
-def can_stratify_single(y: np.ndarray, min_count: int = 3) -> bool:
+def can_stratify_single(y, min_count=3):
     if y.ndim != 1:
         return False
     counts = np.bincount(y)
@@ -1539,24 +1268,14 @@ def can_stratify_single(y: np.ndarray, min_count: int = 3) -> bool:
     return len(nonzero) >= 2 and bool(np.all(nonzero >= min_count))
 
 
-def make_single_splits(y: np.ndarray, cfg: SplitConfig, seed: int) -> dict[str, np.ndarray]:
+def make_single_splits(y, cfg, seed):
     indices = np.arange(len(y))
     stratify = y if cfg.stratify and can_stratify_single(y, 3) else None
-    train_idx, temp_idx = train_test_split(
-        indices,
-        test_size=1.0 - cfg.train,
-        random_state=seed,
-        stratify=stratify,
-    )
+    train_idx, temp_idx = train_test_split(indices, test_size=1.0 - cfg.train, random_state=seed, stratify=stratify)
     temp_y = y[temp_idx]
     temp_stratify = temp_y if cfg.stratify and can_stratify_single(temp_y, 2) else None
     test_fraction_of_temp = cfg.test / (cfg.validation + cfg.test)
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=test_fraction_of_temp,
-        random_state=seed,
-        stratify=temp_stratify,
-    )
+    val_idx, test_idx = train_test_split(temp_idx, test_size=test_fraction_of_temp, random_state=seed, stratify=temp_stratify)
     return {
         "train": np.sort(train_idx),
         "validation": np.sort(val_idx),
@@ -1564,22 +1283,14 @@ def make_single_splits(y: np.ndarray, cfg: SplitConfig, seed: int) -> dict[str, 
     }
 
 
-def make_multilabel_splits(y: np.ndarray, cfg: SplitConfig, seed: int) -> dict[str, np.ndarray]:
+def make_multilabel_splits(y, cfg, seed):
     try:
         from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
-        splitter = MultilabelStratifiedShuffleSplit(
-            n_splits=1,
-            test_size=1.0 - cfg.train,
-            random_state=seed,
-        )
+        splitter = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=1.0 - cfg.train, random_state=seed)
         idx = np.arange(len(y))
         train_rel, temp_rel = next(splitter.split(idx, y))
         temp_y = y[temp_rel]
-        splitter2 = MultilabelStratifiedShuffleSplit(
-            n_splits=1,
-            test_size=cfg.test / (cfg.validation + cfg.test),
-            random_state=seed + 1,
-        )
+        splitter2 = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=cfg.test / (cfg.validation + cfg.test), random_state=seed + 1)
         val_rel, test_rel = next(splitter2.split(temp_rel, temp_y))
         return {
             "train": np.sort(train_rel),
@@ -1602,31 +1313,24 @@ def make_multilabel_splits(y: np.ndarray, cfg: SplitConfig, seed: int) -> dict[s
         }
 
 
-# =============================================================================
-# Metrics (unchanged)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
 
-
-def safe_mcc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+def safe_mcc(y_true, y_pred):
     try:
         return float(matthews_corrcoef(y_true, y_pred))
     except Exception:
         return float("nan")
 
 
-def _safe_multilabel_auc_and_ap(
-    y_true: np.ndarray,
-    probabilities: np.ndarray,
-) -> tuple[float | None, float | None, dict[str, int]]:
+def _safe_multilabel_auc_and_ap(y_true, probabilities):
     y_true = np.asarray(y_true)
     probabilities = np.asarray(probabilities)
     if y_true.ndim == 1:
         y_true = y_true.reshape(-1, 1)
         probabilities = probabilities.reshape(-1, 1)
-
-    valid_auc: list[float] = []
-    valid_ap: list[float] = []
-
+    valid_auc, valid_ap = [], []
     for j in range(y_true.shape[1]):
         target = y_true[:, j]
         score = probabilities[:, j]
@@ -1637,21 +1341,18 @@ def _safe_multilabel_auc_and_ap(
                 warnings.simplefilter("ignore")
                 valid_auc.append(float(roc_auc_score(target, score)))
                 valid_ap.append(float(average_precision_score(target, score)))
-
     coverage = {
         "total_labels": int(y_true.shape[1]),
         "valid_auc_labels": len(valid_auc),
         "valid_ap_labels": len(valid_ap),
         "undefined_labels": int(y_true.shape[1] - len(valid_auc)),
     }
-    return (
-        float(np.mean(valid_auc)) if valid_auc else None,
-        float(np.mean(valid_ap)) if valid_ap else None,
-        coverage,
-    )
+    return (float(np.mean(valid_auc)) if valid_auc else None,
+            float(np.mean(valid_ap)) if valid_ap else None,
+            coverage)
 
 
-def safe_roc_auc_single(y_true: np.ndarray, proba: np.ndarray | None, n_classes: int) -> float | None:
+def safe_roc_auc_single(y_true, proba, n_classes):
     if proba is None:
         return None
     y_true = np.asarray(y_true)
@@ -1664,13 +1365,12 @@ def safe_roc_auc_single(y_true: np.ndarray, proba: np.ndarray | None, n_classes:
                 return float(roc_auc_score(y_true, proba[:, 1]))
         except Exception:
             return None
-
     onehot = np.eye(n_classes, dtype=np.int64)[y_true]
     auc, _, _ = _safe_multilabel_auc_and_ap(onehot, proba)
     return auc
 
 
-def safe_average_precision_single(y_true: np.ndarray, proba: np.ndarray | None, n_classes: int) -> float | None:
+def safe_average_precision_single(y_true, proba, n_classes):
     if proba is None:
         return None
     y_true = np.asarray(y_true)
@@ -1683,13 +1383,12 @@ def safe_average_precision_single(y_true: np.ndarray, proba: np.ndarray | None, 
                 return float(average_precision_score(y_true, proba[:, 1]))
         except Exception:
             return None
-
     onehot = np.eye(n_classes, dtype=np.int64)[y_true]
     _, ap, _ = _safe_multilabel_auc_and_ap(onehot, proba)
     return ap
 
 
-def confidence_metrics(y_true: np.ndarray, proba: np.ndarray, y_pred: np.ndarray) -> dict[str, float | None]:
+def confidence_metrics(y_true, proba, y_pred):
     confidence = np.max(proba, axis=1)
     correct = (y_true == y_pred).astype(float)
     return {
@@ -1700,15 +1399,9 @@ def confidence_metrics(y_true: np.ndarray, proba: np.ndarray, y_pred: np.ndarray
     }
 
 
-def evaluate_single(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    classes: Sequence[str],
-    probabilities: np.ndarray | None = None,
-    include_per_class: bool = True,
-) -> dict[str, Any]:
+def evaluate_single(y_true, y_pred, classes, probabilities=None, include_per_class=True):
     labels = np.arange(len(classes))
-    result: dict[str, Any] = {
+    result = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
@@ -1718,9 +1411,7 @@ def evaluate_single(
         "mcc": safe_mcc(y_true, y_pred),
         "cohen_kappa": float(cohen_kappa_score(y_true, y_pred, labels=labels)),
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
-        "classification_report": classification_report(
-            y_true, y_pred, labels=labels, target_names=list(classes), output_dict=True, zero_division=0
-        ),
+        "classification_report": classification_report(y_true, y_pred, labels=labels, target_names=list(classes), output_dict=True, zero_division=0),
     }
     if probabilities is not None:
         try:
@@ -1745,13 +1436,8 @@ def evaluate_single(
     return result
 
 
-def evaluate_multi(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    probabilities: np.ndarray | None = None,
-    classes: Sequence[str] | None = None,
-) -> dict[str, Any]:
-    result: dict[str, Any] = {
+def evaluate_multi(y_true, y_pred, probabilities=None, classes=None):
+    result = {
         "exact_match_accuracy": float(np.mean(np.all(y_true == y_pred, axis=1))),
         "micro_f1": float(f1_score(y_true, y_pred, average="micro", zero_division=0)),
         "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
@@ -1768,32 +1454,22 @@ def evaluate_multi(
         "label_cardinality_true": float(np.mean(y_true.sum(axis=1))),
         "label_cardinality_pred": float(np.mean(y_pred.sum(axis=1))),
     }
-
     positives = np.sum(y_true, axis=0)
     negatives = np.sum(y_true == 0, axis=0)
     result["labels_with_positive_support"] = int(np.sum(positives > 0))
     result["labels_with_negative_support"] = int(np.sum(negatives > 0))
     result["labels_with_both_support"] = int(np.sum((positives > 0) & (negatives > 0)))
-
     if probabilities is not None:
         try:
-            result["log_loss"] = float(
-                log_loss(y_true.ravel(), probabilities.ravel(), labels=[0, 1])
-            )
-            result["log_loss_score"] = float(
-                np.exp(-min(max(result["log_loss"], 0.0), 20.0))
-            )
+            result["log_loss"] = float(log_loss(y_true.ravel(), probabilities.ravel(), labels=[0, 1]))
+            result["log_loss_score"] = float(np.exp(-min(max(result["log_loss"], 0.0), 20.0)))
         except Exception:
             result["log_loss"] = None
             result["log_loss_score"] = None
-
-        roc_auc, avg_precision, coverage = _safe_multilabel_auc_and_ap(
-            y_true, probabilities
-        )
+        roc_auc, avg_precision, coverage = _safe_multilabel_auc_and_ap(y_true, probabilities)
         result["roc_auc_macro"] = roc_auc
         result["average_precision_macro"] = avg_precision
         result["roc_auc_coverage"] = coverage
-
     if classes is not None:
         result["per_class"] = {}
         for j, name in enumerate(classes):
@@ -1813,7 +1489,7 @@ def evaluate_multi(
     return result
 
 
-def majority_baseline(y_train: np.ndarray, y_test: np.ndarray, classes: Sequence[str]) -> dict[str, Any]:
+def majority_baseline(y_train, y_test, classes):
     counts = np.bincount(y_train, minlength=len(classes))
     majority_id = int(np.argmax(counts))
     pred = np.full(len(y_test), majority_id, dtype=np.int64)
@@ -1825,7 +1501,7 @@ def majority_baseline(y_train: np.ndarray, y_test: np.ndarray, classes: Sequence
     }
 
 
-def label_entropy(y: np.ndarray, task_type: str) -> float:
+def label_entropy(y, task_type):
     if task_type == "single_label":
         counts = np.bincount(y)
         p = counts[counts > 0] / len(y)
@@ -1834,12 +1510,11 @@ def label_entropy(y: np.ndarray, task_type: str) -> float:
     return float(np.mean([-(p * np.log2(p) + (1 - p) * np.log2(1 - p)) for p in counts if 0 < p < 1]))
 
 
-# =============================================================================
-# Probe architecture (unchanged)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Probe architecture
+# -----------------------------------------------------------------------------
 
-
-def resolve_hidden_width(spec: int | str, input_dim: int) -> int:
+def resolve_hidden_width(spec, input_dim):
     if isinstance(spec, int):
         if spec < 1:
             raise ValueError(f"Hidden width must be >=1, got {spec}")
@@ -1855,7 +1530,7 @@ def resolve_hidden_width(spec: int | str, input_dim: int) -> int:
     raise ValueError(f"Invalid hidden width {spec!r}; use integer or e.g. '0.5d'")
 
 
-def resolved_hidden_dims(spec: ProbeSpec, input_dim: int) -> list[int]:
+def resolved_hidden_dims(spec, input_dim):
     if spec.type != "mlp":
         return []
     if spec.complexity == "custom":
@@ -1876,9 +1551,9 @@ def resolved_hidden_dims(spec: ProbeSpec, input_dim: int) -> list[int]:
 
 
 class TorchMLP(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, hidden_dims: Sequence[int], dropout: float):
+    def __init__(self, input_dim, output_dim, hidden_dims, dropout):
         super().__init__()
-        layers: list[nn.Module] = []
+        layers = []
         d = input_dim
         for h in hidden_dims:
             layers.extend([nn.Linear(d, h), nn.GELU()])
@@ -1888,27 +1563,23 @@ class TorchMLP(nn.Module):
         layers.append(nn.Linear(d, output_dim))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.net(x)
 
 
-def count_parameters(model: nn.Module) -> int:
+def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# =============================================================================
-# Probe fitting (unchanged)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Probe fitting
+# -----------------------------------------------------------------------------
 
-
-def _make_logistic(spec: ProbeSpec, seed: int) -> Pipeline:
+def _make_logistic(spec, seed):
     steps = []
     if spec.standardize:
         steps.append(("scale", StandardScaler()))
-    steps.append((
-        "logistic",
-        LogisticRegression(C=spec.C, max_iter=spec.max_iter, solver="lbfgs", random_state=seed),
-    ))
+    steps.append(("logistic", LogisticRegression(C=spec.C, max_iter=spec.max_iter, solver="lbfgs", random_state=seed)))
     return Pipeline(steps)
 
 
@@ -1969,16 +1640,13 @@ def fit_logistic_multi(X_train, y_train, X_val, y_val, X_test, y_test, classes, 
         "train": evaluate_multi(y_train, train_pred, train_prob, classes),
         "validation": evaluate_multi(y_val, val_pred, val_prob, classes),
         "test": evaluate_multi(y_test, test_pred, test_prob, classes),
-        "parameters": int(sum(
-            m.named_steps["logistic"].coef_.size + m.named_steps["logistic"].intercept_.size
-            if hasattr(m, "named_steps") else 2 for m in models
-        )),
+        "parameters": int(sum(m.named_steps["logistic"].coef_.size + m.named_steps["logistic"].intercept_.size if hasattr(m, "named_steps") else 2 for m in models)),
         "resolved_hidden_dims": [],
         "epochs_completed": None,
     }, models
 
 
-def _selection_value(metrics: Mapping[str, Any], metric: str) -> float:
+def _selection_value(metrics, metric):
     return float(metrics.get(metric, float("nan")))
 
 
@@ -2091,7 +1759,7 @@ def fit_mlp(X_train, y_train, X_val, y_val, X_test, y_test, classes, spec, seed,
     }, model
 
 
-def fit_probe(spec: ProbeSpec, X_train, y_train, X_val, y_val, X_test, y_test, classes, task_type, seed, device, include_per_class):
+def fit_probe(spec, X_train, y_train, X_val, y_val, X_test, y_test, classes, task_type, seed, device, include_per_class):
     validate_probe_spec(spec, task_type)
     if spec.type == "logistic":
         if task_type == "single_label":
@@ -2100,15 +1768,14 @@ def fit_probe(spec: ProbeSpec, X_train, y_train, X_val, y_val, X_test, y_test, c
     return fit_mlp(X_train, y_train, X_val, y_val, X_test, y_test, classes, spec, seed, task_type, device, include_per_class)
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Geometry and representation statistics
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-
-def geometry_analysis(X: np.ndarray, y: np.ndarray, classes: Sequence[str], task_type: str, seed: int, cfg: AnalysisConfig) -> dict[str, Any]:
+def geometry_analysis(X, y, classes, task_type, seed, cfg):
     idx = sample_indices(len(X), max(cfg.pca_samples, cfg.silhouette_samples), seed)
     Xs = X[idx]
-    result: dict[str, Any] = {
+    result = {
         "sample_count": int(len(Xs)),
         "dimension": int(Xs.shape[1]),
         "mean": float(Xs.mean()),
@@ -2151,12 +1818,11 @@ def geometry_analysis(X: np.ndarray, y: np.ndarray, classes: Sequence[str], task
     return result
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Score system
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-
-def _normalise_weights(weights: Mapping[str, float]) -> dict[str, float]:
+def _normalise_weights(weights):
     clean = {k: float(v) for k, v in weights.items() if float(v) >= 0}
     total = sum(clean.values())
     if total <= 0:
@@ -2164,14 +1830,14 @@ def _normalise_weights(weights: Mapping[str, float]) -> dict[str, float]:
     return {k: v / total for k, v in clean.items()}
 
 
-def compute_complexity_penalty(parameters: int | float | None, input_dim: int, scale: float) -> float:
+def compute_complexity_penalty(parameters, input_dim, scale):
     if parameters is None or not np.isfinite(parameters) or parameters <= 0:
         return 0.0
     relative = math.log10(max(parameters, 1)) / math.log10(max(input_dim * 100.0, 10.0))
     return float(np.clip(scale * relative, 0, scale))
 
 
-def add_score_columns(results_df: pd.DataFrame, control_df: pd.DataFrame | None, cfg: AnalysisConfig, task_type: str) -> pd.DataFrame:
+def add_score_columns(results_df, control_df, cfg, task_type):
     df = results_df.copy()
     weights = _normalise_weights(cfg.score_weights)
 
@@ -2188,6 +1854,7 @@ def add_score_columns(results_df: pd.DataFrame, control_df: pd.DataFrame | None,
         df["log_loss_score_component"] = np.clip(df["test_log_loss_score"].fillna(0), 0, 1)
     else:
         df["log_loss_score_component"] = 0.0
+
     if control_df is not None and not control_df.empty:
         c = control_df.groupby(["probe", "layer_index"])["control_test_macro_f1"].mean().rename("control_macro_f1")
         df = df.merge(c, on=["probe", "layer_index"], how="left")
@@ -2216,10 +1883,7 @@ def add_score_columns(results_df: pd.DataFrame, control_df: pd.DataFrame | None,
     for key, weight in weights.items():
         raw += weight * comp_map.get(key, pd.Series(0.0, index=df.index)).to_numpy(dtype=float)
 
-    complexity = [
-        compute_complexity_penalty(p, d, cfg.complexity_penalty_scale)
-        for p, d in zip(df["parameters"], df["input_dim"])
-    ]
+    complexity = [compute_complexity_penalty(p, d, cfg.complexity_penalty_scale) for p, d in zip(df["parameters"], df["input_dim"])]
     df["complexity_penalty"] = complexity
     df["probe_score_raw"] = np.clip(raw, 0, 1)
     df["probe_score"] = np.clip(df["probe_score_raw"] - df["complexity_penalty"], 0, 1)
@@ -2228,12 +1892,11 @@ def add_score_columns(results_df: pd.DataFrame, control_df: pd.DataFrame | None,
     return df
 
 
-# =============================================================================
-# Plots and final dashboard (unchanged)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Plotting utilities (unchanged)
+# -----------------------------------------------------------------------------
 
-
-def heatmap_image(matrix: pd.DataFrame, path: Path, title: str, xlabel: str, ylabel: str, fmt: str = ".3f", vmin: float | None = None, vmax: float | None = None) -> None:
+def heatmap_image(matrix, path, title, xlabel, ylabel, fmt=".3f", vmin=None, vmax=None):
     if matrix.empty:
         return
     fig, ax = plt.subplots(figsize=(max(9, matrix.shape[1] * 0.8), max(5, matrix.shape[0] * 0.7)))
@@ -2255,7 +1918,7 @@ def heatmap_image(matrix: pd.DataFrame, path: Path, title: str, xlabel: str, yla
     plt.close(fig)
 
 
-def plot_layer_curves(df: pd.DataFrame, output_dir: Path) -> None:
+def plot_layer_curves(df, output_dir):
     metrics = [
         ("test_macro_f1", "Test Macro-F1"),
         ("test_balanced_accuracy", "Test Balanced Accuracy"),
@@ -2279,7 +1942,7 @@ def plot_layer_curves(df: pd.DataFrame, output_dir: Path) -> None:
         plt.close()
 
 
-def create_final_visuals(results_df: pd.DataFrame, output_dir: Path) -> None:
+def create_final_visuals(results_df, output_dir):
     if results_df.empty:
         return
     plot_layer_curves(results_df, output_dir)
@@ -2292,21 +1955,11 @@ def create_final_visuals(results_df: pd.DataFrame, output_dir: Path) -> None:
         matrix = results_df.pivot_table(index="probe", columns="layer_index", values=metric, aggfunc="mean")
         heatmap_image(matrix, output_dir / filename, title, "Layer", "Probe", vmin=0 if metric != "selectivity" else None, vmax=1 if metric != "selectivity" else None)
 
-    best = (
-        results_df.sort_values(["probe", "probe_score"], ascending=[True, False])
-        .groupby("probe", as_index=False)
-        .first()
-    )
-    final_matrix = best.set_index("probe")[[
-        "test_macro_f1", "test_balanced_accuracy", "test_mcc",
-        "selectivity", "complexity_penalty", "probe_score",
-    ]].copy()
+    best = results_df.sort_values(["probe", "probe_score"], ascending=[True, False]).groupby("probe", as_index=False).first()
+    final_matrix = best.set_index("probe")[["test_macro_f1", "test_balanced_accuracy", "test_mcc", "selectivity", "complexity_penalty", "probe_score"]].copy()
     heatmap_image(final_matrix, output_dir / "final_probe_score_heatmap.png", "Final best-layer probe measurement matrix", "Measurement", "Probe", vmin=0, vmax=1)
 
-    grouped = results_df.groupby("probe").agg(
-        mean_score=("probe_score", "mean"),
-        std_score=("probe_score", "std"),
-    ).reset_index()
+    grouped = results_df.groupby("probe").agg(mean_score=("probe_score", "mean"), std_score=("probe_score", "std")).reset_index()
     plt.figure(figsize=(11, 6))
     plt.bar(grouped["probe"], grouped["mean_score"], yerr=grouped["std_score"].fillna(0), capsize=5)
     plt.ylabel("Unified Probe Score")
@@ -2349,10 +2002,85 @@ def create_final_visuals(results_df: pd.DataFrame, output_dir: Path) -> None:
     best.to_csv(output_dir / "final_best_layer_table.csv", index=False)
 
 
-# =============================================================================
-# Analyzer
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Deterministic trial config and folder naming
+# -----------------------------------------------------------------------------
 
+def build_trial_config(
+    artifact: ExtractionArtifact,
+    config: AnalysisConfig,
+    external_root: Path,
+    experiment_id: str,
+    dataset_name: str,
+) -> dict:
+    """Flatten **all** parameters that define a probe trial, including extraction metadata."""
+    return {
+        "extraction": {
+            "model_name": artifact.model_name,
+            "dataset_name": artifact.dataset_name,
+            "experiment_id": experiment_id,
+            "pooling": artifact.pooling,
+            "max_length": artifact.metadata.get("extraction", {}).get("max_length"),
+            "batch_size": artifact.metadata.get("extraction", {}).get("batch_size"),
+            "storage_dtype": artifact.metadata.get("extraction", {}).get("storage_dtype"),
+            "hidden_layers": artifact.hidden_layers,
+            "hidden_size": artifact.hidden_size,
+            "dataset_fingerprint": artifact.dataset_fingerprint,
+            "model_snapshot": artifact.metadata.get("model", {}).get("snapshot"),
+        },
+        "dataset_contract": asdict(config.dataset),
+        "probes": [asdict(p) for p in config.probes],
+        "split": asdict(config.split),
+        "analysis": {
+            "layers": config.layers,
+            "repeats": config.repeats,
+            "max_samples": config.max_samples,
+            "shuffled_label_control": config.shuffled_label_control,
+            "shuffled_control_repeats": config.shuffled_control_repeats,
+            "run_control_on_all_layers": config.run_control_on_all_layers,
+            "pca_enabled": config.pca_enabled,
+            "pca_samples": config.pca_samples,
+            "silhouette_enabled": config.silhouette_enabled,
+            "silhouette_samples": config.silhouette_samples,
+            "enable_abstention": config.enable_abstention,
+            "enable_per_class_metrics": config.enable_per_class_metrics,
+            "enable_feature_statistics": config.enable_feature_statistics,
+            "score_weights": config.score_weights,
+            "complexity_penalty_scale": config.complexity_penalty_scale,
+            "output_subdir": config.output_subdir,
+            "verbose": config.verbose,
+        },
+        "probe_version": SCRIPT_VERSION,
+    }
+
+def generate_trial_hash(config_dict: dict) -> str:
+    return stable_hash(config_dict, length=12)
+
+def build_trial_dir_name(
+    config_dict: dict,
+    trial_hash: str,
+    max_path_length: int = 200,
+) -> str:
+    """Create a readable folder name that includes key parameters and hash."""
+    ext = config_dict["extraction"]
+    model_part = ext["model_name"].replace("/", "_")
+    dataset_part = ext["dataset_name"]
+    probes = "+".join([p["name"] for p in config_dict["probes"]])
+    max_samples = config_dict["analysis"]["max_samples"] or "full"
+    repeats = config_dict["analysis"]["repeats"]
+    name = (
+        f"probe_run__{model_part}__{dataset_part}"
+        f"__max{max_samples}__rep{repeats}__probes={probes}__hash{trial_hash}"
+    )
+    if len(name) > max_path_length:
+        prefix = name[: max_path_length - len(trial_hash) - 10]
+        name = f"{prefix}...{trial_hash}"
+    return name
+
+
+# -----------------------------------------------------------------------------
+# Analyzer
+# -----------------------------------------------------------------------------
 
 class UnifiedProbeAnalyzer:
     def __init__(
@@ -2391,40 +2119,32 @@ class UnifiedProbeAnalyzer:
 
         self.layers = self._resolve_layers(config.layers)
 
-        # Inside __init__, after `self.layers = self._resolve_layers(config.layers)`
-
         # --- Deterministic trial directory ---
-        # Build the full trial configuration and hash it
         trial_cfg = build_trial_config(
             artifact=artifact,
             config=config,
-            external_root=Path(EXTERNAL_ROOT_DEFAULT),  # Or use artifact.dataset_dir as base
+            external_root=Path(EXTERNAL_ROOT_DEFAULT),
             experiment_id=artifact.experiment_id or "unknown",
             dataset_name=artifact.dataset_name,
         )
         trial_hash = generate_trial_hash(trial_cfg)
         folder_name = build_trial_dir_name(trial_cfg, trial_hash)
 
-        # Base output directory: artifact.dataset_dir / config.output_subdir
         base_output = artifact.dataset_dir / config.output_subdir
-        # Final directory
         output_dir = base_output / folder_name
 
         if output_dir.exists() and (output_dir / "completion.json").exists():
-            # Trial already completed – skip execution and load existing results
             self.logger.emit(f"Trial already completed: {output_dir}", 1)
             self.output_dir = output_dir
             self.skip_run = True
         else:
-            # New trial – create directory and proceed normally
+            self.logger.emit(f"Starting new trial: {output_dir}", 1)
             self.output_dir = safe_relative_output(artifact.dataset_dir, output_dir)
             self.skip_run = False
 
-        # Store trial config for metadata saving
         self.trial_config = trial_cfg
         self.trial_hash = trial_hash
 
-        # Continue with preflight and other initialization...
         self._preflight()
 
         self.logger.emit(f"Model: {artifact.model_name}", 1)
@@ -2437,7 +2157,7 @@ class UnifiedProbeAnalyzer:
             1,
         )
 
-    def _resolve_layers(self, requested: list[int | str] | str) -> list[str]:
+    def _resolve_layers(self, requested):
         available = [f"layer_{i}" for i in range(self.artifact.hidden_layers)]
         if requested == "all":
             return available
@@ -2451,7 +2171,7 @@ class UnifiedProbeAnalyzer:
             out.append(name)
         return sorted(set(out), key=parse_layer_number)
 
-    def _preflight(self) -> None:
+    def _preflight(self):
         self.config.split.validate()
         for p in self.config.probes:
             validate_probe_spec(p, self.task_type)
@@ -2475,7 +2195,7 @@ class UnifiedProbeAnalyzer:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def write_run_manifest(self) -> None:
+    def write_run_manifest(self):
         manifest = {
             "script_version": SCRIPT_VERSION,
             "created_at": time.time(),
@@ -2524,14 +2244,14 @@ class UnifiedProbeAnalyzer:
         }
         save_json(self.output_dir / "probe_alignment_manifest.json", alignment_record)
 
-    def _prepare_population(self, seed: int) -> np.ndarray:
+    def _prepare_population(self, seed):
         return (
             np.arange(len(self.y), dtype=np.int64)
             if self.config.max_samples is None
             else sample_indices(len(self.y), self.config.max_samples, seed)
         )
 
-    def _split(self, selected: np.ndarray, seed: int) -> dict[str, np.ndarray]:
+    def _split(self, selected, seed):
         local_y = self.y[selected]
         result = (
             make_single_splits(local_y, self.config.split, seed)
@@ -2544,13 +2264,13 @@ class UnifiedProbeAnalyzer:
             if k in {"train", "validation", "test"}
         }
 
-    def _load_population_layer(self, layer_idx: int, selected: np.ndarray) -> np.ndarray:
+    def _load_population_layer(self, layer_idx, selected):
         X = np.asarray(self.artifact.states[selected, layer_idx, :], dtype=np.float32)
         if not np.isfinite(X).all():
             raise RuntimeError(f"Layer {layer_idx} contains NaN/Inf in selected rows")
         return X
 
-    def _metric_fields(self, result: Mapping[str, Any], split_name: str) -> dict[str, Any]:
+    def _metric_fields(self, result, split_name):
         m = result[split_name]
         if self.task_type == "single_label":
             keys = [
@@ -2569,24 +2289,12 @@ class UnifiedProbeAnalyzer:
             ]
         return {f"{split_name}_{k}": m.get(k) for k in keys}
 
-    def _save_probe_artifacts(
-        self,
-        probe: ProbeSpec,
-        layer_name: str,
-        repeat: int,
-        results: dict[str, Any],
-        model: Any,
-        scaler: Any,
-        record: dict[str, Any],
-    ) -> None:
+    def _save_probe_artifacts(self, probe, layer_name, repeat, results, model, scaler, record):
         d = self.output_dir / "models" / probe.name / layer_name / f"repeat_{repeat}"
         d.mkdir(parents=True, exist_ok=True)
         save_json(d / "metrics.json", {"record": record, "results": results})
         if self.task_type == "single_label":
-            save_npz(
-                d / "confusion_matrix_test.npz",
-                matrix=np.asarray(results["test"]["confusion_matrix"]),
-            )
+            save_npz(d / "confusion_matrix_test.npz", matrix=np.asarray(results["test"]["confusion_matrix"]))
         if probe.type == "logistic":
             joblib.dump(model, d / "probe.joblib")
         else:
@@ -2594,15 +2302,7 @@ class UnifiedProbeAnalyzer:
         if scaler is not None:
             joblib.dump(scaler, d / "scaler.joblib")
 
-    def _exact_split_controls(
-        self,
-        layer_idx: int,
-        probe: ProbeSpec,
-        X_population: np.ndarray,
-        selected: np.ndarray,
-        split: Mapping[str, np.ndarray],
-        repeat: int,
-    ) -> list[dict[str, Any]]:
+    def _exact_split_controls(self, layer_idx, probe, X_population, selected, split, repeat):
         if not self.config.shuffled_label_control:
             return []
 
@@ -2611,7 +2311,7 @@ class UnifiedProbeAnalyzer:
         va = np.asarray([positions[int(i)] for i in split["validation"]], dtype=np.int64)
         te = np.asarray([positions[int(i)] for i in split["test"]], dtype=np.int64)
         local_y = self.y[selected].copy()
-        rows: list[dict[str, Any]] = []
+        rows = []
 
         for control_repeat in range(self.config.shuffled_control_repeats):
             seed = (
@@ -2638,18 +2338,8 @@ class UnifiedProbeAnalyzer:
                 Xtr, Xv, Xte = Xtr_raw, Xv_raw, Xte_raw
 
             result, _ = fit_probe(
-                probe,
-                Xtr,
-                shuffled_y[tr],
-                Xv,
-                shuffled_y[va],
-                Xte,
-                shuffled_y[te],
-                self.classes,
-                self.task_type,
-                seed,
-                self.device,
-                self.config.enable_per_class_metrics,
+                probe, Xtr, shuffled_y[tr], Xv, shuffled_y[va], Xte, shuffled_y[te],
+                self.classes, self.task_type, seed, self.device, self.config.enable_per_class_metrics,
             )
             test_result = result["test"]
             rows.append({
@@ -2659,31 +2349,39 @@ class UnifiedProbeAnalyzer:
                 "probe": probe.name,
                 "layer_index": layer_idx,
                 "control_test_macro_f1": test_result.get("macro_f1"),
-                "control_test_accuracy": test_result.get(
-                    "accuracy", test_result.get("exact_match_accuracy")
-                ),
+                "control_test_accuracy": test_result.get("accuracy", test_result.get("exact_match_accuracy")),
                 "control_test_mcc": test_result.get("mcc"),
             })
         return rows
 
-    def run(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def run(self):
+        if self.skip_run:
+            self.logger.emit("Skipping execution, loading existing results.", 1)
+            results_path = self.output_dir / "layer_probe_results.csv"
+            best_path = self.output_dir / "final_probe_score_matrix.csv"
+            if results_path.exists() and best_path.exists():
+                scored = pd.read_csv(results_path)
+                best = pd.read_csv(best_path)
+                self.logger.emit(f"Loaded results from {self.output_dir}", 1)
+                return scored, best
+            else:
+                self.logger.emit("Completion marker found but result files missing. Re-running.", 1)
+                self.skip_run = False
+
         self.write_run_manifest()
-        records: list[dict[str, Any]] = []
-        controls: list[dict[str, Any]] = []
-        split_archive: dict[str, np.ndarray] = {}
+        records = []
+        controls = []
+        split_archive = {}
 
         self.logger.section("PROBING EXPERIMENT", 1)
         self.logger.emit(
-            "Question: how recoverable is the target from each frozen hidden-state layer?",
-            1,
+            "Question: how recoverable is the target from each frozen hidden-state layer?", 1
         )
         self.logger.emit(
             f"repeats={self.config.repeats} | max_samples={self.config.max_samples} | "
-            f"layers={len(self.layers)} | probes={len(self.config.probes)}",
-            1,
+            f"layers={len(self.layers)} | probes={len(self.config.probes)}", 1
         )
 
-        # Display target coverage (unchanged)
         if self.logger.level >= 1:
             if self.task_type == "single_label":
                 counts = np.bincount(self.y, minlength=len(self.classes))
@@ -2697,19 +2395,13 @@ class UnifiedProbeAnalyzer:
                 observed = int(np.sum(positives > 0))
                 self.logger.emit(
                     f"Target coverage: labels_with_positive_support={observed}/{len(self.classes)} | "
-                    f"rarest={sorted((int(c), self.classes[i]) for i, c in enumerate(positives) if c > 0)[:10]}",
-                    1,
+                    f"rarest={sorted((int(c), self.classes[i]) for i, c in enumerate(positives) if c > 0)[:10]}", 1
                 )
 
-        # Calculate total number of fittings for progress bar
         total_fittings = self.config.repeats * len(self.layers) * len(self.config.probes)
         if self.config.shuffled_label_control:
-            total_fittings += (
-                self.config.repeats * len(self.layers) * len(self.config.probes)
-                * self.config.shuffled_control_repeats
-            )
+            total_fittings += self.config.repeats * len(self.layers) * len(self.config.probes) * self.config.shuffled_control_repeats
 
-        # Create progress bar (always visible, even if verbose=0, but only if tqdm installed)
         pbar = tqdm(total=total_fittings, desc="Probing", unit="fit", disable=(self.config.verbose < 0))
 
         try:
@@ -2723,17 +2415,12 @@ class UnifiedProbeAnalyzer:
                 y_train = self.y[split["train"]]
                 y_val = self.y[split["validation"]]
                 y_test = self.y[split["test"]]
-                baseline = (
-                    majority_baseline(y_train, y_test, self.classes)
-                    if self.task_type == "single_label"
-                    else None
-                )
+                baseline = majority_baseline(y_train, y_test, self.classes) if self.task_type == "single_label" else None
 
                 self.logger.section(f"REPEAT {repeat + 1}/{self.config.repeats}", 2)
                 self.logger.emit(
                     f"seed={seed} | population={len(selected)} | train={len(y_train)} | "
-                    f"val={len(y_val)} | test={len(y_test)}",
-                    2,
+                    f"val={len(y_val)} | test={len(y_test)}", 2
                 )
 
                 positions = {int(global_i): i for i, global_i in enumerate(selected)}
@@ -2743,35 +2430,21 @@ class UnifiedProbeAnalyzer:
 
                 for layer_name in self.layers:
                     layer_idx = parse_layer_number(layer_name)
-                    relative_depth = (
-                        layer_idx / (self.artifact.hidden_layers - 1)
-                        if self.artifact.hidden_layers > 1 else 0.0
-                    )
+                    relative_depth = layer_idx / (self.artifact.hidden_layers - 1) if self.artifact.hidden_layers > 1 else 0.0
 
                     X_population = self._load_population_layer(layer_idx, selected)
 
-                    geom_count = min(
-                        len(selected),
-                        max(self.config.pca_samples, self.config.silhouette_samples),
-                    )
+                    geom_count = min(len(selected), max(self.config.pca_samples, self.config.silhouette_samples))
                     geom_local = sample_indices(len(selected), geom_count, seed + layer_idx)
                     geom = geometry_analysis(
-                        X_population[geom_local],
-                        self.y[selected][geom_local],
-                        self.classes,
-                        self.task_type,
-                        seed + layer_idx,
-                        self.config,
+                        X_population[geom_local], self.y[selected][geom_local],
+                        self.classes, self.task_type, seed + layer_idx, self.config
                     )
-                    save_json(
-                        self.output_dir / "geometry" / f"{layer_name}_repeat_{repeat}.json",
-                        geom,
-                    )
+                    save_json(self.output_dir / "geometry" / f"{layer_name}_repeat_{repeat}.json", geom)
 
                     self.logger.emit(
                         f"Layer {layer_idx} | relative depth={relative_depth:.3f} | "
-                        f"geometry silhouette={geom.get('silhouette_score')}",
-                        2,
+                        f"geometry silhouette={geom.get('silhouette_score')}", 2
                     )
 
                     Xtr_raw = X_population[tr_local]
@@ -2804,20 +2477,10 @@ class UnifiedProbeAnalyzer:
                         )
 
                         results, model = fit_probe(
-                            probe,
-                            Xtr,
-                            y_train,
-                            Xv,
-                            y_val,
-                            Xte,
-                            y_test,
-                            self.classes,
-                            self.task_type,
-                            probe_seed,
-                            self.device,
-                            self.config.enable_per_class_metrics,
+                            probe, Xtr, y_train, Xv, y_val, Xte, y_test,
+                            self.classes, self.task_type, probe_seed, self.device, self.config.enable_per_class_metrics,
                         )
-                        pbar.update(1)   # <-- advance progress bar after real fit
+                        pbar.update(1)
 
                         record = {
                             "repeat": repeat,
@@ -2848,34 +2511,17 @@ class UnifiedProbeAnalyzer:
                         record.update(self._metric_fields(results, "test"))
                         records.append(record)
 
-                        self._save_probe_artifacts(
-                            probe,
-                            layer_name,
-                            repeat,
-                            results,
-                            model,
-                            scaler_for_artifact,
-                            record,
-                        )
+                        self._save_probe_artifacts(probe, layer_name, repeat, results, model, scaler_for_artifact, record)
 
-                        # Shuffled-label controls
-                        ctrl_rows = self._exact_split_controls(
-                            layer_idx,
-                            probe,
-                            X_population,
-                            selected,
-                            split,
-                            repeat,
-                        )
+                        ctrl_rows = self._exact_split_controls(layer_idx, probe, X_population, selected, split, repeat)
                         controls.extend(ctrl_rows)
-                        pbar.update(len(ctrl_rows))   # advance by number of control fits
+                        pbar.update(len(ctrl_rows))
 
                         if self.config.verbose >= 3:
                             test = results["test"]
                             self.logger.emit(
                                 f"TEST Macro-F1={test.get('macro_f1')} | "
-                                f"BalancedAcc={test.get('balanced_accuracy')} | "
-                                f"MCC={test.get('mcc')}",
+                                f"BalancedAcc={test.get('balanced_accuracy')} | MCC={test.get('mcc')}",
                                 3,
                             )
                             if self.task_type == "multi_label":
@@ -2885,79 +2531,58 @@ class UnifiedProbeAnalyzer:
                                     f"ROC-AUC={test.get('roc_auc_macro')} | AP={test.get('average_precision_macro')}",
                                     3,
                                 )
-                                
             pbar.close()
-                                
         except Exception:
-            print("Unexpected Error, Closing the P Bar... ")
+            print("Unexpected Error, Closing the Progress Bar... ")
             pbar.close()
 
-        # Rest of function unchanged...
         save_npz(self.output_dir / "split_indices.npz", **split_archive)
         results_df = pd.DataFrame(records)
         control_df = pd.DataFrame(controls)
         if not control_df.empty:
             control_df.to_csv(self.output_dir / "shuffled_label_controls.csv", index=False)
 
-        scored = add_score_columns(
-            results_df,
-            control_df if not control_df.empty else None,
-            self.config,
-            self.task_type,
-        )
+        scored = add_score_columns(results_df, control_df if not control_df.empty else None, self.config, self.task_type)
 
-        aggregate = (
-            scored.groupby(
-                ["probe", "probe_type", "probe_complexity", "layer_index"],
-                as_index=False,
-            )
-            .agg(
-                test_macro_f1_mean=("test_macro_f1", "mean"),
-                test_macro_f1_std=("test_macro_f1", "std"),
-                test_balanced_accuracy_mean=("test_balanced_accuracy", "mean"),
-                test_mcc_mean=("test_mcc", "mean"),
-                selectivity_mean=("selectivity", "mean"),
-                probe_score_mean=("probe_score", "mean"),
-                probe_score_std=("probe_score", "std"),
-                parameters=("parameters", "first"),
-                relative_layer_depth=("relative_layer_depth", "first"),
-            )
+        aggregate = scored.groupby(["probe", "probe_type", "probe_complexity", "layer_index"], as_index=False).agg(
+            test_macro_f1_mean=("test_macro_f1", "mean"),
+            test_macro_f1_std=("test_macro_f1", "std"),
+            test_balanced_accuracy_mean=("test_balanced_accuracy", "mean"),
+            test_mcc_mean=("test_mcc", "mean"),
+            selectivity_mean=("selectivity", "mean"),
+            probe_score_mean=("probe_score", "mean"),
+            probe_score_std=("probe_score", "std"),
+            parameters=("parameters", "first"),
+            relative_layer_depth=("relative_layer_depth", "first"),
         )
-        best = (
-            aggregate.sort_values(
-                ["probe", "probe_score_mean"], ascending=[True, False]
-            )
-            .groupby("probe", as_index=False)
-            .first()
-        )
+        best = aggregate.sort_values(["probe", "probe_score_mean"], ascending=[True, False]).groupby("probe", as_index=False).first()
 
         scored.to_csv(self.output_dir / "layer_probe_results.csv", index=False)
         aggregate.to_csv(self.output_dir / "layer_probe_aggregate_results.csv", index=False)
         best.to_csv(self.output_dir / "final_probe_score_matrix.csv", index=False)
         create_final_visuals(scored, self.output_dir)
+
         metadata_path = save_complete_run_metadata(
             self, scored, best, control_df,
             extra_info={"trial_config": self.trial_config, "trial_hash": self.trial_hash}
         )
         self.logger.emit(f"Complete run metadata saved: {metadata_path}", 1)
 
-        summary = { ... }  # unchanged
+        summary = {
+            "trial_hash": self.trial_hash,
+            "probe_score_mean": float(scored["probe_score"].mean()) if not scored.empty else None,
+            "test_macro_f1_mean": float(scored["test_macro_f1"].mean()) if not scored.empty else None,
+            "test_balanced_accuracy_mean": float(scored["test_balanced_accuracy"].mean()) if not scored.empty else None,
+            "best_per_probe": best.to_dict("records") if not best.empty else [],
+            "control_mean_macro_f1": float(control_df["control_test_macro_f1"].mean()) if control_df is not None and not control_df.empty else None,
+            "output_dir": str(self.output_dir),
+        }
         save_json(self.output_dir / "summary.json", summary)
-        save_json(
-            self.output_dir / "completion.json",
-            {"status": "complete", "finished_at": time.time()},
-        )
+        save_json(self.output_dir / "completion.json", {"status": "complete", "finished_at": time.time()})
 
         self.logger.section("FINAL RESULT", 1)
         if not best.empty:
-            cols = [
-                c for c in [
-                    "probe", "layer_index", "relative_layer_depth",
-                    "probe_score_mean", "test_macro_f1_mean",
-                    "test_balanced_accuracy_mean", "test_mcc_mean",
-                    "selectivity_mean",
-                ] if c in best.columns
-            ]
+            cols = [c for c in ["probe", "layer_index", "probe_score_mean", "test_macro_f1_mean"] if c in best.columns]
             self.logger.emit("Final best layer table:", 1)
             if self.config.verbose >= 1:
                 print(best[cols].to_string(index=False))
@@ -2965,23 +2590,105 @@ class UnifiedProbeAnalyzer:
         return scored, best
 
 
-# =============================================================================
-# Generalised model × dataset driver with error handling
-# =============================================================================
+# -----------------------------------------------------------------------------
+# save_complete_run_metadata (updated to include trial config/hash)
+# -----------------------------------------------------------------------------
 
-def _results_index_path(checkpoint_dir: Path) -> Path:
+def save_complete_run_metadata(analyzer, results_df, best_df, control_df=None, extra_info=None):
+    output_dir = analyzer.output_dir
+    metadata_path = output_dir / "complete_run_metadata.json"
+
+    config_dict = {
+        "script_version": SCRIPT_VERSION,
+        "created_at": time.time(),
+        "dataset_contract": asdict(analyzer.config.dataset),
+        "probes": [asdict(p) for p in analyzer.config.probes],
+        "split": asdict(analyzer.config.split),
+        "repeats": analyzer.config.repeats,
+        "max_samples": analyzer.config.max_samples,
+        "layers": analyzer.layers,
+        "analysis": asdict(analyzer.config),
+        "score_weights": _normalise_weights(analyzer.config.score_weights),
+        "device": analyzer.device,
+    }
+
+    artifact_summary = analyzer.artifact.analysis_summary()
+    artifact_summary.pop("provenance", None)
+
+    target_info = {
+        "target_metadata": analyzer.target_meta,
+        "target_validation": analyzer.target_validation,
+        "text_alignment": analyzer.text_alignment,
+        "label_alignment": analyzer.label_alignment,
+        "classes": analyzer.classes,
+        "label_entropy_bits": label_entropy(analyzer.y, analyzer.task_type),
+    }
+
+    environment = get_environment_info()
+
+    results_summary = {}
+    if not results_df.empty:
+        results_summary = {
+            "rows": len(results_df),
+            "columns": list(results_df.columns),
+            "best_per_probe": best_df.to_dict("records") if best_df is not None else [],
+            "layer_wise_metrics": {
+                "test_macro_f1_by_layer": results_df.groupby("layer_index")["test_macro_f1"].mean().to_dict(),
+                "probe_score_by_layer": results_df.groupby("layer_index")["probe_score"].mean().to_dict(),
+            },
+        }
+
+    control_summary = None
+    if control_df is not None and not control_df.empty:
+        control_summary = {
+            "rows": len(control_df),
+            "mean_control_macro_f1": float(control_df["control_test_macro_f1"].mean()),
+            "by_layer": control_df.groupby("layer_index")["control_test_macro_f1"].mean().to_dict(),
+        }
+
+    extra = extra_info or {}
+    full_metadata = {
+        "run_id": output_dir.name,
+        "output_directory": str(output_dir),
+        "configuration": config_dict,
+        "artifact": artifact_summary,
+        "target": target_info,
+        "environment": environment,
+        "results": results_summary,
+        "controls": control_summary,
+        "extra_info": extra,
+    }
+
+    save_json(metadata_path, full_metadata)
+    return metadata_path
+
+
+# -----------------------------------------------------------------------------
+# Matrix runner
+# -----------------------------------------------------------------------------
+
+def _results_index_path(checkpoint_dir):
     return checkpoint_dir / "results_index.csv"
 
-def update_results_index(checkpoint_dir: Path, result_csv: Path, model_name: str, dataset_name: str) -> None:
+
+def update_results_index(
+    checkpoint_dir: Path,
+    result_csv: Path,
+    model_name: str,
+    dataset_name: str,
+    trial_hash: str,
+) -> None:
     """
     Append or update a row in the results index CSV.
-    The index maps hashed result filenames to model/dataset.
+    The index maps result filenames (which include the trial hash) to model/dataset
+    and the hash itself for quick lookup.
     """
     index_path = _results_index_path(checkpoint_dir)
     row = {
         "result_filename": result_csv.name,
         "model": model_name,
         "dataset": dataset_name,
+        "trial_hash": trial_hash,
         "saved_at": time.time(),
     }
     if index_path.exists():
@@ -2993,11 +2700,13 @@ def update_results_index(checkpoint_dir: Path, result_csv: Path, model_name: str
         df = pd.DataFrame([row])
     df.to_csv(index_path, index=False)
 
-def load_results_index(checkpoint_dir: Path) -> pd.DataFrame:
+
+def load_results_index(checkpoint_dir):
     index_path = _results_index_path(checkpoint_dir)
     if index_path.exists():
         return pd.read_csv(index_path)
     return pd.DataFrame(columns=["result_filename", "model", "dataset", "saved_at"])
+
 
 def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
     """
@@ -3006,7 +2715,6 @@ def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
     Returns None if not found.
     """
     index = load_results_index(checkpoint_dir)
-    # Allow either the full filename or just the hash prefix
     if not hash_or_filename.endswith(".csv"):
         hash_prefix = hash_or_filename
     else:
@@ -3018,6 +2726,50 @@ def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
     result_path = checkpoint_dir / "per_entry_results" / row["result_filename"]
     row["result_path"] = str(result_path)
     return row
+
+
+def validate_checkpoint_consistency(checkpoint_dir: Path, verbose: bool = True) -> bool:
+    """
+    Check that all completed entries in the checkpoint have corresponding files and
+    that the stored trial_config hashes to the trial_hash. Returns True if consistent.
+    """
+    checkpoint_file = checkpoint_dir / "probe_matrix_checkpoint.json"
+    results_subdir = checkpoint_dir / "per_entry_results"
+    if not checkpoint_file.exists():
+        if verbose:
+            print("[validate] Checkpoint file not found.")
+        return True  # nothing to validate
+
+    with open(checkpoint_file) as f:
+        checkpoint = json.load(f)
+
+    completed = checkpoint.get("completed", {})
+    inconsistent = []
+    for key, info in completed.items():
+        trial_hash = info.get("trial_hash")
+        stored_config = info.get("trial_config")
+        # Verify file exists
+        expected_file = results_subdir / f"{trial_hash}_layer_probe_results.csv"
+        if not expected_file.exists():
+            inconsistent.append((key, "missing file"))
+            continue
+        # If stored_config is present, verify it hashes to trial_hash
+        if stored_config is not None:
+            computed_hash = generate_trial_hash(stored_config)
+            if computed_hash != trial_hash:
+                inconsistent.append((key, "hash mismatch (stored config)"))
+        # Additional checks: model/dataset match?
+    if inconsistent:
+        if verbose:
+            print("[validate] Inconsistencies found:")
+            for k, reason in inconsistent:
+                print(f"  - {k}: {reason}")
+        return False
+    else:
+        if verbose:
+            print("[validate] Checkpoint is consistent.")
+        return True
+
 
 def run_matrix(
     entries: Sequence[Mapping[str, Any]],
@@ -3035,24 +2787,14 @@ def run_matrix(
 ) -> pd.DataFrame:
     """
     Run the same probe benchmark across arbitrary frozen model artifacts, with
-    automatic checkpointing and resume.
-
-    Each entry must provide model and dataset names and optionally the dataset_df
-    and contract. After each successful entry, the full per-layer results are saved
-    to a CSV file and the checkpoint file is updated. If the process is restarted,
-    already completed entries are skipped and their saved results are loaded.
-
-    Parameters:
-        checkpoint_dir: Directory where per-entry results and the checkpoint file
-                        will be stored. If None, uses
-                        external_root/experiments/experiment_id/matrix_checkpoint.
-
-    Returns:
-        Full per-layer DataFrame with columns for model, dataset, artifact_dir,
-        metadata_path, and all probe metrics. The order of rows corresponds to
-        the original entries order (completed ones first, then new ones).
+    automatic checkpointing and resume. The checkpoint is keyed by a unique trial
+    hash derived from the full configuration. Before reusing any existing result,
+    the stored configuration is compared with the current one to prevent mixing.
     """
     split = split or SplitConfig(train=0.80, validation=0.10, test=0.10, seed=42)
+    # At start of run_matrix, after loading checkpoint:
+    if not validate_checkpoint_consistency(checkpoint_dir, verbose=verbose):
+        print("!!![!warning!]!!! Checkpoint inconsistencies detected. Consider running migration or cleaning !")
     if checkpoint_dir is None:
         checkpoint_dir = external_root / "experiments" / experiment_id / "matrix_checkpoint"
     checkpoint_dir = Path(checkpoint_dir)
@@ -3072,88 +2814,97 @@ def run_matrix(
             if verbose >= 1:
                 print(f"[checkpoint] Could not load checkpoint file {checkpoint_file}; starting fresh.")
 
-    # Map each entry to a unique key
-    entry_keys = [f"{str(entry['model'])}::{str(entry['dataset'])}" for entry in entries]
-
-    # For each entry, either load its saved results or run it fresh
-    per_entry_results = []   # list of DataFrames in final order
+    per_entry_results = []
     error_records = []
 
-    for i, (entry, key) in enumerate(zip(entries, entry_keys), start=1):
+    for i, entry in enumerate(entries, start=1):
         model_name = str(entry["model"])
         dataset_name = str(entry["dataset"])
 
-        # Determine the result CSV path for this entry
-        result_csv = results_subdir / f"{stable_hash(f'{model_name}::{dataset_name}', 12)}_layer_probe_results.csv"
-        
-        if key in checkpoint.get("completed", {}):
-            # Load from saved CSV
-            if verbose >= 1:
-                print(f"[checkpoint] {i}/{len(entries)} | {model_name} | {dataset_name} : already completed, loading from {result_csv.name}")
-            if result_csv.exists():
-                try:
-                    df = pd.read_csv(result_csv)
-                    per_entry_results.append(df)
-                except Exception as e:
-                    print(f"[checkpoint] Failed to load {result_csv}: {e}. Will re-run this entry.")
-                    checkpoint["completed"].pop(key, None)
-                    # fall through to run
-                else:
-                    continue
-            else:
-                print(f"[checkpoint] Checkpoint says {key} completed but result file missing. Re-running.")
-                checkpoint["completed"].pop(key, None)
+        art = ExtractionArtifact(
+            dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name)
+        )
+        cfg = AnalysisConfig(
+            dataset=entry["contract"],
+            probes=list(probes),
+            layers="all",
+            split=split,
+            repeats=repeats,
+            max_samples=max_samples,
+            shuffled_label_control=shuffled_label_control,
+            shuffled_control_repeats=shuffled_control_repeats,
+            pca_enabled=True,
+            silhouette_enabled=True,
+            pca_samples=min(3000, max_samples or 3000),
+            silhouette_samples=min(3000, max_samples or 3000),
+            enable_per_class_metrics=True,
+            enable_feature_statistics=True,
+            verbose=verbose,
+        )
 
-        # If we get here, we need to run the entry
+        trial_cfg = build_trial_config(art, cfg, external_root, experiment_id, dataset_name)
+        trial_hash = generate_trial_hash(trial_cfg)
+        unique_key = f"{model_name}::{dataset_name}::{trial_hash}"
+        folder_name = build_trial_dir_name(trial_cfg, trial_hash)
+        out_dir = (
+            dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name)
+            / "analysis" / "probes" / "matrix_runs" / folder_name
+        )
+        result_csv = results_subdir / f"{trial_hash}_layer_probe_results.csv"
+
         if verbose >= 1:
-            print(f"[matrix] {i}/{len(entries)} | {model_name} | {dataset_name}")
+            print(f"[matrix] {i}/{len(entries)} | {model_name} | {dataset_name} | trial {trial_hash[:8]}")
 
+        # Check if this exact trial has already been completed AND the stored config matches
+        if unique_key in checkpoint.get("completed", {}):
+            stored_info = checkpoint["completed"][unique_key]
+            stored_config = stored_info.get("trial_config", None)
+            # Ensure the stored config matches the current config exactly
+            if stored_config is not None and stored_config != trial_cfg:
+                if verbose >= 1:
+                    print(f"[checkpoint] Stored config for {unique_key} differs from current. Ignoring old result.")
+                # Do not use old result
+            else:
+                # Config matches, we can reuse
+                if verbose >= 1:
+                    print(f"[checkpoint] Already completed, loading from {result_csv.name}")
+                if result_csv.exists():
+                    try:
+                        df = pd.read_csv(result_csv)
+                        per_entry_results.append(df)
+                    except Exception as e:
+                        print(f"[checkpoint] Failed to load {result_csv}: {e}. Will re-run this entry.")
+                        checkpoint["completed"].pop(unique_key, None)
+                    else:
+                        continue
+                else:
+                    print(f"[checkpoint] Checkpoint says completed but result file missing. Re-running.")
+                    checkpoint["completed"].pop(unique_key, None)
+
+        # If we get here, we need to run the trial
         try:
-            art = ExtractionArtifact(dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name))
-            cfg = AnalysisConfig(
-                dataset=entry["contract"],
-                probes=list(probes),
-                layers="all",
-                split=split,
-                repeats=repeats,
-                max_samples=max_samples,
-                shuffled_label_control=shuffled_label_control,
-                shuffled_control_repeats=shuffled_control_repeats,
-                pca_enabled=True,
-                silhouette_enabled=True,
-                pca_samples=min(3000, max_samples or 3000),
-                silhouette_samples=min(3000, max_samples or 3000),
-                enable_per_class_metrics=True,
-                enable_feature_statistics=True,
-                verbose=verbose,
-            )
-            out_dir = (
-                dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name)
-                / "analysis" / "probes" / "matrix_runs"
-                / f"unified_v4_{time.strftime('%Y%m%d_%H%M%S')}"
-            )
             analyzer = UnifiedProbeAnalyzer(art, cfg, out_dir, dataset_df=entry.get("dataset_df"))
-            scored, _ = analyzer.run()   # full per-layer results
+            scored, _ = analyzer.run()
 
-            # Add identification columns
             scored = scored.copy()
             scored["model"] = model_name
             scored["dataset"] = dataset_name
             scored["artifact_dir"] = str(out_dir)
             scored["metadata_path"] = str(out_dir / "complete_run_metadata.json")
+            scored["trial_hash"] = trial_hash
 
-            # Save the per-entry full results to CSV
             scored.to_csv(result_csv, index=False)
-            update_results_index(checkpoint_dir, result_csv, model_name, dataset_name)
+            update_results_index(checkpoint_dir, result_csv, model_name, dataset_name, trial_hash)
             if verbose >= 1:
                 print(f"[checkpoint] Saved {result_csv.name}")
 
             per_entry_results.append(scored)
 
-            # Update checkpoint
-            checkpoint["completed"][key] = {
+            checkpoint["completed"][unique_key] = {
                 "model": model_name,
                 "dataset": dataset_name,
+                "trial_hash": trial_hash,
+                "trial_config": trial_cfg,   # store for future verification
                 "result_csv": str(result_csv),
                 "completed_at": time.time(),
             }
@@ -3165,18 +2916,17 @@ def run_matrix(
             error_records.append({
                 "model": model_name,
                 "dataset": dataset_name,
+                "trial_hash": trial_hash,
                 "error_type": type(e).__name__,
                 "error_message": str(e),
                 "status": "failed",
             })
 
-    # Combine all results in the original entries order
     if per_entry_results:
         full_df = pd.concat(per_entry_results, ignore_index=True)
     else:
         full_df = pd.DataFrame()
 
-    # Save error log (optional)
     if error_records:
         error_df = pd.DataFrame(error_records)
         error_csv = checkpoint_dir / "probe_errors.csv"
@@ -3186,18 +2936,15 @@ def run_matrix(
 
     return full_df
 
-def _save_checkpoint(checkpoint_file: Path, checkpoint: dict) -> None:
-    """Write checkpoint atomically."""
+
+def _save_checkpoint(checkpoint_file, checkpoint):
     tmp = checkpoint_file.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(checkpoint, f, indent=2, default=str)
     tmp.replace(checkpoint_file)
-    
-def collect_layer_results(
-    external_root: Path,
-    experiment_id: str,
-    entries: Sequence[Mapping[str, Any]],
-) -> pd.DataFrame:
+
+
+def collect_layer_results(external_root, experiment_id, entries):
     frames = []
     for entry in entries:
         model_name = entry["model"]
@@ -3210,16 +2957,17 @@ def collect_layer_results(
             df = pd.read_csv(run_dir)
             df["model"] = model_name
             df["dataset"] = dataset_name
-            df["artifact_dir"] = str(run_dir.parent)   # directory containing the CSV
+            df["artifact_dir"] = str(run_dir.parent)
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-def dataset_dir_from_args(external_root: Path, experiment_id: str, model_name: str, dataset_name: str) -> Path:
+
+def dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name):
     model_path = Path(*[p for p in model_name.split("/") if p])
     return external_root / "experiments" / experiment_id / "models" / model_path / "datasets" / dataset_name
 
-def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
-    """Generate publication‑quality plots from full layer‑wise probe results."""
+
+def plot_full_dashboard(full_results, output_root):
     if full_results.empty:
         print("No results to plot.")
         return
@@ -3227,7 +2975,6 @@ def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. Layer curves for test Macro-F1 and Unified Score (one panel per model/dataset)
     for (model, dataset), group in full_results.groupby(["model", "dataset"]):
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         for ax, metric, title in [
@@ -3246,7 +2993,6 @@ def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
         fig.savefig(output_root / f"layer_curves_{model.replace('/', '_')}_{dataset}.png", dpi=240)
         plt.show()
 
-    # 2. Heatmap: probe × layer for test Macro-F1 averaged over repeats and models/datasets
     pivot = full_results.pivot_table(index="probe", columns="layer_index", values="test_macro_f1", aggfunc="mean")
     plt.figure(figsize=(12, 6))
     sns.heatmap(pivot, annot=True, fmt=".3f", cmap="viridis", cbar_kws={"label": "Macro-F1"})
@@ -3257,17 +3003,13 @@ def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
     plt.savefig(output_root / "heatmap_macro_f1.png", dpi=240)
     plt.show()
 
-    # 3. Confusion matrix for the best probe-layer combination (across all)
     best_row = full_results.loc[full_results["test_macro_f1"].idxmax()]
     model, dataset, probe_name, layer_idx = best_row["model"], best_row["dataset"], best_row["probe"], int(best_row["layer_index"])
     artifact_dir = Path(best_row["artifact_dir"])
-    # Locate confusion matrix file
     cm_file = artifact_dir / "models" / probe_name / f"layer_{layer_idx}" / "repeat_0" / "confusion_matrix_test.npz"
     if cm_file.exists():
         data = np.load(cm_file)
         cm = data["matrix"]
-        # We need class names; retrieve from metadata or classification report
-        # For simplicity, we can load from a saved metrics.json if available
         metrics_file = artifact_dir / "models" / probe_name / f"layer_{layer_idx}" / "repeat_0" / "metrics.json"
         if metrics_file.exists():
             with open(metrics_file) as f:
@@ -3285,15 +3027,13 @@ def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
         plt.savefig(output_root / "confusion_matrix_best.png", dpi=240)
         plt.show()
 
-    # 4. Control comparison: true vs shuffled macro-F1 per layer (average over all)
-    # We need control data; if not in full_results, load from CSV files
     control_frames = []
     for run_dir in full_results["artifact_dir"].unique():
         ctrl_file = Path(run_dir) / "shuffled_label_controls.csv"
         if ctrl_file.exists():
             ctrl = pd.read_csv(ctrl_file)
-            ctrl["model"] = best_row["model"] if "model" not in ctrl.columns else ctrl["model"]
-            ctrl["dataset"] = best_row["dataset"] if "dataset" not in ctrl.columns else ctrl["dataset"]
+            ctrl["model"] = best_row["model"]
+            ctrl["dataset"] = best_row["dataset"]
             control_frames.append(ctrl)
     if control_frames:
         control_df = pd.concat(control_frames, ignore_index=True)
@@ -3301,7 +3041,6 @@ def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
         for probe_name in control_df["probe"].unique():
             sub_ctrl = control_df[control_df["probe"] == probe_name].groupby("layer_index")["control_test_macro_f1"].mean()
             plt.plot(sub_ctrl.index, sub_ctrl.values, linestyle="--", marker="x", label=f"{probe_name} (shuffled)")
-        # Also plot true macro-f1 from full_results for comparison
         for probe_name in full_results["probe"].unique():
             sub_true = full_results[full_results["probe"] == probe_name].groupby("layer_index")["test_macro_f1"].mean()
             plt.plot(sub_true.index, sub_true.values, linestyle="-", marker="o", label=f"{probe_name} (true)")
@@ -3314,20 +3053,14 @@ def plot_full_dashboard(full_results: pd.DataFrame, output_root: Path):
         plt.savefig(output_root / "control_comparison.png", dpi=240)
         plt.show()
 
-def discover_model_dataset_pairs(
-    external_root: Path,
-    experiment_id: str,
-    model_names: Sequence[str] | None = None,
-    dataset_names: Sequence[str] | None = None,
-) -> list[dict]:
-    """Discover existing extraction directories for given models/datasets."""
+
+def discover_model_dataset_pairs(external_root, experiment_id, model_names=None, dataset_names=None):
     pairs = []
     exp_root = external_root / "experiments" / experiment_id / "models"
     if not exp_root.exists():
         return pairs
 
-    # Find all model directories
-    for model_dir in exp_root.glob("*/*"):  # handles nested models like google-bert/bert-base-uncased
+    for model_dir in exp_root.glob("*/*"):
         model_name = "/".join(model_dir.relative_to(exp_root).parts)
         if model_names and model_name not in model_names:
             continue
@@ -3336,20 +3069,16 @@ def discover_model_dataset_pairs(
                 dataset_name = dataset_dir.name
                 if dataset_names and dataset_name not in dataset_names:
                     continue
-                pairs.append({
-                    "model": model_name,
-                    "dataset": dataset_name,
-                })
+                pairs.append({"model": model_name, "dataset": dataset_name})
     return pairs
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # CLI
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Unified Hidden-State Probe v4.2")
+def main():
+    parser = argparse.ArgumentParser(description="Unified Hidden-State Probe v4.3")
     parser.add_argument("--dataset-dir")
     parser.add_argument("--external-root", default=str(EXTERNAL_ROOT_DEFAULT))
     parser.add_argument("--experiment-id")
@@ -3376,8 +3105,7 @@ def main() -> None:
         dataset_dir = dataset_dir_from_args(Path(args.external_root).expanduser().resolve(), args.experiment_id, args.model_name, args.dataset_name)
 
     artifact = ExtractionArtifact(dataset_dir, verify_checksum=args.verify_checksum)
-    output_dir = dataset_dir / config.output_subdir / f"run_{time.strftime('%Y%m%d_%H%M%S')}_{stable_hash(asdict(config), 10)}"
-    analyzer = UnifiedProbeAnalyzer(artifact, config, output_dir)
+    analyzer = UnifiedProbeAnalyzer(artifact, config)
 
     print("=" * 100)
     print(f"UNIFIED HIDDEN-STATE PROBE v{SCRIPT_VERSION}")
@@ -3398,10 +3126,7 @@ def main() -> None:
     print("\n" + "=" * 100)
     print("FINAL BEST-LAYER PROBE SCORE MATRIX")
     print("=" * 100)
-    cols = [c for c in [
-        "probe", "layer_index", "probe_score_mean", "test_macro_f1_mean",
-        "test_balanced_accuracy_mean", "test_mcc_mean", "selectivity_mean",
-    ] if c in best.columns]
+    cols = [c for c in ["probe", "layer_index", "probe_score_mean", "test_macro_f1_mean", "test_balanced_accuracy_mean", "test_mcc_mean", "selectivity_mean"] if c in best.columns]
     print(best[cols].to_string(index=False))
     print("\nOutputs:", analyzer.output_dir)
 
