@@ -7,6 +7,7 @@ and robust error handling in the matrix run.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import hashlib
 import importlib
@@ -731,9 +732,14 @@ class ExtractionArtifact:
     @property
     def dataset_name(self):
         name = self.metadata.get("dataset", {}).get("name")
-        if not name:
-            name = self.dataset_dir.name
-        return name
+        if name:
+            return name
+        # fallback: if the last part is 'datasets', use the parent model name + '_' + something?
+        parts = self.dataset_dir.parts
+        if parts[-1] == 'datasets':
+            # maybe return the experiment dataset identifier from metadata?
+            return self.metadata.get("dataset", {}).get("text_column", "unknown")
+        return self.dataset_dir.name
     @property
     def sample_count(self) -> int:
         return int(self.metadata.get("dataset", {}).get("samples", self.states.shape[0]))
@@ -1651,9 +1657,9 @@ def evaluate_single(
     if include_per_class:
         result["per_class"] = {
             name: {
-                "precision": float(precision_score(y_true, y_pred, labels=[i], average='binary', zero_division=0)),
-                "recall": float(recall_score(y_true, y_pred, labels=[i], average='binary', zero_division=0)),
-                "f1": float(f1_score(y_true, y_pred, labels=[i], average='binary', zero_division=0)),
+                "precision": float(precision_score(y_true, y_pred, labels=[i], average=None, zero_division=0)),
+                "recall": float(recall_score(y_true, y_pred, labels=[i], average=None, zero_division=0)),
+                "f1": float(f1_score(y_true, y_pred, labels=[i], average=None, zero_division=0)),
                 "support": int(np.sum(y_true == i)),
             }
             for i, name in enumerate(classes)
@@ -1715,10 +1721,13 @@ def evaluate_multi(
         for j, name in enumerate(classes):
             support = int(y_true[:, j].sum())
             predicted_positive = int(y_pred[:, j].sum())
+            prec = precision_score(y_true[:, j], y_pred[:, j], average=None, zero_division=0)
+            rec = recall_score(y_true[:, j], y_pred[:, j], average=None, zero_division=0)
+            f1 = f1_score(y_true[:, j], y_pred[:, j], average=None, zero_division=0)
             result["per_class"][name] = {
-                "f1": float(f1_score(y_true[:, j], y_pred[:, j], zero_division=0)),
-                "precision": float(precision_score(y_true[:, j], y_pred[:, j], zero_division=0)),
-                "recall": float(recall_score(y_true[:, j], y_pred[:, j], zero_division=0)),
+                "f1": float(f1[0]),
+                "precision": float(prec[0]),
+                "recall": float(rec[0]),
                 "support": support,
                 "predicted_positive": predicted_positive,
                 "roc_auc_defined": bool(support > 0 and negatives[j] > 0),
@@ -2595,180 +2604,185 @@ class UnifiedProbeAnalyzer:
         # Create progress bar (always visible, even if verbose=0, but only if tqdm installed)
         pbar = tqdm(total=total_fittings, desc="Probing", unit="fit", disable=(self.config.verbose < 0))
 
-        for repeat in range(self.config.repeats):
-            seed = self.config.split.seed + repeat
-            selected = self._prepare_population(seed)
-            split = self._split(selected, seed)
-            for name, idx in split.items():
-                split_archive[f"repeat_{repeat}_{name}"] = idx
+        try:
+            for repeat in range(self.config.repeats):
+                seed = self.config.split.seed + repeat
+                selected = self._prepare_population(seed)
+                split = self._split(selected, seed)
+                for name, idx in split.items():
+                    split_archive[f"repeat_{repeat}_{name}"] = idx
 
-            y_train = self.y[split["train"]]
-            y_val = self.y[split["validation"]]
-            y_test = self.y[split["test"]]
-            baseline = (
-                majority_baseline(y_train, y_test, self.classes)
-                if self.task_type == "single_label"
-                else None
-            )
-
-            self.logger.section(f"REPEAT {repeat + 1}/{self.config.repeats}", 2)
-            self.logger.emit(
-                f"seed={seed} | population={len(selected)} | train={len(y_train)} | "
-                f"val={len(y_val)} | test={len(y_test)}",
-                2,
-            )
-
-            positions = {int(global_i): i for i, global_i in enumerate(selected)}
-            tr_local = np.asarray([positions[int(i)] for i in split["train"]], dtype=np.int64)
-            va_local = np.asarray([positions[int(i)] for i in split["validation"]], dtype=np.int64)
-            te_local = np.asarray([positions[int(i)] for i in split["test"]], dtype=np.int64)
-
-            for layer_name in self.layers:
-                layer_idx = parse_layer_number(layer_name)
-                relative_depth = (
-                    layer_idx / (self.artifact.hidden_layers - 1)
-                    if self.artifact.hidden_layers > 1 else 0.0
+                y_train = self.y[split["train"]]
+                y_val = self.y[split["validation"]]
+                y_test = self.y[split["test"]]
+                baseline = (
+                    majority_baseline(y_train, y_test, self.classes)
+                    if self.task_type == "single_label"
+                    else None
                 )
 
-                X_population = self._load_population_layer(layer_idx, selected)
-
-                geom_count = min(
-                    len(selected),
-                    max(self.config.pca_samples, self.config.silhouette_samples),
-                )
-                geom_local = sample_indices(len(selected), geom_count, seed + layer_idx)
-                geom = geometry_analysis(
-                    X_population[geom_local],
-                    self.y[selected][geom_local],
-                    self.classes,
-                    self.task_type,
-                    seed + layer_idx,
-                    self.config,
-                )
-                save_json(
-                    self.output_dir / "geometry" / f"{layer_name}_repeat_{repeat}.json",
-                    geom,
-                )
-
+                self.logger.section(f"REPEAT {repeat + 1}/{self.config.repeats}", 2)
                 self.logger.emit(
-                    f"Layer {layer_idx} | relative depth={relative_depth:.3f} | "
-                    f"geometry silhouette={geom.get('silhouette_score')}",
+                    f"seed={seed} | population={len(selected)} | train={len(y_train)} | "
+                    f"val={len(y_val)} | test={len(y_test)}",
                     2,
                 )
 
-                Xtr_raw = X_population[tr_local]
-                Xv_raw = X_population[va_local]
-                Xte_raw = X_population[te_local]
+                positions = {int(global_i): i for i, global_i in enumerate(selected)}
+                tr_local = np.asarray([positions[int(i)] for i in split["train"]], dtype=np.int64)
+                va_local = np.asarray([positions[int(i)] for i in split["validation"]], dtype=np.int64)
+                te_local = np.asarray([positions[int(i)] for i in split["test"]], dtype=np.int64)
 
-                scaled_cache = None
-                if any(p.standardize for p in self.config.probes):
-                    shared_scaler = StandardScaler().fit(Xtr_raw)
-                    scaled_cache = (
-                        shared_scaler.transform(Xtr_raw).astype(np.float32),
-                        shared_scaler.transform(Xv_raw).astype(np.float32),
-                        shared_scaler.transform(Xte_raw).astype(np.float32),
-                    )
-                else:
-                    shared_scaler = None
-
-                for probe in self.config.probes:
-                    probe_seed = seed + stable_int(probe.name) + layer_idx * 997
-                    if probe.standardize:
-                        Xtr, Xv, Xte = scaled_cache
-                        scaler_for_artifact = shared_scaler
-                    else:
-                        Xtr, Xv, Xte = Xtr_raw, Xv_raw, Xte_raw
-                        scaler_for_artifact = None
-
-                    self.logger.emit(
-                        f"FIT {probe.name} | layer={layer_idx} | complexity={probe.complexity} | seed={probe_seed}",
-                        3,
+                for layer_name in self.layers:
+                    layer_idx = parse_layer_number(layer_name)
+                    relative_depth = (
+                        layer_idx / (self.artifact.hidden_layers - 1)
+                        if self.artifact.hidden_layers > 1 else 0.0
                     )
 
-                    results, model = fit_probe(
-                        probe,
-                        Xtr,
-                        y_train,
-                        Xv,
-                        y_val,
-                        Xte,
-                        y_test,
+                    X_population = self._load_population_layer(layer_idx, selected)
+
+                    geom_count = min(
+                        len(selected),
+                        max(self.config.pca_samples, self.config.silhouette_samples),
+                    )
+                    geom_local = sample_indices(len(selected), geom_count, seed + layer_idx)
+                    geom = geometry_analysis(
+                        X_population[geom_local],
+                        self.y[selected][geom_local],
                         self.classes,
                         self.task_type,
-                        probe_seed,
-                        self.device,
-                        self.config.enable_per_class_metrics,
+                        seed + layer_idx,
+                        self.config,
                     )
-                    pbar.update(1)   # <-- advance progress bar after real fit
-
-                    record = {
-                        "repeat": repeat,
-                        "seed": probe_seed,
-                        "layer": layer_name,
-                        "layer_index": layer_idx,
-                        "relative_layer_depth": relative_depth,
-                        "probe": probe.name,
-                        "probe_type": probe.type,
-                        "probe_complexity": probe.complexity,
-                        "task_type": self.task_type,
-                        "input_dim": int(X_population.shape[1]),
-                        "hidden_layers_total": int(self.artifact.hidden_layers),
-                        "class_count": len(self.classes),
-                        "train_n": int(len(tr_local)),
-                        "validation_n": int(len(va_local)),
-                        "test_n": int(len(te_local)),
-                        "parameters": results.get("parameters"),
-                        "resolved_hidden_dims": results.get("resolved_hidden_dims", []),
-                        "epochs_completed": results.get("epochs_completed"),
-                        "best_validation_score": results.get("best_validation_score"),
-                        "geometry_silhouette": geom.get("silhouette_score"),
-                        "geometry_pca_2d_variance": geom.get("pca_2d_variance"),
-                        "baseline_test_macro_f1": baseline["test"]["macro_f1"] if baseline else None,
-                    }
-                    record.update(self._metric_fields(results, "train"))
-                    record.update(self._metric_fields(results, "validation"))
-                    record.update(self._metric_fields(results, "test"))
-                    records.append(record)
-
-                    self._save_probe_artifacts(
-                        probe,
-                        layer_name,
-                        repeat,
-                        results,
-                        model,
-                        scaler_for_artifact,
-                        record,
+                    save_json(
+                        self.output_dir / "geometry" / f"{layer_name}_repeat_{repeat}.json",
+                        geom,
                     )
 
-                    # Shuffled-label controls
-                    ctrl_rows = self._exact_split_controls(
-                        layer_idx,
-                        probe,
-                        X_population,
-                        selected,
-                        split,
-                        repeat,
+                    self.logger.emit(
+                        f"Layer {layer_idx} | relative depth={relative_depth:.3f} | "
+                        f"geometry silhouette={geom.get('silhouette_score')}",
+                        2,
                     )
-                    controls.extend(ctrl_rows)
-                    pbar.update(len(ctrl_rows))   # advance by number of control fits
 
-                    if self.config.verbose >= 3:
-                        test = results["test"]
+                    Xtr_raw = X_population[tr_local]
+                    Xv_raw = X_population[va_local]
+                    Xte_raw = X_population[te_local]
+
+                    scaled_cache = None
+                    if any(p.standardize for p in self.config.probes):
+                        shared_scaler = StandardScaler().fit(Xtr_raw)
+                        scaled_cache = (
+                            shared_scaler.transform(Xtr_raw).astype(np.float32),
+                            shared_scaler.transform(Xv_raw).astype(np.float32),
+                            shared_scaler.transform(Xte_raw).astype(np.float32),
+                        )
+                    else:
+                        shared_scaler = None
+
+                    for probe in self.config.probes:
+                        probe_seed = seed + stable_int(probe.name) + layer_idx * 997
+                        if probe.standardize:
+                            Xtr, Xv, Xte = scaled_cache
+                            scaler_for_artifact = shared_scaler
+                        else:
+                            Xtr, Xv, Xte = Xtr_raw, Xv_raw, Xte_raw
+                            scaler_for_artifact = None
+
                         self.logger.emit(
-                            f"TEST Macro-F1={test.get('macro_f1')} | "
-                            f"BalancedAcc={test.get('balanced_accuracy')} | "
-                            f"MCC={test.get('mcc')}",
+                            f"FIT {probe.name} | layer={layer_idx} | complexity={probe.complexity} | seed={probe_seed}",
                             3,
                         )
-                        if self.task_type == "multi_label":
+
+                        results, model = fit_probe(
+                            probe,
+                            Xtr,
+                            y_train,
+                            Xv,
+                            y_val,
+                            Xte,
+                            y_test,
+                            self.classes,
+                            self.task_type,
+                            probe_seed,
+                            self.device,
+                            self.config.enable_per_class_metrics,
+                        )
+                        pbar.update(1)   # <-- advance progress bar after real fit
+
+                        record = {
+                            "repeat": repeat,
+                            "seed": probe_seed,
+                            "layer": layer_name,
+                            "layer_index": layer_idx,
+                            "relative_layer_depth": relative_depth,
+                            "probe": probe.name,
+                            "probe_type": probe.type,
+                            "probe_complexity": probe.complexity,
+                            "task_type": self.task_type,
+                            "input_dim": int(X_population.shape[1]),
+                            "hidden_layers_total": int(self.artifact.hidden_layers),
+                            "class_count": len(self.classes),
+                            "train_n": int(len(tr_local)),
+                            "validation_n": int(len(va_local)),
+                            "test_n": int(len(te_local)),
+                            "parameters": results.get("parameters"),
+                            "resolved_hidden_dims": results.get("resolved_hidden_dims", []),
+                            "epochs_completed": results.get("epochs_completed"),
+                            "best_validation_score": results.get("best_validation_score"),
+                            "geometry_silhouette": geom.get("silhouette_score"),
+                            "geometry_pca_2d_variance": geom.get("pca_2d_variance"),
+                            "baseline_test_macro_f1": baseline["test"]["macro_f1"] if baseline else None,
+                        }
+                        record.update(self._metric_fields(results, "train"))
+                        record.update(self._metric_fields(results, "validation"))
+                        record.update(self._metric_fields(results, "test"))
+                        records.append(record)
+
+                        self._save_probe_artifacts(
+                            probe,
+                            layer_name,
+                            repeat,
+                            results,
+                            model,
+                            scaler_for_artifact,
+                            record,
+                        )
+
+                        # Shuffled-label controls
+                        ctrl_rows = self._exact_split_controls(
+                            layer_idx,
+                            probe,
+                            X_population,
+                            selected,
+                            split,
+                            repeat,
+                        )
+                        controls.extend(ctrl_rows)
+                        pbar.update(len(ctrl_rows))   # advance by number of control fits
+
+                        if self.config.verbose >= 3:
+                            test = results["test"]
                             self.logger.emit(
-                                f"TEST label coverage: positive={test.get('labels_with_positive_support')} | "
-                                f"both_classes={test.get('labels_with_both_support')} | "
-                                f"ROC-AUC={test.get('roc_auc_macro')} | AP={test.get('average_precision_macro')}",
+                                f"TEST Macro-F1={test.get('macro_f1')} | "
+                                f"BalancedAcc={test.get('balanced_accuracy')} | "
+                                f"MCC={test.get('mcc')}",
                                 3,
                             )
-
-        pbar.close()
+                            if self.task_type == "multi_label":
+                                self.logger.emit(
+                                    f"TEST label coverage: positive={test.get('labels_with_positive_support')} | "
+                                    f"both_classes={test.get('labels_with_both_support')} | "
+                                    f"ROC-AUC={test.get('roc_auc_macro')} | AP={test.get('average_precision_macro')}",
+                                    3,
+                                )
+                                
+            pbar.close()
+                                
+        except Exception:
+            print("Unexpected Error, Closing the P Bar... ")
+            pbar.close()
 
         # Rest of function unchanged...
         save_npz(self.output_dir / "split_indices.npz", **split_archive)
@@ -2844,6 +2858,55 @@ class UnifiedProbeAnalyzer:
 # Generalised model × dataset driver with error handling
 # =============================================================================
 
+def _results_index_path(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir / "results_index.csv"
+
+def update_results_index(checkpoint_dir: Path, result_csv: Path, model_name: str, dataset_name: str) -> None:
+    """
+    Append or update a row in the results index CSV.
+    The index maps hashed result filenames to model/dataset.
+    """
+    index_path = _results_index_path(checkpoint_dir)
+    row = {
+        "result_filename": result_csv.name,
+        "model": model_name,
+        "dataset": dataset_name,
+        "saved_at": time.time(),
+    }
+    if index_path.exists():
+        df = pd.read_csv(index_path)
+        # Remove any existing row with same filename
+        df = df[df["result_filename"] != result_csv.name]
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+    df.to_csv(index_path, index=False)
+
+def load_results_index(checkpoint_dir: Path) -> pd.DataFrame:
+    index_path = _results_index_path(checkpoint_dir)
+    if index_path.exists():
+        return pd.read_csv(index_path)
+    return pd.DataFrame(columns=["result_filename", "model", "dataset", "saved_at"])
+
+def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
+    """
+    Given a hashed filename (e.g., '85063c5df2ed_layer_probe_results.csv')
+    or just the hash, return a dict with model, dataset, and full path.
+    Returns None if not found.
+    """
+    index = load_results_index(checkpoint_dir)
+    # Allow either the full filename or just the hash prefix
+    if not hash_or_filename.endswith(".csv"):
+        hash_prefix = hash_or_filename
+    else:
+        hash_prefix = hash_or_filename.replace("_layer_probe_results.csv", "")
+    match = index[index["result_filename"].str.startswith(hash_prefix)]
+    if match.empty:
+        return None
+    row = match.iloc[0].to_dict()
+    result_path = checkpoint_dir / "per_entry_results" / row["result_filename"]
+    row["result_path"] = str(result_path)
+    return row
 
 def run_matrix(
     entries: Sequence[Mapping[str, Any]],
@@ -2910,8 +2973,8 @@ def run_matrix(
         dataset_name = str(entry["dataset"])
 
         # Determine the result CSV path for this entry
-        result_csv = results_subdir / f"{model_name.replace('/', '_')}_{dataset_name}_layer_probe_results.csv"
-
+        result_csv = results_subdir / f"{stable_hash(f'{model_name}::{dataset_name}', 12)}_layer_probe_results.csv"
+        
         if key in checkpoint.get("completed", {}):
             # Load from saved CSV
             if verbose >= 1:
@@ -2970,6 +3033,7 @@ def run_matrix(
 
             # Save the per-entry full results to CSV
             scored.to_csv(result_csv, index=False)
+            update_results_index(checkpoint_dir, result_csv, model_name, dataset_name)
             if verbose >= 1:
                 print(f"[checkpoint] Saved {result_csv.name}")
 
