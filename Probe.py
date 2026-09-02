@@ -21,6 +21,8 @@ import math
 import os
 import random
 import re
+import shutil
+import hashlib
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -2090,6 +2092,118 @@ class UnifiedProbeAnalyzer:
         output_dir: Path | None = None,
         dataset_df: pd.DataFrame | Any | None = None,
     ):
+        def _save_progress(self, completed: set, records: list) -> None:
+            """
+            Atomically save progress with checksum and backup.
+
+            Parameters
+            ----------
+            completed : set of (repeat, layer_idx, probe_name) tuples
+            records   : list of result dicts
+            """
+            path = self.output_dir / 'progress.json'
+            backup_path = self.output_dir / 'progress.json.bak'
+            tmp_name = f"progress_{os.getpid()}.tmp"
+            tmp_path = self.output_dir / tmp_name
+
+            # Prepare payload without checksum first
+            payload = {
+                'completed': sorted(completed),
+                'records': records,
+            }
+            serialized = json.dumps(payload, sort_keys=True, default=str).encode()
+            checksum = hashlib.sha256(serialized).hexdigest()
+            payload['checksum'] = checksum
+
+            try:
+                # Write to temp file
+                with open(tmp_path, 'w') as f:
+                    json.dump(payload, f, indent=2, sort_keys=True, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Atomic replace
+                os.replace(tmp_path, path)
+
+                # Update backup (keep the last valid version)
+                if backup_path.exists():
+                    try:
+                        # Verify current file is valid before copying
+                        with open(path, 'r') as f:
+                            data = json.load(f)
+                        # Recompute checksum on the actual payload (without checksum field)
+                        stored_checksum = data.get('checksum')
+                        payload_part = {
+                            'completed': data.get('completed', []),
+                            'records': data.get('records', [])
+                        }
+                        computed = hashlib.sha256(
+                            json.dumps(payload_part, sort_keys=True, default=str).encode()
+                        ).hexdigest()
+                        if stored_checksum == computed:
+                            shutil.copy2(path, backup_path)
+                    except Exception:
+                        # If current file is invalid, keep old backup
+                        pass
+                else:
+                    shutil.copy2(path, backup_path)
+
+            except Exception as e:
+                self.logger.emit(f"Warning: could not save progress file: {e}", 1)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+
+        def _load_progress(self) -> tuple[set, list]:
+            """
+            Load progress from progress.json or its backup, verifying checksum.
+
+            Returns
+            -------
+            completed : set of (repeat, layer_idx, probe_name) tuples
+            records   : list of result dicts
+            """
+            path = self.output_dir / 'progress.json'
+            backup_path = self.output_dir / 'progress.json.bak'
+
+            for candidate in (path, backup_path):
+                if not candidate.exists():
+                    continue
+                try:
+                    with open(candidate, 'r') as f:
+                        data = json.load(f)
+
+                    stored_checksum = data.get('checksum')
+                    if stored_checksum:
+                        # Recompute checksum on the actual payload fields
+                        payload_part = {
+                            'completed': data.get('completed', []),
+                            'records': data.get('records', [])
+                        }
+                        serialized = json.dumps(payload_part, sort_keys=True, default=str).encode()
+                        computed = hashlib.sha256(serialized).hexdigest()
+                        if computed != stored_checksum:
+                            self.logger.emit(
+                                f"Checksum mismatch in {candidate.name}, trying backup.", 1
+                            )
+                            continue
+                    else:
+                        self.logger.emit(
+                            f"Progress file {candidate.name} has no checksum; assuming valid.", 2
+                        )
+
+                    completed = set(tuple(item) for item in data.get('completed', []))
+                    records = data.get('records', [])
+                    return completed, records
+
+                except Exception as e:
+                    self.logger.emit(f"Failed to load {candidate.name}: {e}", 1)
+                    continue
+
+            self.logger.emit("No valid progress file found, starting fresh.", 1)
+            return set(), []
+    
+    
         config.validate_verbose()
         self.artifact = artifact
         self.config = config
@@ -2354,35 +2468,116 @@ class UnifiedProbeAnalyzer:
             })
         return rows
     
-    def _load_progress(self):
-        """Load completed (repeat, layer, probe) tuples and partial records from progress file."""
-        path = self.output_dir / 'progress.json'
-        if not path.exists():
-            return set(), []
-        try:
-            with open(path, 'r') as f:
-                data = json.load(f)
-            completed = set(tuple(item) for item in data.get('completed', []))
-            records = data.get('records', [])
-            return completed, records
-        except Exception:
-            # If progress file is corrupt, start fresh (but log warning)
-            self.logger.emit(f"Warning: could not read progress file {path}, starting fresh.", 1)
-            return set(), []
+    def _save_progress(self, completed: set, records: list) -> None:
+        """
+        Atomically save progress with checksum and backup.
 
-    def _save_progress(self, completed, records):
-        """Atomically save progress file."""
+        Parameters
+        ----------
+        completed : set of (repeat, layer_idx, probe_name) tuples
+        records   : list of result dicts
+        """
         path = self.output_dir / 'progress.json'
-        tmp = path.with_suffix('.tmp')
+        backup_path = self.output_dir / 'progress.json.bak'
+        tmp_name = f"progress_{os.getpid()}.tmp"
+        tmp_path = self.output_dir / tmp_name
+
+        # Prepare payload without checksum first
+        payload = {
+            'completed': sorted(completed),
+            'records': records,
+        }
+        serialized = json.dumps(payload, sort_keys=True, default=str).encode()
+        checksum = hashlib.sha256(serialized).hexdigest()
+        payload['checksum'] = checksum
+
         try:
-            with open(tmp, 'w') as f:
-                json.dump({'completed': sorted(completed), 'records': records}, f, indent=2)
+            # Write to temp file
+            with open(tmp_path, 'w') as f:
+                json.dump(payload, f, indent=2, sort_keys=True, default=str)
                 f.flush()
                 os.fsync(f.fileno())
-            tmp.replace(path)
+
+            # Atomic replace
+            os.replace(tmp_path, path)
+
+            # Update backup (keep the last valid version)
+            if backup_path.exists():
+                try:
+                    # Verify current file is valid before copying
+                    with open(path, 'r') as f:
+                        data = json.load(f)
+                    # Recompute checksum on the actual payload (without checksum field)
+                    stored_checksum = data.get('checksum')
+                    payload_part = {
+                        'completed': data.get('completed', []),
+                        'records': data.get('records', [])
+                    }
+                    computed = hashlib.sha256(
+                        json.dumps(payload_part, sort_keys=True, default=str).encode()
+                    ).hexdigest()
+                    if stored_checksum == computed:
+                        shutil.copy2(path, backup_path)
+                except Exception:
+                    # If current file is invalid, keep old backup
+                    pass
+            else:
+                shutil.copy2(path, backup_path)
+
         except Exception as e:
             self.logger.emit(f"Warning: could not save progress file: {e}", 1)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
+    def _load_progress(self) -> tuple[set, list]:
+        """
+        Load progress from progress.json or its backup, verifying checksum.
+
+        Returns
+        -------
+        completed : set of (repeat, layer_idx, probe_name) tuples
+        records   : list of result dicts
+        """
+        path = self.output_dir / 'progress.json'
+        backup_path = self.output_dir / 'progress.json.bak'
+
+        for candidate in (path, backup_path):
+            if not candidate.exists():
+                continue
+            try:
+                with open(candidate, 'r') as f:
+                    data = json.load(f)
+
+                stored_checksum = data.get('checksum')
+                if stored_checksum:
+                    # Recompute checksum on the actual payload fields
+                    payload_part = {
+                        'completed': data.get('completed', []),
+                        'records': data.get('records', [])
+                    }
+                    serialized = json.dumps(payload_part, sort_keys=True, default=str).encode()
+                    computed = hashlib.sha256(serialized).hexdigest()
+                    if computed != stored_checksum:
+                        self.logger.emit(
+                            f"Checksum mismatch in {candidate.name}, trying backup.", 1
+                        )
+                        continue
+                else:
+                    self.logger.emit(
+                        f"Progress file {candidate.name} has no checksum; assuming valid.", 2
+                    )
+
+                completed = set(tuple(item) for item in data.get('completed', []))
+                records = data.get('records', [])
+                return completed, records
+
+            except Exception as e:
+                self.logger.emit(f"Failed to load {candidate.name}: {e}", 1)
+                continue
+
+        self.logger.emit("No valid progress file found, starting fresh.", 1)
+        return set(), []
     def run(self):
         if self.skip_run:
             self.logger.emit("Skipping execution, loading existing results.", 1)
@@ -2396,40 +2591,18 @@ class UnifiedProbeAnalyzer:
             else:
                 self.logger.emit("Completion marker found but result files missing. Re-running.", 1)
                 self.skip_run = False
-                
-        def _load_progress(self):
-            """Load completed (repeat, layer, probe) tuples and partial records from progress file."""
-            path = self.output_dir / 'progress.json'
-            if not path.exists():
-                return set(), []
-            try:
-                with open(path, 'r') as f:
-                    data = json.load(f)
-                completed = set(tuple(item) for item in data.get('completed', []))
-                records = data.get('records', [])
-                return completed, records
-            except Exception:
-                # If progress file is corrupt, start fresh (but log warning)
-                self.logger.emit(f"Warning: could not read progress file {path}, starting fresh.", 1)
-                return set(), []
 
-        def _save_progress(self, completed, records):
-            """Atomically save progress file."""
-            path = self.output_dir / 'progress.json'
-            tmp = path.with_suffix('.tmp')
-            try:
-                with open(tmp, 'w') as f:
-                    json.dump({'completed': sorted(completed), 'records': records}, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                tmp.replace(path)
-            except Exception as e:
-                self.logger.emit(f"Warning: could not save progress file: {e}", 1)
-            
-        self.write_run_manifest()
-        records = []
+        # Load progress if available
+        completed, partial_records = self._load_progress()
+        if completed:
+            self.logger.emit(f"Resuming from progress file with {len(completed)} completed fits.", 1)
+
+        # If we have partial records, they will be appended to the main records list.
+        records = partial_records.copy()  # list of dicts
         controls = []
         split_archive = {}
+
+        self.write_run_manifest()  # (this may already be called earlier; ensure it's not duplicated)
 
         self.logger.section("PROBING EXPERIMENT", 1)
         self.logger.emit(
@@ -2439,7 +2612,7 @@ class UnifiedProbeAnalyzer:
             f"repeats={self.config.repeats} | max_samples={self.config.max_samples} | "
             f"layers={len(self.layers)} | probes={len(self.config.probes)}", 1
         )
-
+        
         if self.logger.level >= 1:
             if self.task_type == "single_label":
                 counts = np.bincount(self.y, minlength=len(self.classes))
@@ -2453,7 +2626,7 @@ class UnifiedProbeAnalyzer:
                 observed = int(np.sum(positives > 0))
                 self.logger.emit(
                     f"Target coverage: labels_with_positive_support={observed}/{len(self.classes)} | "
-                    f"rarest={sorted((int(c), self.classes[i]) for i, c in enumerate(positives) if c > 0)[:10]}", 1
+                    f"rarest={sorted((int(c), self.classes[i]) for i, c in enumerate(positives) if c > 0)[:10]}", 1,
                 )
 
         total_fittings = self.config.repeats * len(self.layers) * len(self.config.probes)
@@ -2489,7 +2662,17 @@ class UnifiedProbeAnalyzer:
                 for layer_name in self.layers:
                     layer_idx = parse_layer_number(layer_name)
                     relative_depth = layer_idx / (self.artifact.hidden_layers - 1) if self.artifact.hidden_layers > 1 else 0.0
-
+                    all_probes_done = all(
+                        (repeat, layer_idx, probe.name) in completed
+                        for probe in self.config.probes
+                    )
+                    if all_probes_done:
+                        self.logger.emit(
+                            f"Layer {layer_idx} already fully completed for repeat {repeat+1}, skipping.",
+                            2,
+                        )
+                        continue
+                    # Load data for this layer
                     X_population = self._load_population_layer(layer_idx, selected)
 
                     geom_count = min(len(selected), max(self.config.pca_samples, self.config.silhouette_samples))
@@ -2521,6 +2704,11 @@ class UnifiedProbeAnalyzer:
                         shared_scaler = None
 
                     for probe in self.config.probes:
+                        key = (repeat, layer_idx, probe.name)
+                        if key in completed:
+                            # Already done, skip fitting
+                            continue
+
                         probe_seed = seed + stable_int(probe.name) + layer_idx * 997
                         if probe.standardize:
                             Xtr, Xv, Xte = scaled_cache
@@ -2571,6 +2759,14 @@ class UnifiedProbeAnalyzer:
 
                         self._save_probe_artifacts(probe, layer_name, repeat, results, model, scaler_for_artifact, record)
 
+                        # Add to completed set and save progress atomically
+                        completed.add(key)
+                        self._save_progress(completed, records)
+
+                        # Shuffled-label controls (if enabled) are not part of progress for now; they can be recomputed
+                        # if needed, but we treat them as part of the probe fit if we want to save them.
+                        # For simplicity, we do NOT save control rows in progress; they will be re-run if needed.
+                        # If you want to include them, extend the record and completed key.
                         ctrl_rows = self._exact_split_controls(layer_idx, probe, X_population, selected, split, repeat)
                         controls.extend(ctrl_rows)
                         pbar.update(len(ctrl_rows))
@@ -2589,63 +2785,76 @@ class UnifiedProbeAnalyzer:
                                     f"ROC-AUC={test.get('roc_auc_macro')} | AP={test.get('average_precision_macro')}",
                                     3,
                                 )
-            pbar.close()
+                pbar.close()
         except Exception:
             print("Unexpected Error, Closing the Progress Bar... ")
             pbar.close()
 
-        save_npz(self.output_dir / "split_indices.npz", **split_archive)
-        results_df = pd.DataFrame(records)
-        control_df = pd.DataFrame(controls)
-        if not control_df.empty:
-            control_df.to_csv(self.output_dir / "shuffled_label_controls.csv", index=False)
+        # After loops, if we completed everything, delete progress file and finalise
+        if len(completed) == total_fittings:
+            # Save final results and remove progress file
+            save_npz(self.output_dir / "split_indices.npz", **split_archive)
+            results_df = pd.DataFrame(records)
+            control_df = pd.DataFrame(controls)
+            if not control_df.empty:
+                control_df.to_csv(self.output_dir / "shuffled_label_controls.csv", index=False)
 
-        scored = add_score_columns(results_df, control_df if not control_df.empty else None, self.config, self.task_type)
+            scored = add_score_columns(results_df, control_df if not control_df.empty else None, self.config, self.task_type)
 
-        aggregate = scored.groupby(["probe", "probe_type", "probe_complexity", "layer_index"], as_index=False).agg(
-            test_macro_f1_mean=("test_macro_f1", "mean"),
-            test_macro_f1_std=("test_macro_f1", "std"),
-            test_balanced_accuracy_mean=("test_balanced_accuracy", "mean"),
-            test_mcc_mean=("test_mcc", "mean"),
-            selectivity_mean=("selectivity", "mean"),
-            probe_score_mean=("probe_score", "mean"),
-            probe_score_std=("probe_score", "std"),
-            parameters=("parameters", "first"),
-            relative_layer_depth=("relative_layer_depth", "first"),
-        )
-        best = aggregate.sort_values(["probe", "probe_score_mean"], ascending=[True, False]).groupby("probe", as_index=False).first()
+            aggregate = scored.groupby(["probe", "probe_type", "probe_complexity", "layer_index"], as_index=False).agg(
+                test_macro_f1_mean=("test_macro_f1", "mean"),
+                test_macro_f1_std=("test_macro_f1", "std"),
+                test_balanced_accuracy_mean=("test_balanced_accuracy", "mean"),
+                test_mcc_mean=("test_mcc", "mean"),
+                selectivity_mean=("selectivity", "mean"),
+                probe_score_mean=("probe_score", "mean"),
+                probe_score_std=("probe_score", "std"),
+                parameters=("parameters", "first"),
+                relative_layer_depth=("relative_layer_depth", "first"),
+            )
+            best = aggregate.sort_values(["probe", "probe_score_mean"], ascending=[True, False]).groupby("probe", as_index=False).first()
 
-        scored.to_csv(self.output_dir / "layer_probe_results.csv", index=False)
-        aggregate.to_csv(self.output_dir / "layer_probe_aggregate_results.csv", index=False)
-        best.to_csv(self.output_dir / "final_probe_score_matrix.csv", index=False)
-        create_final_visuals(scored, self.output_dir)
+            scored.to_csv(self.output_dir / "layer_probe_results.csv", index=False)
+            aggregate.to_csv(self.output_dir / "layer_probe_aggregate_results.csv", index=False)
+            best.to_csv(self.output_dir / "final_probe_score_matrix.csv", index=False)
+            create_final_visuals(scored, self.output_dir)
 
-        metadata_path = save_complete_run_metadata(
-            self, scored, best, control_df,
-            extra_info={"trial_config": self.trial_config, "trial_hash": self.trial_hash}
-        )
-        self.logger.emit(f"Complete run metadata saved: {metadata_path}", 1)
+            metadata_path = save_complete_run_metadata(
+                self, scored, best, control_df,
+                extra_info={"trial_config": self.trial_config, "trial_hash": self.trial_hash}
+            )
+            self.logger.emit(f"Complete run metadata saved: {metadata_path}", 1)
 
-        summary = {
-            "trial_hash": self.trial_hash,
-            "probe_score_mean": float(scored["probe_score"].mean()) if not scored.empty else None,
-            "test_macro_f1_mean": float(scored["test_macro_f1"].mean()) if not scored.empty else None,
-            "test_balanced_accuracy_mean": float(scored["test_balanced_accuracy"].mean()) if not scored.empty else None,
-            "best_per_probe": best.to_dict("records") if not best.empty else [],
-            "control_mean_macro_f1": float(control_df["control_test_macro_f1"].mean()) if control_df is not None and not control_df.empty else None,
-            "output_dir": str(self.output_dir),
-        }
-        save_json(self.output_dir / "summary.json", summary)
-        save_json(self.output_dir / "completion.json", {"status": "complete", "finished_at": time.time()})
+            summary = {
+                "trial_hash": self.trial_hash,
+                "probe_score_mean": float(scored["probe_score"].mean()) if not scored.empty else None,
+                "test_macro_f1_mean": float(scored["test_macro_f1"].mean()) if not scored.empty else None,
+                "test_balanced_accuracy_mean": float(scored["test_balanced_accuracy"].mean()) if not scored.empty else None,
+                "best_per_probe": best.to_dict("records") if not best.empty else [],
+                "control_mean_macro_f1": float(control_df["control_test_macro_f1"].mean()) if control_df is not None and not control_df.empty else None,
+                "output_dir": str(self.output_dir),
+            }
+            save_json(self.output_dir / "summary.json", summary)
+            save_json(self.output_dir / "completion.json", {"status": "complete", "finished_at": time.time()})
 
-        self.logger.section("FINAL RESULT", 1)
-        if not best.empty:
-            cols = [c for c in ["probe", "layer_index", "probe_score_mean", "test_macro_f1_mean"] if c in best.columns]
-            self.logger.emit("Final best layer table:", 1)
-            if self.config.verbose >= 1:
-                print(best[cols].to_string(index=False))
-        self.logger.emit(f"Output directory: {self.output_dir}", 1)
-        return scored, best
+            # Delete progress file
+            progress_path = self.output_dir / 'progress.json'
+            if progress_path.exists():
+                progress_path.unlink()
+
+            self.logger.section("FINAL RESULT", 1)
+            if not best.empty:
+                cols = [c for c in ["probe", "layer_index", "probe_score_mean", "test_macro_f1_mean"] if c in best.columns]
+                self.logger.emit("Final best layer table:", 1)
+                if self.config.verbose >= 1:
+                    print(best[cols].to_string(index=False))
+            self.logger.emit(f"Output directory: {self.output_dir}", 1)
+            return scored, best
+        else:
+            # Incomplete run; save partial state and exit gracefully (or raise)
+            self.logger.emit(f"Run incomplete: {len(completed)}/{total_fittings} fits completed. Progress saved.", 1)
+            # Optionally raise an exception to signal incompleteness to matrix runner
+            raise RuntimeError(f"Trial incomplete after {len(completed)}/{total_fittings} fits. Progress saved; rerun to continue.")
 
 
 # -----------------------------------------------------------------------------
