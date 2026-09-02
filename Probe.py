@@ -2353,6 +2353,35 @@ class UnifiedProbeAnalyzer:
                 "control_test_mcc": test_result.get("mcc"),
             })
         return rows
+    
+    def _load_progress(self):
+        """Load completed (repeat, layer, probe) tuples and partial records from progress file."""
+        path = self.output_dir / 'progress.json'
+        if not path.exists():
+            return set(), []
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            completed = set(tuple(item) for item in data.get('completed', []))
+            records = data.get('records', [])
+            return completed, records
+        except Exception:
+            # If progress file is corrupt, start fresh (but log warning)
+            self.logger.emit(f"Warning: could not read progress file {path}, starting fresh.", 1)
+            return set(), []
+
+    def _save_progress(self, completed, records):
+        """Atomically save progress file."""
+        path = self.output_dir / 'progress.json'
+        tmp = path.with_suffix('.tmp')
+        try:
+            with open(tmp, 'w') as f:
+                json.dump({'completed': sorted(completed), 'records': records}, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(path)
+        except Exception as e:
+            self.logger.emit(f"Warning: could not save progress file: {e}", 1)
 
     def run(self):
         if self.skip_run:
@@ -2367,7 +2396,36 @@ class UnifiedProbeAnalyzer:
             else:
                 self.logger.emit("Completion marker found but result files missing. Re-running.", 1)
                 self.skip_run = False
+                
+        def _load_progress(self):
+            """Load completed (repeat, layer, probe) tuples and partial records from progress file."""
+            path = self.output_dir / 'progress.json'
+            if not path.exists():
+                return set(), []
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                completed = set(tuple(item) for item in data.get('completed', []))
+                records = data.get('records', [])
+                return completed, records
+            except Exception:
+                # If progress file is corrupt, start fresh (but log warning)
+                self.logger.emit(f"Warning: could not read progress file {path}, starting fresh.", 1)
+                return set(), []
 
+        def _save_progress(self, completed, records):
+            """Atomically save progress file."""
+            path = self.output_dir / 'progress.json'
+            tmp = path.with_suffix('.tmp')
+            try:
+                with open(tmp, 'w') as f:
+                    json.dump({'completed': sorted(completed), 'records': records}, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp.replace(path)
+            except Exception as e:
+                self.logger.emit(f"Warning: could not save progress file: {e}", 1)
+            
         self.write_run_manifest()
         records = []
         controls = []
