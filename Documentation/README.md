@@ -1,306 +1,64 @@
-# Hidden-State Probing for Emotion Recognition in Language Models
+# 🧠 Hidden-State Probing for Emotion Recognition in Language Models
 
-This repository houses a complete framework for extracting frozen transformer representations and systematically probing them for emotion-related information. It is built for scientific reproducibility and long-running experiment management.
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
+[![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/yourusername/emotion-probing/graphs/commit-activity)
 
----
+> **A complete framework for extracting frozen transformer representations and systematically probing them for emotion-related information.**  
+> Built for scientific reproducibility and long-running experiment management. If you’ve ever wanted to know *where* (and how well) emotion lives inside a language model’s hidden states, you’re in the right place.
 
-## Project Map
-
-| Path | Purpose |
-|------|---------|
-| `Analyser_.py` | Early hidden-state analyser, superseded by unified probe. |
-| `Analyser_new.ipynb` | Notebook for advanced hidden-state analysis. |
-| `Analyzer_Visualizer_.ipynb` | Visual dashboard for inspecting extracted states. |
-| `Extraction6_new.py` | Deterministic extraction pipeline with resume and v2 unified format. |
-| `Extraction6_display.ipynb` | Notebook front-end for running and monitoring extraction. |
-| `Get_Go_Emo.py` | Loader for the GoEmotions dataset. |
-| `Get_Isear.py` | Loader for the ISEAR dataset. |
-| `GoEmotion.ipynb` | Exploration and preprocessing of GoEmotions. |
-| `ISEAR.ipynb` | Exploration and preprocessing of ISEAR. |
-| `Working_Analyser.ipynb` | Main analysis notebook for probe results. |
-| `unified_hidden_state_probe_v4_2.py` | Core probe training, evaluation, controls, and checkpointing. |
-| `unified_hidden_state_probe_v4_2_master.ipynb` | Master notebook driving the full probe matrix. |
-| `good_broken_analyser.ipynb` | Debug notebook containing working and broken attempts. |
-| `Documentation/` | Logbook, poster, presentation, specification, requirements. |
-| `Go_Emotion_Google/` | Raw GoEmotions CSVs (train/validation/test). |
-| `isear_dataset-master/isear.csv` | Raw ISEAR dataset. |
-| `__pycache__/` | Compiled Python bytecode, safe to ignore. |
+This repository is the result of many months of work, countless experiments, and a fair share of late‑night debugging. What started as a simple script to pull hidden states from BERT has grown into a full‑fledged pipeline with checkpointing, robust controls, and a suite of analysis notebooks. I built it as part of my final‑year project, and I’m sharing it in the hope that others can build on it or learn from it.
 
 ---
 
-## TODO
+## 📚 Table of Contents
 
-### Phase 0 — Dataset
-
-- [x] Confirm GoEmotions loader returns expected columns and label format.
-- [x] Confirm ISEAR loader maps numeric labels to emotion names.
-- [x] Inspect class balance and sample counts.
-- [ ] Add dataset statistics to documentation.
-- [ ] Cache cleaned datasets as Parquet for faster reload.
-
-### Phase 1 — Extraction
-
-- [x] Finalise deterministic extraction pipeline.
-- [x] Implement memmap storage with checksums and flush control.
-- [x] Add resume capability via experiment manifest validation.
-- [x] Repair auxiliary files (`sample_ids`, `labels`, integrity hashes).
-- [x] Run extraction across all models and datasets.
-- [ ] Audit every model‑dataset pair for completeness.
-- [ ] Generate a global extraction audit report.
-
-### Phase 2 — Probing
-
-- [x] Implement unified probe training (logistic + MLP).
-- [x] Add shuffled‑label controls for chance estimation.
-- [x] Add checkpoint/resume for matrix runs.
-- [x] Fix per‑class metric calculation for multiclass targets.
-- [x] Save complete run metadata (config, environment, results).
-- [x] Execute full probe matrix over available pairs.
-- [ ] Compare results against baselines and controls.
-- [ ] Run permutation tests for statistical significance.
-
-### Phase 3 — Analysis & Visualisation
-
-- [x] Load checkpoint results with encoding fallback.
-- [x] Generate best‑layer summary table.
-- [x] Plot layer‑wise Macro‑F1 curves.
-- [x] Plot heatmaps (probe × layer).
-- [x] Plot confusion matrices for single‑label tasks.
-- [x] Plot per‑class metrics heatmap.
-- [x] Compare true vs shuffled‑label performance.
-- [ ] Add model performance ranking bar chart.
-- [ ] Add PCA/t‑SNE visualisation of hidden states.
-- [ ] Compile final publication‑quality dashboard.
-
-### Phase 4 — Documentation & Cleanup
-
-- [x] Maintain logbook with key decisions.
-- [x] Draft poster and presentation.
-- [x] Write specification document.
-- [ ] Update README with final results and usage.
-- [ ] Remove legacy files and `__pycache__` from repository.
-- [ ] Ensure `requirements.txt` is current.
+- [What This Project Does](#what-this-project-does)
+- [Why Should You Care?](#why-should-you-care)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [The Pipeline (Step by Step)](#the-pipeline-step-by-step)
+  - [1️⃣ Dataset Preparation](#1️⃣-dataset-preparation)
+  - [2️⃣ Hidden‑State Extraction](#2️⃣-hidden-state-extraction)
+  - [3️⃣ Probing](#3️⃣-probing)
+  - [4️⃣ Analysis & Visualisation](#4️⃣-analysis--visualisation)
+- [Repository Structure](#repository-structure)
+- [Features That Matter](#features-that-matter)
+- [Current Status & Roadmap](#current-status--roadmap)
+- [Design Notes & Gotchas](#design-notes--gotchas)
+- [Contributing](#contributing)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
 
 ---
 
-## Notes
+## What This Project Does
 
-- Extraction is deterministic; batch size, dtype, pooling, and max length are fixed after initialisation.
-- The unified v2 format stores sample IDs as strings, text hashes, and a global checksum.
-- Probe runs are checkpointed per model‑dataset pair, allowing interruption and seamless resume.
-- Shuffled‑label controls use identical data splits, providing a robust chance baseline.
-- Some early extractions lack explicit model/dataset names; directory‑based fallbacks are used.
-- Multi‑label confusion matrices are not saved; per‑class metrics serve as an alternative.
-- ISEAR labels are numeric and must be mapped to emotion names before probing.
-- Checkpoint CSVs may contain non‑UTF‑8 characters; a robust reader is used in analysis.
+I’m investigating whether pre‑trained transformer models (BERT, RoBERTa, etc.) encode emotional content in their hidden representations, and if so, **which layers** carry the most signal. I use two emotion datasets:
+
+- **GoEmotions** – a large multi‑label dataset of Reddit comments annotated with 27 emotion categories.
+- **ISEAR** – a classic single‑label dataset of self‑reported emotional experiences across 7 emotions.
+
+I extract hidden states from **every layer** of each model, then train **linear and MLP probes** on top of those frozen representations to predict emotion labels. Every experiment includes **shuffled‑label controls** to establish chance performance, and the entire pipeline is designed to be **resumable, deterministic, and fully logged**.
+
+The end result is a detailed map of where emotional information lives inside transformer architectures — useful for interpretability research, model comparison, and downstream applications.
 
 ---
 
-## Quick Start
+## Why Should You Care?
 
-```bash
-# Install dependencies
-pip install -r Documentation/requirements.txt
+- **Interpretability**: Ever wondered if a model “understands” emotion? This project gives you a layer‑by‑layer breakdown.
+- **Reproducibility**: The pipeline is deterministic and checkpointed, so you can trust the results and rerun anything easily.
+- **Benchmark**: The probe results serve as a baseline for comparing different transformer models on emotion tasks.
+- **Code reuse**: The extraction and probing modules are modular and can be adapted for other tasks (sentiment, toxicity, etc.).
 
-# Load datasets
-python -c "from Get_Go_Emo import get_go; df = get_go(); print(df.shape)"
-python -c "from Get_Isear import get_isr; df = get_isr(); print(df.shape)"
+---
 
-# Extract hidden states (if not already done)
-jupyter notebook Extraction6_display.ipynb
+## Installation
 
-# Run probe matrix
-jupyter notebook unified_hidden_state_probe_v4_2_master.ipynb
-
-# Analyse results
-jupyter notebook Working_Analyser.ipynb
-
-
-██████╗ ██████╗  █████╗  ██████╗  ███╗   ██╗
-██╔══██╗██╔══██╗██╔══██╗██╔════╝  ████╗  ██║
-██║  ██║██████╔╝███████║██║  ███╗ ██╔██╗ ██║
-██║  ██║██╔══██╗██╔══██║██║   ██║ ██║╚██╗██║
-██████╔╝██║  ██║██║  ██║╚██████╔╝ ██║ ╚████║
-╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═╝  ╚═══╝
-
-                 D R A C O
-
-
-
-
-                            .==.
-                           ()''()
-                    .---. ;`--' ; .---.
-                   /     \|    |/     \
-                  /  /|   |    |   |\  \
-                 /  / |   |    |   | \  \
-                /__/  |   |    |   |  \__\
-               (  \   |   |    |   |   /  )
-                \  \  |   |    |   |  /  /
-                 \  \_|   |    |   |_/  /
-                  \_  |   |    |   |  _/
-                    \ |   |    |   | /
-                     \|   |    |   |/
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                      |   |    |   |
-                     /    |    |    \
-                    /     |    |     \
-                   /      |    |      \
-
-
-
-
-
-                                                                        .-^^^^-.
-                                  _.-'  _   _  `-._
-                               .-'     / \_/ \     `-.
-                             .'       /  (O O)  \       `.
-                            /        |    \_/    |        \
-                           ;         | .-.___.-. |         ;
-                           |         \/  /###\  \/         |
-                           |          \  \###/  /          |
-                           ;           `-.###.-'           ;
-                            \              |              /
-                             `.            |            .'
-                               `-.         |         .-'
-                                  `--.__   |   __.--'
-                                        `\ | /'
-                                   _______\|/_______
-                               _.-'       / \       `-._
-                            _.-'         /###\         `-._
-                         .-'            \###/            `-.
-                       .'                `V'                `.
-                      /             _.-^^^^^^^-._             \
-                     /          _.-'   _    _   `-._          \
-                    ;         .'      (_)  (_)      `.         ;
-                    |        /          \__/          \        |
-                    |       /      _.-.      .-._      \       |
-                    ;      ;     .'   /######\   `.     ;      ;
-                     \     |    /   /##########\   \    |     /
-                      `.   |   ;   /############\   ;   |   .'
-                        `-.|   |  /##############\  |   |.-'
-                           \   | /################\ |   /
-                            \  |/##################\|  /
-                             \ /####################\ /
-                              Y######################Y
-                              |######################|
-                              |######  /\  /\  ######|
-                              |###### /  \/  \ ######|
-                              |##### |   /\   | #####|
-                              |##### |  /##\  | #####|
-                              |#####  \/####\/  #####|
-                               \####################/
-                                \##################/
-                                 `-.############.-'
-                                    \##########/
-                         ____________\########/____________
-                    _.-'              \######/              `-._
-                 .-'                  /######\                  `-.
-              _-'                    /########\                    `-_
-            .'                      /##########\                      `.
-           /               _..----''############``----.._              \
-          /          _..-''##############################``-.._          \
-         ;       _.-'##########################################`-._       ;
-         |    .-'#######################/\########################`-.    |
-         | .-'########################/  \##########################`-. |
-         |/#########################/ /\ \############################\|
-         /#########################/ /##\ \############################\
-        /#########################/ /####\ \############################\
-       ;#########################/ /######\ \############################;
-       |########################| /########\ |############################|
-       |########################|/##########\|############################|
-       |########################/############\############################|
-       |#######################/##############\###########################|
-       |######################/################\##########################|
-       |#####################/##################\#########################|
-       ;####################/####################\########################;
-        \##################/######################\######################/
-         \################/########################\####################/
-          \##############/############################\################/
-           `.##########/################################\############.'
-             `-._###_/##################################\###_.-'
-                  /########################################\
-                 /##########################################\
-                /############################################\
-               /##############################################\
-              /################################################\
-             /##################################################\
-            /####################################################\
-           /######################################################\
-          /########################################################\
-         /##########################################################\
-        /############################################################\
-       /##############################################################\
-      /################################################################\
-     /##################################################################\
-    /####################################################################\
-   /######################################################################\
-  /#######################################################################\
- /#########################################################################\
- \########################################################################/
-  \#######################################################################/
-   \#####################################################################/
-    \###################################################################/
-     \#################################################################/
-      \###############################################################/
-       \#############################################################/
-        \###########################################################/
-         \#########################################################/
-          \#######################################################/
-           \#####################################################/
-            \###################################################/
-             \#################################################/
-              \###############################################/
-               \#############################################/
-                \###########################################/
-                 \#########################################/
-                  \#######################################/
-                   \#####################################/
-                    \###################################/
-                     \#################################/
-                      \###############################/
-                       \#############################/
-                        \###########################/
-                         \#########################/
-                          \#######################/
-                           \#####################/
-                            \###################/
-                             \#################/
-                              \###############/
-                               \#############/
-                                \###########/
-                                 \#########/
-                                  \#######/
-                                   \#####/
-                                    \###/
-                                     \#/
-                                      V
-
-
-
--------====-----=-=-=-----=-=-=======-----==--==--==-=-==-=--==---------=-=-=-=-=========
-
-
-Ideal Logbook Logs and Books :- Logbook on hackmd -> date, cleaner, short descriptions of papers, errors, good githubs, explaining to yourself in the logbook... 
-
-Github Culture :- regular commits (not necessarly pushing)
-
-capture package requirement for project :- pip freeze > requirements.txt
-
--=-===--=-=-=-=-=-----=-=-=-----=-=-=======-----==--==--==-=-==-=--==---------=-=-=-=-=========
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/emotion-probing.git
+   cd emotion-probing
