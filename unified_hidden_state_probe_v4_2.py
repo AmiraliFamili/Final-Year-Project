@@ -428,7 +428,6 @@ class DatasetContract:
     require_provenance: bool = False
     require_label_fingerprint: bool = False
     lenient_provenance: bool = False 
-
     allow_missing_label_fingerprint: bool = False
 
 @dataclass
