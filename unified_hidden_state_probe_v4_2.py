@@ -427,9 +427,9 @@ class DatasetContract:
     # Stronger alignment checks when extraction metadata contains row identifiers.
     require_provenance: bool = False
     require_label_fingerprint: bool = False
-    
     lenient_provenance: bool = False 
 
+    allow_missing_label_fingerprint: bool = False
 
 @dataclass
 class SplitConfig:
@@ -1458,21 +1458,31 @@ def validate_label_alignment(
             "fingerprint disagrees with the clean-dataset target.\n"
             + json.dumps({"expected": expected, "observed": observed}, indent=2)
         )
-    if expected is None and contract.require_label_fingerprint:
-        raise RuntimeError(
-            "require_label_fingerprint=True but extraction metadata contains no label/target fingerprint."
-        )
+
+    # Determine initial status
+    if expected is not None:
+        status = "verified"
+        verified = True
+        provenance_available = True
+    else:
+        provenance_available = False
+        if contract.require_label_fingerprint:
+            # Do NOT raise here; caller will handle based on text alignment
+            status = "missing"
+            verified = False
+        else:
+            status = "unverified"
+            verified = False
 
     return {
-        "status": "verified" if expected is not None else "unverified",
-        "verified": expected is not None,
-        "provenance_available": expected is not None,
+        "status": status,
+        "verified": verified,
+        "provenance_available": provenance_available,
         "label_fingerprint": observed,
         "metadata_label_fingerprint": expected,
         "warning": None if expected is not None else (
-            "No label fingerprint was stored during extraction. Clean labels were "
-            "reconstructed deterministically, but extraction-time row identity is not "
-            "cryptographically proven by the existing artifact."
+            "No label fingerprint was stored during extraction. "
+            "Label row order will be inferred from verified text alignment if allowed."
         ),
     }
 
@@ -1526,6 +1536,21 @@ def validate_targets(y: np.ndarray, classes: Sequence[str], task_type: str) -> d
     return {"status": "pass", "warnings": warnings, "class_count": len(classes)}
 
 
+def detect_duplicate_texts(
+    df: pd.DataFrame,
+    text_column: str,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> dict:
+    texts = df[text_column].astype(str).str.strip().str.lower()
+    train_texts = set(texts.iloc[train_idx])
+    test_texts = set(texts.iloc[test_idx])
+    overlap = train_texts & test_texts
+    return {
+        "train_test_overlap_count": len(overlap),
+        "overlap_examples": list(overlap)[:10],
+        "percentage_test_overlap": len(overlap) / len(test_texts) * 100 if test_texts else 0.0,
+    }
 # =============================================================================
 # Split logic (unchanged)
 # =============================================================================
@@ -2383,6 +2408,35 @@ class UnifiedProbeAnalyzer:
         self.text_alignment = validate_text_alignment(artifact, self.df, config.dataset)
         self.label_alignment = validate_label_alignment(artifact, self.df, config.dataset, self.y, self.classes)
 
+        # --- Handle missing label fingerprint ---
+        if self.label_alignment["status"] == "missing":
+            if config.dataset.require_label_fingerprint:
+                if not config.dataset.allow_missing_label_fingerprint:
+                    raise RuntimeError(
+                        "require_label_fingerprint=True but extraction metadata contains no "
+                        "label/target fingerprint. Set allow_missing_label_fingerprint=True "
+                        "if you want to infer label alignment from verified text alignment."
+                    )
+                elif not self.text_alignment["verified"]:
+                    raise RuntimeError(
+                        "allow_missing_label_fingerprint=True but text alignment is not "
+                        "verified. Cannot infer label row order."
+                    )
+                else:
+                    # Infer label alignment from text alignment
+                    self.label_alignment["status"] = "inferred_from_text"
+                    self.label_alignment["verified"] = True
+                    self.label_alignment["verification_basis"] = (
+                        "Label row order inferred from cryptographically verified text alignment."
+                    )
+            else:
+                self.label_alignment["status"] = "unverified"
+                self.label_alignment["warning"] = (
+                    "No label fingerprint stored and require_label_fingerprint=False; "
+                    "proceeding with unverified labels."
+                )
+
+            # If text verified but label still unverified, add a note
         if self.text_alignment.get("verified") and not self.label_alignment.get("verified"):
             self.label_alignment["verification_basis"] = (
                 "Label row order inherits verification from the cryptographically matched "
@@ -3092,6 +3146,16 @@ def run_matrix(
                 print(f"[checkpoint] {i}/{len(entries)} | {model_name} | {dataset_name} : already completed, loading from {result_csv.name}")
             if result_csv.exists():
                 try:
+                    art_dir = dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name)
+                    required_files = [
+                        art_dir / "data" / "hidden_states.npy",
+                        art_dir / "data" / "completed.npy",
+                        art_dir / "metadata" / "extraction.json",
+                    ]
+                    missing = [str(p) for p in required_files if not p.exists()]
+                    if missing:
+                        raise FileNotFoundError(f"Missing extraction artifact(s): {missing}")
+                    art = ExtractionArtifact(art_dir)
                     df = pd.read_csv(result_csv)
                     per_entry_results.append(df)
                 except Exception as e:
