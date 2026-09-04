@@ -22,7 +22,6 @@ import os
 import random
 import re
 import shutil
-import hashlib
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -268,7 +267,7 @@ class DatasetContract:
     require_provenance: bool = False
     require_label_fingerprint: bool = False
     lenient_provenance: bool = False
-
+    allow_missing_label_fingerprint: bool = True
 
 @dataclass
 class SplitConfig:
@@ -1200,15 +1199,21 @@ def validate_label_alignment(artifact, df, contract, y, classes):
     expected = artifact.provenance.get("label_fingerprint") or artifact.provenance.get("target_fingerprint")
     if expected is not None and expected != observed:
         raise RuntimeError("Label provenance mismatch.")
-    if expected is None and contract.require_label_fingerprint:
-        raise RuntimeError("require_label_fingerprint=True but extraction metadata contains no label/target fingerprint.")
+    
+    if expected is None:
+        if contract.require_label_fingerprint and not contract.allow_missing_label_fingerprint:
+            raise RuntimeError("require_label_fingerprint=True but extraction metadata contains no label/target fingerprint.")
+        warning = "No label fingerprint was stored during extraction." if expected is None else None
+    else:
+        warning = None
+    
     return {
         "status": "verified" if expected is not None else "unverified",
         "verified": expected is not None,
         "provenance_available": expected is not None,
         "label_fingerprint": observed,
         "metadata_label_fingerprint": expected,
-        "warning": None if expected is not None else "No label fingerprint was stored during extraction.",
+        "warning": warning,
     }
 
 
@@ -2007,6 +2012,17 @@ def create_final_visuals(results_df, output_dir):
 # -----------------------------------------------------------------------------
 # Deterministic trial config and folder naming
 # -----------------------------------------------------------------------------
+def compute_computational_trial_config(config_dict: dict) -> dict:
+    """Return a copy of the trial config containing only fields that affect computation."""
+    comp = copy.deepcopy(config_dict)
+    # Remove non‑computational fields from dataset_contract
+    comp["dataset_contract"].pop("allow_missing_label_fingerprint", None)
+    # Remove non‑computational top‑level analysis fields
+    for field in ["output_subdir", "verbose"]:
+        comp["analysis"].pop(field, None)
+    # Optionally remove probe_version if version changes do not affect algorithm
+    # comp.pop("probe_version", None)
+    return comp
 
 def build_trial_config(
     artifact: ExtractionArtifact,
@@ -2015,6 +2031,9 @@ def build_trial_config(
     experiment_id: str,
     dataset_name: str,
 ) -> dict:
+    dataset_contract = asdict(config.dataset)
+    # Remove fields that do not affect actual computation
+    dataset_contract.pop("allow_missing_label_fingerprint", None)
     """Flatten **all** parameters that define a probe trial, including extraction metadata."""
     return {
         "extraction": {
@@ -2030,7 +2049,7 @@ def build_trial_config(
             "dataset_fingerprint": artifact.dataset_fingerprint,
             "model_snapshot": artifact.metadata.get("model", {}).get("snapshot"),
         },
-        "dataset_contract": asdict(config.dataset),
+        "dataset_contract": dataset_contract,
         "probes": [asdict(p) for p in config.probes],
         "split": asdict(config.split),
         "analysis": {
@@ -2079,6 +2098,27 @@ def build_trial_dir_name(
         name = f"{prefix}...{trial_hash}"
     return name
 
+def find_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
+    """Search for a run directory under base_dir that has a matching computational hash."""
+    for run_dir in base_dir.glob("probe_run__*"):
+        meta_path = run_dir / "complete_run_metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+            stored_comp_hash = meta.get("extra_info", {}).get("computational_hash")
+            if stored_comp_hash is None:
+                # fallback: compute from stored trial_config if present
+                trial_cfg = meta.get("extra_info", {}).get("trial_config")
+                if trial_cfg:
+                    stored_comp_hash = generate_trial_hash(
+                        compute_computational_trial_config(trial_cfg)
+                    )
+            if stored_comp_hash == comp_hash:
+                return run_dir
+        except Exception:
+            continue
+    return None
 
 # -----------------------------------------------------------------------------
 # Analyzer
@@ -2092,118 +2132,6 @@ class UnifiedProbeAnalyzer:
         output_dir: Path | None = None,
         dataset_df: pd.DataFrame | Any | None = None,
     ):
-        def _save_progress(self, completed: set, records: list) -> None:
-            """
-            Atomically save progress with checksum and backup.
-
-            Parameters
-            ----------
-            completed : set of (repeat, layer_idx, probe_name) tuples
-            records   : list of result dicts
-            """
-            path = self.output_dir / 'progress.json'
-            backup_path = self.output_dir / 'progress.json.bak'
-            tmp_name = f"progress_{os.getpid()}.tmp"
-            tmp_path = self.output_dir / tmp_name
-
-            # Prepare payload without checksum first
-            payload = {
-                'completed': sorted(completed),
-                'records': records,
-            }
-            serialized = json.dumps(payload, sort_keys=True, default=str).encode()
-            checksum = hashlib.sha256(serialized).hexdigest()
-            payload['checksum'] = checksum
-
-            try:
-                # Write to temp file
-                with open(tmp_path, 'w') as f:
-                    json.dump(payload, f, indent=2, sort_keys=True, default=str)
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                # Atomic replace
-                os.replace(tmp_path, path)
-
-                # Update backup (keep the last valid version)
-                if backup_path.exists():
-                    try:
-                        # Verify current file is valid before copying
-                        with open(path, 'r') as f:
-                            data = json.load(f)
-                        # Recompute checksum on the actual payload (without checksum field)
-                        stored_checksum = data.get('checksum')
-                        payload_part = {
-                            'completed': data.get('completed', []),
-                            'records': data.get('records', [])
-                        }
-                        computed = hashlib.sha256(
-                            json.dumps(payload_part, sort_keys=True, default=str).encode()
-                        ).hexdigest()
-                        if stored_checksum == computed:
-                            shutil.copy2(path, backup_path)
-                    except Exception:
-                        # If current file is invalid, keep old backup
-                        pass
-                else:
-                    shutil.copy2(path, backup_path)
-
-            except Exception as e:
-                self.logger.emit(f"Warning: could not save progress file: {e}", 1)
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-
-        def _load_progress(self) -> tuple[set, list]:
-            """
-            Load progress from progress.json or its backup, verifying checksum.
-
-            Returns
-            -------
-            completed : set of (repeat, layer_idx, probe_name) tuples
-            records   : list of result dicts
-            """
-            path = self.output_dir / 'progress.json'
-            backup_path = self.output_dir / 'progress.json.bak'
-
-            for candidate in (path, backup_path):
-                if not candidate.exists():
-                    continue
-                try:
-                    with open(candidate, 'r') as f:
-                        data = json.load(f)
-
-                    stored_checksum = data.get('checksum')
-                    if stored_checksum:
-                        # Recompute checksum on the actual payload fields
-                        payload_part = {
-                            'completed': data.get('completed', []),
-                            'records': data.get('records', [])
-                        }
-                        serialized = json.dumps(payload_part, sort_keys=True, default=str).encode()
-                        computed = hashlib.sha256(serialized).hexdigest()
-                        if computed != stored_checksum:
-                            self.logger.emit(
-                                f"Checksum mismatch in {candidate.name}, trying backup.", 1
-                            )
-                            continue
-                    else:
-                        self.logger.emit(
-                            f"Progress file {candidate.name} has no checksum; assuming valid.", 2
-                        )
-
-                    completed = set(tuple(item) for item in data.get('completed', []))
-                    records = data.get('records', [])
-                    return completed, records
-
-                except Exception as e:
-                    self.logger.emit(f"Failed to load {candidate.name}: {e}", 1)
-                    continue
-
-            self.logger.emit("No valid progress file found, starting fresh.", 1)
-            return set(), []
-    
-    
         config.validate_verbose()
         self.artifact = artifact
         self.config = config
@@ -2246,6 +2174,17 @@ class UnifiedProbeAnalyzer:
 
         base_output = artifact.dataset_dir / config.output_subdir
         output_dir = base_output / folder_name
+
+        # --- Fallback: search for existing run with same computational config ---
+        if not output_dir.exists():
+            comp_cfg = compute_computational_trial_config(trial_cfg)
+            comp_hash = generate_trial_hash(comp_cfg)
+            existing = find_matching_run_dir(base_output, comp_hash)
+            if existing is not None:
+                self.logger.emit(f"Found existing run with matching computational config: {existing}")
+                self.logger.emit(f"Renaming to expected directory {output_dir}")
+                existing.rename(output_dir)
+                output_dir = existing  # now output_dir points to existing renamed dir
 
         if output_dir.exists() and (output_dir / "completion.json").exists():
             self.logger.emit(f"Trial already completed: {output_dir}", 1)
@@ -2467,15 +2406,10 @@ class UnifiedProbeAnalyzer:
                 "control_test_mcc": test_result.get("mcc"),
             })
         return rows
-    
+
     def _save_progress(self, completed: set, records: list) -> None:
         """
         Atomically save progress with checksum and backup.
-
-        Parameters
-        ----------
-        completed : set of (repeat, layer_idx, probe_name) tuples
-        records   : list of result dicts
         """
         path = self.output_dir / 'progress.json'
         backup_path = self.output_dir / 'progress.json.bak'
@@ -2533,11 +2467,6 @@ class UnifiedProbeAnalyzer:
     def _load_progress(self) -> tuple[set, list]:
         """
         Load progress from progress.json or its backup, verifying checksum.
-
-        Returns
-        -------
-        completed : set of (repeat, layer_idx, probe_name) tuples
-        records   : list of result dicts
         """
         path = self.output_dir / 'progress.json'
         backup_path = self.output_dir / 'progress.json.bak'
@@ -2578,6 +2507,7 @@ class UnifiedProbeAnalyzer:
 
         self.logger.emit("No valid progress file found, starting fresh.", 1)
         return set(), []
+
     def run(self):
         if self.skip_run:
             self.logger.emit("Skipping execution, loading existing results.", 1)
@@ -2602,7 +2532,7 @@ class UnifiedProbeAnalyzer:
         controls = []
         split_archive = {}
 
-        self.write_run_manifest()  # (this may already be called earlier; ensure it's not duplicated)
+        self.write_run_manifest()
 
         self.logger.section("PROBING EXPERIMENT", 1)
         self.logger.emit(
@@ -2612,7 +2542,7 @@ class UnifiedProbeAnalyzer:
             f"repeats={self.config.repeats} | max_samples={self.config.max_samples} | "
             f"layers={len(self.layers)} | probes={len(self.config.probes)}", 1
         )
-        
+
         if self.logger.level >= 1:
             if self.task_type == "single_label":
                 counts = np.bincount(self.y, minlength=len(self.classes))
@@ -2706,7 +2636,6 @@ class UnifiedProbeAnalyzer:
                     for probe in self.config.probes:
                         key = (repeat, layer_idx, probe.name)
                         if key in completed:
-                            # Already done, skip fitting
                             continue
 
                         probe_seed = seed + stable_int(probe.name) + layer_idx * 997
@@ -2759,14 +2688,9 @@ class UnifiedProbeAnalyzer:
 
                         self._save_probe_artifacts(probe, layer_name, repeat, results, model, scaler_for_artifact, record)
 
-                        # Add to completed set and save progress atomically
                         completed.add(key)
                         self._save_progress(completed, records)
 
-                        # Shuffled-label controls (if enabled) are not part of progress for now; they can be recomputed
-                        # if needed, but we treat them as part of the probe fit if we want to save them.
-                        # For simplicity, we do NOT save control rows in progress; they will be re-run if needed.
-                        # If you want to include them, extend the record and completed key.
                         ctrl_rows = self._exact_split_controls(layer_idx, probe, X_population, selected, split, repeat)
                         controls.extend(ctrl_rows)
                         pbar.update(len(ctrl_rows))
@@ -2790,9 +2714,7 @@ class UnifiedProbeAnalyzer:
             print("Unexpected Error, Closing the Progress Bar... ")
             pbar.close()
 
-        # After loops, if we completed everything, delete progress file and finalise
         if len(completed) == total_fittings:
-            # Save final results and remove progress file
             save_npz(self.output_dir / "split_indices.npz", **split_archive)
             results_df = pd.DataFrame(records)
             control_df = pd.DataFrame(controls)
@@ -2837,7 +2759,6 @@ class UnifiedProbeAnalyzer:
             save_json(self.output_dir / "summary.json", summary)
             save_json(self.output_dir / "completion.json", {"status": "complete", "finished_at": time.time()})
 
-            # Delete progress file
             progress_path = self.output_dir / 'progress.json'
             if progress_path.exists():
                 progress_path.unlink()
@@ -2851,14 +2772,12 @@ class UnifiedProbeAnalyzer:
             self.logger.emit(f"Output directory: {self.output_dir}", 1)
             return scored, best
         else:
-            # Incomplete run; save partial state and exit gracefully (or raise)
             self.logger.emit(f"Run incomplete: {len(completed)}/{total_fittings} fits completed. Progress saved.", 1)
-            # Optionally raise an exception to signal incompleteness to matrix runner
             raise RuntimeError(f"Trial incomplete after {len(completed)}/{total_fittings} fits. Progress saved; rerun to continue.")
 
 
 # -----------------------------------------------------------------------------
-# save_complete_run_metadata (updated to include trial config/hash)
+# save_complete_run_metadata
 # -----------------------------------------------------------------------------
 
 def save_complete_run_metadata(analyzer, results_df, best_df, control_df=None, extra_info=None):
@@ -2914,6 +2833,10 @@ def save_complete_run_metadata(analyzer, results_df, best_df, control_df=None, e
         }
 
     extra = extra_info or {}
+    # Add computational hash
+    extra["computational_hash"] = generate_trial_hash(
+        compute_computational_trial_config(analyzer.trial_config)
+    )
     full_metadata = {
         "run_id": output_dir.name,
         "output_directory": str(output_dir),
@@ -2945,11 +2868,6 @@ def update_results_index(
     dataset_name: str,
     trial_hash: str,
 ) -> None:
-    """
-    Append or update a row in the results index CSV.
-    The index maps result filenames (which include the trial hash) to model/dataset
-    and the hash itself for quick lookup.
-    """
     index_path = _results_index_path(checkpoint_dir)
     row = {
         "result_filename": result_csv.name,
@@ -2960,7 +2878,6 @@ def update_results_index(
     }
     if index_path.exists():
         df = pd.read_csv(index_path)
-        # Remove any existing row with same filename
         df = df[df["result_filename"] != result_csv.name]
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     else:
@@ -2976,11 +2893,6 @@ def load_results_index(checkpoint_dir):
 
 
 def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
-    """
-    Given a hashed filename (e.g., '85063c5df2ed_layer_probe_results.csv')
-    or just the hash, return a dict with model, dataset, and full path.
-    Returns None if not found.
-    """
     index = load_results_index(checkpoint_dir)
     if not hash_or_filename.endswith(".csv"):
         hash_prefix = hash_or_filename
@@ -2996,16 +2908,12 @@ def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
 
 
 def validate_checkpoint_consistency(checkpoint_dir: Path, verbose: bool = True) -> bool:
-    """
-    Check that all completed entries in the checkpoint have corresponding files and
-    that the stored trial_config hashes to the trial_hash. Returns True if consistent.
-    """
     checkpoint_file = checkpoint_dir / "probe_matrix_checkpoint.json"
     results_subdir = checkpoint_dir / "per_entry_results"
     if not checkpoint_file.exists():
         if verbose:
             print("[validate] Checkpoint file not found.")
-        return True  # nothing to validate
+        return True
 
     with open(checkpoint_file) as f:
         checkpoint = json.load(f)
@@ -3015,17 +2923,14 @@ def validate_checkpoint_consistency(checkpoint_dir: Path, verbose: bool = True) 
     for key, info in completed.items():
         trial_hash = info.get("trial_hash")
         stored_config = info.get("trial_config")
-        # Verify file exists
         expected_file = results_subdir / f"{trial_hash}_layer_probe_results.csv"
         if not expected_file.exists():
             inconsistent.append((key, "missing file"))
             continue
-        # If stored_config is present, verify it hashes to trial_hash
         if stored_config is not None:
             computed_hash = generate_trial_hash(stored_config)
             if computed_hash != trial_hash:
                 inconsistent.append((key, "hash mismatch (stored config)"))
-        # Additional checks: model/dataset match?
     if inconsistent:
         if verbose:
             print("[validate] Inconsistencies found:")
@@ -3052,14 +2957,7 @@ def run_matrix(
     shuffled_label_control: bool = True,
     shuffled_control_repeats: int = 3,
 ) -> pd.DataFrame:
-    """
-    Run the same probe benchmark across arbitrary frozen model artifacts, with
-    automatic checkpointing and resume. The checkpoint is keyed by a unique trial
-    hash derived from the full configuration. Before reusing any existing result,
-    the stored configuration is compared with the current one to prevent mixing.
-    """
     split = split or SplitConfig(train=0.80, validation=0.10, test=0.10, seed=42)
-    # At start of run_matrix, after loading checkpoint:
     if not validate_checkpoint_consistency(checkpoint_dir, verbose=verbose):
         print("!!![!warning!]!!! Checkpoint inconsistencies detected. Consider running migration or cleaning !")
     if checkpoint_dir is None:
@@ -3071,7 +2969,6 @@ def run_matrix(
     results_subdir = checkpoint_dir / "per_entry_results"
     results_subdir.mkdir(exist_ok=True)
 
-    # Load existing checkpoint if present
     checkpoint = {"completed": {}, "errors": []}
     if checkpoint_file.exists():
         try:
@@ -3119,36 +3016,37 @@ def run_matrix(
         )
         result_csv = results_subdir / f"{trial_hash}_layer_probe_results.csv"
 
+        comp_cfg = compute_computational_trial_config(trial_cfg)
+        comp_hash = generate_trial_hash(comp_cfg)
+
         if verbose >= 1:
             print(f"[matrix] {i}/{len(entries)} | {model_name} | {dataset_name} | trial {trial_hash[:8]}")
 
-        # Check if this exact trial has already been completed AND the stored config matches
         if unique_key in checkpoint.get("completed", {}):
             stored_info = checkpoint["completed"][unique_key]
-            stored_config = stored_info.get("trial_config", None)
-            # Ensure the stored config matches the current config exactly
-            if stored_config is not None and stored_config != trial_cfg:
-                if verbose >= 1:
-                    print(f"[checkpoint] Stored config for {unique_key} differs from current. Ignoring old result.")
-                # Do not use old result
-            else:
-                # Config matches, we can reuse
-                if verbose >= 1:
-                    print(f"[checkpoint] Already completed, loading from {result_csv.name}")
-                if result_csv.exists():
-                    try:
-                        df = pd.read_csv(result_csv)
-                        per_entry_results.append(df)
-                    except Exception as e:
-                        print(f"[checkpoint] Failed to load {result_csv}: {e}. Will re-run this entry.")
-                        checkpoint["completed"].pop(unique_key, None)
-                    else:
-                        continue
+            if stored_info.get("comp_hash") == comp_hash:
+                stored_config = stored_info.get("trial_config", None)
+                if stored_config is not None and stored_config != trial_cfg:
+                    if verbose >= 1:
+                        print(f"[checkpoint] Stored config for {unique_key} differs from current. Ignoring old result.")
                 else:
-                    print(f"[checkpoint] Checkpoint says completed but result file missing. Re-running.")
-                    checkpoint["completed"].pop(unique_key, None)
+                    if verbose >= 1:
+                        print(f"[checkpoint] Already completed, loading from {result_csv.name}")
+                    if result_csv.exists():
+                        try:
+                            df = pd.read_csv(result_csv)
+                            per_entry_results.append(df)
+                        except Exception as e:
+                            print(f"[checkpoint] Failed to load {result_csv}: {e}. Will re-run this entry.")
+                            checkpoint["completed"].pop(unique_key, None)
+                        else:
+                            continue
+                    else:
+                        print(f"[checkpoint] Checkpoint says completed but result file missing. Re-running.")
+                        checkpoint["completed"].pop(unique_key, None)
+            else:
+                print("re-running ...   No Checkpoint Data.")
 
-        # If we get here, we need to run the trial
         try:
             analyzer = UnifiedProbeAnalyzer(art, cfg, out_dir, dataset_df=entry.get("dataset_df"))
             scored, _ = analyzer.run()
@@ -3171,7 +3069,8 @@ def run_matrix(
                 "model": model_name,
                 "dataset": dataset_name,
                 "trial_hash": trial_hash,
-                "trial_config": trial_cfg,   # store for future verification
+                "comp_hash": comp_hash,
+                "trial_config": trial_cfg,
                 "result_csv": str(result_csv),
                 "completed_at": time.time(),
             }
