@@ -1611,7 +1611,7 @@ def fit_logistic_single(X_train, y_train, X_val, y_val, X_test, y_test, classes,
     }
     return metrics, model
 
-class ConstantPredictor: # local helper class
+class ConstantPredictor: 
     """Trivial predictor used when a binary label has only one class in training."""
     def __init__(self, constant: int):
         self.constant = int(constant)
@@ -1627,7 +1627,7 @@ def _fit_one_binary(X_train, target_train, X_val, X_test, spec, seed):
     unique = np.unique(target_train)
     if len(unique) == 1:
         constant = int(unique[0])
-        return ConstantPredictor(constant)   # no longer local
+        return ConstantPredictor(constant)  
     model = _make_logistic(spec, seed)
     model.fit(X_train, target_train)
     return model

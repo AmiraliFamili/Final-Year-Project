@@ -480,6 +480,8 @@ class MasterConfig:
     # Module overrides (optional)
     extraction_module: str | None = None
     probe_module: str | None = None
+    
+    quiet: bool = False
 
     # List of probes to run
     probes: list[ProbeChoice] = field(
@@ -677,11 +679,14 @@ class Renderer:
     Otherwise falls back to simple print statements.
     """
 
-    def __init__(self):
-        self.console = Console() if RICH_AVAILABLE else None
+    def __init__(self, silent=False):
+        self.silent = silent
+        self.console = None if silent else (Console() if RICH_AVAILABLE else None)
+
 
     def title(self, title: str, subtitle: str = "") -> None:
         """Display a prominent title."""
+        if self.silent: return
         if self.console:
             body = Text(subtitle) if subtitle else ""
             self.console.print(Panel(body, title=title, expand=False))
@@ -694,6 +699,7 @@ class Renderer:
 
     def info(self, text: str) -> None:
         """Display an informational message."""
+        if self.silent: return
         if self.console:
             self.console.print(text)
         else:
@@ -701,19 +707,20 @@ class Renderer:
 
     def warning(self, text: str) -> None:
         """Display a warning message."""
+        if self.silent: return
         if self.console:
             self.console.print(f"[yellow]WARNING[/yellow] {text}")
         else:
             print(f"WARNING: {text}")
 
-    def success(self, text: str) -> None:
+    def success(self, text: str) -> None: # No silent mode
         """Display a success message."""
         if self.console:
             self.console.print(f"[green]✓[/green] {text}")
         else:
             print(f"✓ {text}")
 
-    def error(self, text: str) -> None:
+    def error(self, text: str) -> None: # No silent mode
         """Display an error message."""
         if self.console:
             self.console.print(f"[red]✗[/red] {text}")
@@ -722,6 +729,7 @@ class Renderer:
 
     def stage(self, current: str, stages: Sequence[str]) -> None:
         """Show a list of stages with the current one highlighted."""
+        if self.silent: return
         if self.console:
             table = Table(show_header=False, box=None, padding=(0, 1))
             for stage in stages:
@@ -735,6 +743,7 @@ class Renderer:
 
     def config(self, cfg: MasterConfig) -> None:
         """Pretty‑print the configuration."""
+        if self.silent: return
         rows = [
             ("Model", cfg.model or "—"),
             ("Dataset", cfg.dataset or "—"),
@@ -762,6 +771,7 @@ class Renderer:
 
     def result_table(self, df: pd.DataFrame, task_type: str) -> None:
         """Display a snapshot of the results DataFrame."""
+        if self.silent: return
         if df.empty:
             self.warning("No result rows available.")
             return
@@ -802,6 +812,8 @@ class Renderer:
                 for i in progress.track(range(100)):
                     ...
         """
+        if self.silent: return
+        
         if self.console:
             return Progress(
                 SpinnerColumn(),
@@ -1582,7 +1594,18 @@ class ResultAnalyser:
         plt.close(fig)
 
         print(f"Plots saved to {self.output_dir}")
-
+        
+    
+    def compare_runs(run_dirs: list[Path], output_dir: Path):
+        frames = []
+        for d in run_dirs:
+            for csv in d.glob("master_results.csv"):
+                df = pd.read_csv(csv)
+                df["run"] = d.name
+                frames.append(df)
+        if not frames:
+            raise ValueError("No master_results.csv found in provided run directories.")
+        combined = pd.concat(frames, ignore_index=True)
 
 # ============================================================================
 # 11. Main orchestrator
@@ -2650,6 +2673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
 
     help_requested = any(arg in ("-h", "--help") for arg in argv[1:])
+    
 
     if help_requested and subcommand:
         # Map aliases to canonical command names.
@@ -2695,6 +2719,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=args.model,
                 dataset=args.dataset,
                 root=args.root,
+                quiet=args.quiet,
                 experiment_id=args.experiment_id,
                 output_dir=args.output_dir,
                 probes=probes,
