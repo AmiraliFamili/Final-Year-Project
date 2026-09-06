@@ -1,7 +1,6 @@
 """
 dataset_loader.py
 =================
-
 Schema-free, research-safe dataset ingestion for hidden-state probing.
 
 The loader intentionally reduces every supported tabular dataset to two semantic
