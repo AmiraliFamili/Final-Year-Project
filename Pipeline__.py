@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 EMOTION PROBE LAB – UNIFIED PIPELINE
 ====================================
@@ -10,7 +13,7 @@ This file provides a single entry point for:
   • Task‑aware evaluation (single‑label vs multi‑label)
   • Beautiful terminal UI (using `rich` if available)
   • Interactive guided mode
-  • CLI with subcommands: run, audit, analyse, interactive
+  • CLI with subcommands: run, audit, analyse, interactive, models, compare
   • Rich visualisations (layer curves, heatmaps, control comparisons, …)
 
 All heavy computation is delegated to existing project modules:
@@ -62,6 +65,86 @@ except ImportError:
     plt = None
     sns = None
 
+# ============================================================================
+# USER GUIDE (expanded)
+# ============================================================================
+"""
+COMMAND USAGE
+=============
+
+This script provides several subcommands for the emotion probe pipeline.
+Each subcommand can be abbreviated (shortcuts shown in parentheses).
+
+1. run (r)
+   Execute a full experiment.
+   Usage:
+     python G_test.py run --model MODEL --dataset {goEmo,ISEAR} [options]
+   Options:
+     -m, --model MODEL         Hugging Face model name (full or alias)
+     -d, --dataset {goEmo,ISEAR}  Dataset to probe
+     -R, --root PATH           Root directory for artifacts (default: /Volumes/Amirali/hidden_states)
+     -e, --experiment-id ID    Experiment identifier (default: baseline_v5_001)
+     -o, --output-dir PATH     Output directory for local results/plots
+     -p, --probe {logistic,mlp1,mlp2,mlp3}  Probe type (can be repeated for comparison)
+     -r, --repeats N           Number of independent train/test splits (default: 3)
+     -n, --max-samples N       Maximum samples to use (default: 5000)
+     -f, --full                Use all samples (overrides --max-samples)
+     -s, --seed N              Random seed (default: 42)
+     -S, --no-shuffle-control  Disable shuffled-label control
+     -x, --extract-if-missing  Run extraction if artifact is missing
+     -P, --no-plot             Skip generating plots
+     -q, --quiet               Suppress all non-essential output (final summary still shown)
+
+2. models (m)
+   List available models and their artifact availability.
+   Usage: python G_test.py models
+
+3. interactive (i)
+   Launch guided interactive mode.
+   Usage: python G_test.py interactive
+
+4. audit (a)
+   Audit an existing run directory without retraining.
+   Usage: python G_test.py audit RUN_DIR
+
+5. analyse (an)
+   Generate plots from one or more result CSV files (or directories containing CSVs).
+   Usage: python G_test.py analyse -i CSV1 [-i CSV2 ...] [-o OUTPUT_DIR]
+   Options:
+     -i, --input FILE         Input CSV file (repeatable) or directory
+     -o, --output-dir DIR     Output directory for plots (default: ./analysis_plots)
+
+6. compare (c)
+   Compare multiple completed runs side‑by‑side.
+   Usage: python G_test.py compare RUN_DIR1 RUN_DIR2 ... [-o OUTPUT_DIR]
+
+EXAMPLES
+--------
+# Run a standard experiment with logistic probe
+python G_test.py run --model google-bert/bert-base-uncased --dataset goEmo
+
+# Run with two probes (logistic and MLP) for comparison
+python G_test.py run --model Qwen/Qwen2-0.5B --dataset ISEAR --probe logistic --probe mlp1 --extract-if-missing
+
+# List models and their artifact status
+python G_test.py models
+
+# Launch interactive menu
+python G_test.py interactive
+
+# Audit a previous run
+python G_test.py audit ./demo_runs/goEmo__bert-base-uncased/abc123def456
+
+# Generate plots from a master run directory
+python G_test.py analyse -i /path/to/master_run_dir -o ./my_plots
+
+# Compare two completed runs
+python G_test.py compare ./run1 ./run2 -o ./comparison_plots
+
+# Run silently (only final result table is printed)
+python G_test.py run --model Qwen/Qwen2-0.5B --dataset ISEAR --quiet
+"""
+# ============================================================================
 
 # ============================================================================
 # 1. Constants and configurations
@@ -137,7 +220,16 @@ MODEL_ALIASES = {
     "TINYLLAMA": "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
 }
 
-def build_reverse_alias(aliases):
+def build_reverse_alias(aliases: dict) -> dict:
+    """
+    Build a mapping from full model name to its primary short alias.
+
+    Args:
+        aliases: Dictionary of short alias -> full name.
+
+    Returns:
+        Dictionary of full name -> short alias.
+    """
     reverse = {}
     for short, full in aliases.items():
         if full not in reverse:
@@ -151,8 +243,15 @@ FULL_TO_SHORT = build_reverse_alias(MODEL_ALIASES)
 def resolve_model_name(raw: str) -> str:
     """
     Resolve a user-provided model name to a full registry name.
+
     Accepts full name, short alias (case-insensitive), or abbreviation.
     Raises ValueError if not resolvable.
+
+    Args:
+        raw: User input string.
+
+    Returns:
+        Canonical model name (full Hugging Face ID).
     """
     raw = raw.strip()
     if not raw:
@@ -344,6 +443,53 @@ def compact_path(path: Path, max_chars: int = 74) -> str:
 # ------------------------------------------------------------------------------
 # NEW: Functions for listing available models and artifacts
 # ------------------------------------------------------------------------------
+def get_run_label(run_dir: Path) -> str:
+    """
+    Generate a compact human‑readable label for a run directory.
+    Format: <model>_<dataset>_<short_hash>
+    """
+    run_dir = run_dir.resolve()
+    parts = run_dir.parts
+
+    # Try to find dataset and model from path structure
+    # master_runs/<dataset>__<org>/<model>/<hash>
+    if "master_runs" in parts:
+        idx = parts.index("master_runs")
+        # parts after idx: dataset__org, model_name, hash
+        if len(parts) > idx + 2:
+            dataset_org = parts[idx + 1]      # e.g., "ISEAR__Qwen"
+            model_name = parts[idx + 2]       # e.g., "Qwen2-0.5B"
+            hash_part = parts[idx + 3] if len(parts) > idx + 3 else ""
+            if "__" in dataset_org:
+                dataset, org = dataset_org.split("__", 1)
+                full_model = f"{org}/{model_name}"
+            else:
+                dataset = dataset_org
+                full_model = model_name
+            short_hash = hash_part[:6] if hash_part else ""
+            # Replace slashes to keep label filesystem-safe
+            label = f"{full_model.replace('/', '_')}_{dataset}_{short_hash}"
+            return label
+
+    # Fallback for probe output directories
+    # .../models/<org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>
+    if "models" in parts:
+        idx = parts.index("models")
+        if len(parts) > idx + 3:
+            org = parts[idx + 1]
+            model_name = parts[idx + 2]
+            if parts[idx + 3] == "datasets" and len(parts) > idx + 4:
+                dataset = parts[idx + 4]
+                full_model = f"{org}/{model_name}"
+                # Use last directory name as hash identifier
+                hash_part = parts[-1]
+                short_hash = hash_part[-6:] if hash_part else ""
+                label = f"{full_model.replace('/', '_')}_{dataset}_{short_hash}"
+                return label
+
+    # If all else fails, use the directory name truncated
+    return run_dir.name[:20]
+
 
 def get_available_models(extraction_mod=None):
     """
@@ -370,60 +516,147 @@ def has_artifact(root: Path, experiment_id: str, model: str, dataset: str) -> bo
     return (ds_dir / "metadata" / "extraction.json").exists()
 
 
-def list_available_models(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EXPERIMENT_ID) -> None:
+def list_analysable_runs(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EXPERIMENT_ID) -> None:
     """
-    Display a table of all available models and their artifact availability.
-
-    The table shows, for each model in the extraction module's registry:
-      - Model ID (full Hugging Face name)
-      - Family
-      - Number of parameters (B)
-      - Whether an artifact exists for goEmo and for ISEAR
+    List all directories that contain analysable probe result CSVs.
+    Scans:
+      - master_runs/<dataset>__<org>/<model>/<hash>/           -> master_results.csv
+      - experiments/<exp_id>/models/<org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>/ -> layer_probe_results.csv
+    Displays model, dataset, run type, directory (truncated to 100 chars), and config hash if available.
     """
     renderer = Renderer()
-    extraction_mod = ModuleFactory.extraction(MasterConfig())
-    models = get_available_models(extraction_mod)
+    entries = []
 
-    if not models:
-        renderer.warning("No models found in the extraction module's registry.")
+    # Scan master runs
+    master_runs = root / "master_runs"
+    if master_runs.exists():
+        for master_csv in master_runs.glob("**/master_results.csv"):
+            run_dir = master_csv.parent
+            # Relative path from master_runs: e.g., "goEmo__HuggingFaceTB/SmolLM2-360M/9cf..."
+            parts = run_dir.relative_to(master_runs).parts
+            if len(parts) >= 3:
+                dataset_org = parts[0]           # "goEmo__HuggingFaceTB"
+                model_name = parts[1]            # "SmolLM2-360M"
+                config_hash = parts[2]
+                # dataset_org can itself contain "__" if model org has slash?
+                # Actually dataset_org is dataset__org (org may have no slash)
+                if "__" in dataset_org:
+                    dataset, org = dataset_org.split("__", 1)
+                    full_model = f"{org}/{model_name}"
+                else:
+                    dataset = dataset_org
+                    full_model = model_name
+                entries.append({
+                    "model": full_model,
+                    "dataset": dataset,
+                    "run_type": "master",
+                    "path": str(run_dir),
+                    "config_hash": config_hash,
+                })
+
+    # Scan probe output directories
+    exp_models = root / "experiments" / experiment_id / "models"
+    if exp_models.exists():
+        for probe_csv in exp_models.glob("**/layer_probe_results.csv"):
+            run_dir = probe_csv.parent
+            # Relative path from exp_models: <org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>
+            parts = run_dir.relative_to(exp_models).parts
+            if len(parts) >= 5 and parts[2] == "datasets":
+                org = parts[0]
+                model_name = parts[1]
+                dataset = parts[3]
+                full_model = f"{org}/{model_name}"
+                # Try to extract config hash from run_dir name (optional)
+                config_hash = ""
+                # Run_dir name often contains "__hash<hash>"
+                m = re.search(r"__hash([a-f0-9]+)", run_dir.name)
+                if m:
+                    config_hash = m.group(1)
+                entries.append({
+                    "model": full_model,
+                    "dataset": dataset,
+                    "run_type": "probe",
+                    "path": str(run_dir),
+                    "config_hash": config_hash,
+                })
+
+    if not entries:
+        renderer.warning("No analysable runs found.")
         return
-    # Build reverse alias for display
-    full_to_short = build_reverse_alias(MODEL_ALIASES)
-    
+
+    # Sort by model, dataset, run_type
+    entries.sort(key=lambda x: (x["model"], x["dataset"], x["run_type"]))
+
     if RICH_AVAILABLE:
-        table = Table(title="Available Models", show_lines=True, header_style="bold magenta", width=150, min_width=120)
-        table.add_column("#", style="dim", justify="right")
-        table.add_column("Model ID", style="cyan", no_wrap=True)
-        table.add_column("Short Name", style="green", min_width=12)
-        table.add_column("Family", style="magenta")
-        table.add_column("Params (B)", justify="right")
-        table.add_column("goEmo artifact", justify="center")
-        table.add_column("ISEAR artifact", justify="center")
-
-        for i, (name, family, params) in enumerate(models, 1):
-            has_go = has_artifact(root, experiment_id, name, "goEmo")
-            has_isear = has_artifact(root, experiment_id, name, "ISEAR")
-            go_mark = "[green]✓[/green]" if has_go else "[red]✗[/red]"
-            isear_mark = "[green]✓[/green]" if has_isear else "[red]✗[/red]"
-            short = full_to_short.get(name, "—")
-            # add everything to the table
-            table.add_row(str(i), name, short, family, f"{params:.3f}", go_mark, isear_mark)
-
+        table = Table(title="Analysable Runs", show_lines=True, header_style="bold magenta", width=150)
+        table.add_column("#", style="dim", justify="right", width=4)
+        table.add_column("Model", style="cyan", min_width=20, no_wrap=True)
+        table.add_column("Dataset", style="green", min_width=10)
+        table.add_column("Type", style="yellow", width=8)
+        table.add_column("Run Directory", style="white", min_width=40, max_width=100, overflow="fold")
+        table.add_column("Config Hash", style="yellow", min_width=12)
+        for i, entry in enumerate(entries, 1):
+            table.add_row(
+                str(i),
+                entry["model"],
+                entry["dataset"],
+                entry["run_type"],
+                entry["path"],
+                entry["config_hash"],
+            )
         renderer.console.print(table)
-        renderer.info(
-            "✓ = hidden‑state artifact exists (ready for probing)\n"
-            "✗ = artifact missing (extraction needed)"
-        )
     else:
-        # Plain‑text fallback
-        print("\nAvailable models:")
-        for i, (name, family, params) in enumerate(models, 1):
-            has_go = has_artifact(root, experiment_id, name, "goEmo")
-            has_isear = has_artifact(root, experiment_id, name, "ISEAR")
-            status = f"goEmo:{'✓' if has_go else '✗'}, ISEAR:{'✓' if has_isear else '✗'}"
-            print(f"{i:3d}. {name:30s} {family:10s} {params:.3f}B  [{status}]")
-    print()
+        print("\nAnalysable Runs:")
+        for i, entry in enumerate(entries, 1):
+            print(f"{i:3d}. {entry['model']:30s} {entry['dataset']:10s} {entry['run_type']:6s} {entry['path']}")
 
+
+def list_auditable_runs(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EXPERIMENT_ID) -> None:
+    """
+    List all probe run directories that contain a probe_run_manifest.json.
+    Displays model (org/name), dataset, and run directory.
+    """
+    renderer = Renderer()
+    exp_models = root / "experiments" / experiment_id / "models"
+    if not exp_models.exists():
+        renderer.warning(f"No experiment directory found at {exp_models}.")
+        return
+
+    entries = []
+    for manifest_path in exp_models.glob("**/probe_run_manifest.json"):
+        run_dir = manifest_path.parent
+        parts = run_dir.relative_to(exp_models).parts
+        # Expected: <org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>
+        if len(parts) >= 5 and parts[2] == "datasets":
+            org = parts[0]
+            model_name = parts[1]
+            dataset = parts[3]
+            full_model = f"{org}/{model_name}"
+            entries.append({
+                "model": full_model,
+                "dataset": dataset,
+                "path": str(run_dir),
+            })
+
+    if not entries:
+        renderer.warning("No auditable runs found.")
+        return
+
+    entries.sort(key=lambda x: (x["model"], x["dataset"]))
+
+    if RICH_AVAILABLE:
+        table = Table(title="Auditable Runs", show_lines=True, header_style="bold magenta", width=150)
+        table.add_column("#", style="dim", justify="right", width=4)
+        table.add_column("Model", style="cyan", min_width=20, no_wrap=True)
+        table.add_column("Dataset", style="green", min_width=10)
+        table.add_column("Run Directory", style="white", min_width=40, max_width=100, overflow="fold")
+        for i, entry in enumerate(entries, 1):
+            table.add_row(str(i), entry["model"], entry["dataset"], entry["path"])
+        renderer.console.print(table)
+    else:
+        print("\nAuditable Runs:")
+        for i, entry in enumerate(entries, 1):
+            print(f"{i:3d}. {entry['model']:30s} {entry['dataset']:10s} {entry['path']}")
 
 # ============================================================================
 # 3. Configuration dataclasses
@@ -480,7 +713,7 @@ class MasterConfig:
     # Module overrides (optional)
     extraction_module: str | None = None
     probe_module: str | None = None
-    
+
     quiet: bool = False
 
     # List of probes to run
@@ -679,10 +912,9 @@ class Renderer:
     Otherwise falls back to simple print statements.
     """
 
-    def __init__(self, silent=False):
+    def __init__(self, silent: bool = False):
         self.silent = silent
         self.console = None if silent else (Console() if RICH_AVAILABLE else None)
-
 
     def title(self, title: str, subtitle: str = "") -> None:
         """Display a prominent title."""
@@ -713,14 +945,14 @@ class Renderer:
         else:
             print(f"WARNING: {text}")
 
-    def success(self, text: str) -> None: # No silent mode
+    def success(self, text: str) -> None:
         """Display a success message."""
         if self.console:
             self.console.print(f"[green]✓[/green] {text}")
         else:
             print(f"✓ {text}")
 
-    def error(self, text: str) -> None: # No silent mode
+    def error(self, text: str) -> None:
         """Display an error message."""
         if self.console:
             self.console.print(f"[red]✗[/red] {text}")
@@ -812,8 +1044,7 @@ class Renderer:
                 for i in progress.track(range(100)):
                     ...
         """
-        if self.silent: return
-        
+        if self.silent: return None
         if self.console:
             return Progress(
                 SpinnerColumn(),
@@ -1347,27 +1578,28 @@ class ResultAnalyser:
         if PLOTTING_AVAILABLE and sns is not None:
             sns.set_theme(style="whitegrid", palette="deep")
             plt.rcParams.update({
-            "figure.facecolor": "white",
-            "axes.facecolor": "white",
-            "axes.edgecolor": "black",
-            "axes.labelcolor": "black",
-            "text.color": "black",
-            "xtick.color": "black",
-            "ytick.color": "black",
-            "grid.color": "#dddddd",
-            "legend.facecolor": "white",
-            "legend.edgecolor": "black",
-            "font.size": 11,
-            "axes.titlesize": 13,
-            "axes.labelsize": 12,
-            "figure.dpi": 100,
-            "savefig.dpi": 300,
-            "savefig.bbox": "tight",
-        })
-
+                "figure.facecolor": "white",
+                "axes.facecolor": "white",
+                "axes.edgecolor": "black",
+                "axes.labelcolor": "black",
+                "text.color": "black",
+                "xtick.color": "black",
+                "ytick.color": "black",
+                "grid.color": "#dddddd",
+                "legend.facecolor": "white",
+                "legend.edgecolor": "black",
+                "font.size": 11,
+                "axes.titlesize": 13,
+                "axes.labelsize": 12,
+                "figure.dpi": 100,
+                "savefig.dpi": 300,
+                "savefig.bbox": "tight",
+            })
 
     def load_csvs(self, csv_paths: Iterable[Path]) -> pd.DataFrame:
-        """Concatenate multiple CSV files into a single DataFrame.
+        """
+        Concatenate multiple CSV files into a single DataFrame.
+
         If a directory is provided, all CSV files inside it are loaded.
         Handles non‑UTF‑8 files by falling back to latin‑1 or skipping with a warning.
         """
@@ -1393,6 +1625,7 @@ class ResultAnalyser:
         return pd.concat(frames, ignore_index=True)
 
     def _try_read_csv(self, path: Path, frames: list) -> None:
+        """Attempt to read a CSV file, trying different encodings."""
         try:
             df = pd.read_csv(path)
             frames.append(df)
@@ -1479,13 +1712,11 @@ class ResultAnalyser:
     def _plot_layer_curves(self, df: pd.DataFrame, metric: str):
         """Line plot with mean and std across repeats for each probe."""
         fig, ax = plt.subplots(figsize=(10, 6))
-        # Group by probe and layer, compute mean/std
         stats = df.groupby(["probe", "layer_index"])[metric].agg(["mean", "std"]).reset_index()
 
         for probe in stats["probe"].unique():
             sub = stats[stats["probe"] == probe].sort_values("layer_index")
             ax.plot(sub["layer_index"], sub["mean"], marker="o", label=probe)
-            # Shade ±1 std (if >1 repeat)
             if df["probe"].nunique() == 1 or len(sub) > 1:
                 ax.fill_between(
                     sub["layer_index"],
@@ -1505,10 +1736,8 @@ class ResultAnalyser:
 
     def _plot_distributions(self, df: pd.DataFrame, metrics: list[str]):
         """Box plot showing distribution of metrics across repeats for each layer."""
-        # Choose a representative metric (first one)
         metric = metrics[0]
         fig, ax = plt.subplots(figsize=(12, 6))
-        # Melt to long format for seaborn
         melted = df.melt(id_vars=["probe", "layer_index"], value_vars=[metric],
                          var_name="metric", value_name="score")
         sns.boxplot(data=melted, x="layer_index", y="score", hue="probe", ax=ax)
@@ -1541,7 +1770,6 @@ class ResultAnalyser:
         if not metrics:
             return
         metric = metrics[0]
-        # Find best layer per probe (mean across repeats first)
         best_rows = df.groupby(["probe", "layer_index"])[metric].mean().reset_index()
         best_rows = best_rows.loc[best_rows.groupby("probe")[metric].idxmax()]
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -1557,7 +1785,6 @@ class ResultAnalyser:
     def _plot_control_comparison(self, df: pd.DataFrame):
         """Line plot comparing true vs shuffled label performance."""
         fig, ax = plt.subplots(figsize=(10, 6))
-        # Average across repeats
         true = df.groupby(["probe", "layer_index"])["test_macro_f1"].mean().reset_index()
         ctrl = df.groupby(["probe", "layer_index"])["control_macro_f1"].mean().reset_index()
 
@@ -1580,7 +1807,6 @@ class ResultAnalyser:
         if not metrics:
             return
         metric = metrics[0]
-        # Compute best (max) metric for each model/dataset/probe
         best = df.groupby(["model", "dataset", "probe"])[metric].max().reset_index()
         pivot = best.pivot_table(index=["model", "dataset"], columns="probe", values=metric, aggfunc="first")
         if pivot.empty:
@@ -1593,22 +1819,135 @@ class ResultAnalyser:
         fig.savefig(self.output_dir / "best_heatmap.png")
         plt.close(fig)
 
-        print(f"Plots saved to {self.output_dir}")
-        
-    
-    def compare_runs(run_dirs: list[Path], output_dir: Path):
-        frames = []
-        for d in run_dirs:
-            for csv in d.glob("master_results.csv"):
-                df = pd.read_csv(csv)
-                df["run"] = d.name
-                frames.append(df)
-        if not frames:
-            raise ValueError("No master_results.csv found in provided run directories.")
-        combined = pd.concat(frames, ignore_index=True)
 
 # ============================================================================
-# 11. Main orchestrator
+# 11. Run comparison
+# ============================================================================
+
+def compare_runs(run_dirs: Sequence[Path], output_dir: Path):
+    """
+    Compare multiple completed runs by loading their master_results.csv files.
+
+    Args:
+        run_dirs: List of directories containing master_results.csv (or probe result CSVs).
+        output_dir: Directory where comparison plots/tables will be saved.
+    """
+    frames = []
+    labels = []
+    for d in run_dirs:
+        d = Path(d)
+        if not d.exists():
+            print(f"Warning: {d} does not exist, skipping.")
+            continue
+        # Look for master_results.csv or any layer_probe_results.csv
+        csv_files = list(d.glob("**/master_results.csv"))
+        if not csv_files:
+            csv_files = list(d.glob("**/layer_probe_results.csv"))
+        if not csv_files:
+            print(f"Warning: No result CSV found in {d}, skipping.")
+            continue
+
+        label = get_run_label(d)
+        labels.append(label)
+        for csv_file in csv_files:
+            df = pd.read_csv(csv_file)
+            df["run"] = label          # Use human-readable label
+            frames.append(df)
+
+    if not frames:
+        raise ValueError("No result CSV files found in provided run directories.")
+
+    combined = pd.concat(frames, ignore_index=True)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save combined CSV
+    combined.to_csv(output_dir / "combined_results.csv", index=False)
+
+    # Prepare summary
+    summary = combined.groupby(["run", "probe"]).agg(
+        best_macro_f1=("test_macro_f1", "max"),
+        mean_macro_f1=("test_macro_f1", "mean"),
+        best_layer=("layer_index", "first"),   # simplified; may be improved
+    ).reset_index()
+
+    # Display summary as rich table if available
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Comparison Summary", show_lines=True, header_style="bold magenta")
+        table.add_column("Run", style="cyan", no_wrap=True)
+        table.add_column("Probe", style="green")
+        table.add_column("Best Macro-F1", justify="right")
+        table.add_column("Mean Macro-F1", justify="right")
+        table.add_column("Best Layer", justify="right")
+        for _, row in summary.iterrows():
+            table.add_row(
+                str(row["run"]),
+                str(row["probe"]),
+                f"{row['best_macro_f1']:.4f}",
+                f"{row['mean_macro_f1']:.4f}",
+                str(int(row["best_layer"])),
+            )
+        renderer.console.print(table)
+    else:
+        print("\nComparison Summary:")
+        summary = combined.groupby(["run", "probe"]).agg(
+        best_macro_f1=("test_macro_f1", "max"),
+        mean_macro_f1=("test_macro_f1", "mean"),
+        best_layer=("layer_index", lambda x: x[combined.loc[x.index, "test_macro_f1"].idxmax()] if len(x) else None)
+    ).reset_index()
+        print("\nComparison Summary:")
+        print(summary.to_string(index=False))
+
+    # Generate comparison plots (if plotting available)
+    if PLOTTING_AVAILABLE:
+        # Best macro_f1 per run and probe (bar chart)
+        if "test_macro_f1" in combined.columns:
+            best_per_run_probe = combined.groupby(["run", "probe"])["test_macro_f1"].max().reset_index()
+            plt.figure(figsize=(10, 6))
+            sns.barplot(data=best_per_run_probe, x="run", y="test_macro_f1", hue="probe")
+            plt.title("Best Test Macro-F1 per Run and Probe")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+            plt.savefig(output_dir / "comparison_best_macro_f1.png", dpi=240)
+            plt.close()
+
+        # Layer curves per run for each probe (mean)
+        if "layer_index" in combined.columns and "probe" in combined.columns:
+            for probe in combined["probe"].unique():
+                plt.figure(figsize=(12, 6))
+                for run in combined["run"].unique():
+                    sub = combined[(combined["probe"] == probe) & (combined["run"] == run)]
+                    avg = sub.groupby("layer_index")["test_macro_f1"].mean().sort_index()
+                    plt.plot(avg.index, avg.values, marker="o", label=run)
+                plt.xlabel("Layer index")
+                plt.ylabel("Test Macro-F1")
+                plt.title(f"Layer-wise Macro-F1 for {probe} across runs")
+                plt.legend()
+                plt.grid(alpha=0.3)
+                plt.tight_layout()
+                safe_probe = probe.replace("/", "_").replace(" ", "_")
+                plt.savefig(output_dir / f"comparison_layer_curves_{safe_probe}.png", dpi=240)
+                plt.close()
+
+
+
+
+
+
+
+
+def discover_all_master_runs(root: Path = DEFAULT_ROOT) -> list[Path]:
+    """
+    Return a list of all directories containing master_results.csv under master_runs.
+    """
+    master_runs = root / "master_runs"
+    if not master_runs.exists():
+        return []
+    return sorted(set(p.parent for p in master_runs.glob("**/master_results.csv")))
+
+# ============================================================================
+# 12. Main orchestrator
 # ============================================================================
 
 class EmotionProbePipeline:
@@ -1618,14 +1957,6 @@ class EmotionProbePipeline:
     The constructor resolves the scientific configuration but does not start
     expensive computation. Users can inspect/modify the pipeline before
     calling .run().
-
-    Example:
-        pipe = EmotionProbePipeline(
-            model="google-bert/bert-base-uncased",
-            dataset="goEmo",
-            max_samples=5000,
-        )
-        result = pipe.run()
     """
 
     STAGES = [
@@ -1654,28 +1985,8 @@ class EmotionProbePipeline:
         extraction_module: str | None = None,
         probe_module: str | None = None,
         strict_provenance: bool = True,
+        quiet: bool = False,
     ):
-        """
-        Initialise the pipeline.
-
-        Args:
-            model: Hugging Face model name.
-            dataset: Dataset name ('goEmo' or 'ISEAR').
-            root: Root directory for artifacts.
-            experiment_id: Experiment identifier.
-            output_dir: Local directory for results and plots.
-            probes: List of probe names or ProbeChoice objects.
-            repeats: Number of independent train/test splits.
-            max_samples: Maximum samples to use (None for all).
-            seed: Random seed.
-            shuffled_label_control: Whether to run shuffled‑label controls.
-            shuffled_control_repeats: Number of control repeats.
-            extraction_module: Optional override for extraction module.
-            probe_module: Optional override for probe module.
-            strict_provenance: If True, fail on provenance mismatch.
-        """
-        self.renderer = Renderer()
-
         # Normalise probe choices
         normalized_choices = []
         for p in probes:
@@ -1690,9 +2001,8 @@ class EmotionProbePipeline:
             resolved_model = resolve_model_name(raw_model)
         except ValueError as e:
             raise ValueError(str(e)) from e
-        if resolved_model != raw_model:
-            self.renderer.warning(f"Model name '{raw_model}' resolved to '{resolved_model}'.")
 
+        # Create configuration with resolved model
         self.config = MasterConfig(
             root=Path(root).resolve(),
             experiment_id=experiment_id,
@@ -1708,14 +2018,21 @@ class EmotionProbePipeline:
             extraction_module=extraction_module,
             probe_module=probe_module,
             strict_provenance=bool(strict_provenance),
+            quiet=bool(quiet),
         )
+
+        # Renderer is created after config so quiet flag can be used
+        self.renderer = Renderer(silent=self.config.quiet)
+
+        if resolved_model != raw_model:
+            self.renderer.warning(f"Model name '{raw_model}' resolved to '{resolved_model}'.")
 
         self._validate_config()
 
         # Auto-adjust experiment ID if necessary
         self._auto_adjust_experiment_id()
 
-        # Deterministic run directory (now with possibly updated experiment_id)
+        # Deterministic run directory
         self.run_root = (
             self.config.root / "master_runs"
             / f"{self.config.dataset}__{safe_model_path(self.config.model)}"
@@ -1746,17 +2063,14 @@ class EmotionProbePipeline:
         experiment_dir = self.config.root / "experiments" / self.config.experiment_id
         manifest_path = experiment_dir / "run_manifest.json"
 
-        # If no manifest exists, the experiment is new – no adjustment needed
         if not manifest_path.exists():
             return
 
-        # Try to load the manifest and extract the list of models
         existing_models = []
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
 
-            # Check multiple possible keys for model list
             for key in ("models", "model_names", "model_matrix", "model_list"):
                 if key in manifest:
                     raw = manifest[key]
@@ -1764,22 +2078,17 @@ class EmotionProbePipeline:
                         existing_models = [str(m) for m in raw]
                         break
         except Exception:
-            # If manifest cannot be parsed, assume conflict to be safe
             existing_models = ["__unknown__"]
 
-        # If we couldn't find any model list, treat as conflict
         if not existing_models:
             existing_models = ["__unknown__"]
 
-        # Normalise for comparison
         current_model = self.config.model.lower()
         existing_normalized = [m.lower() for m in existing_models]
 
-        # If current model is already in the list, no adjustment needed
         if current_model in existing_normalized:
             return
 
-        # Conflict: create a new experiment ID
         model_slug = safe_model_path(self.config.model).as_posix().replace("/", "_")
         new_exp_id = f"{self.config.experiment_id}__{model_slug}"
         old_exp_id = self.config.experiment_id
@@ -1788,7 +2097,6 @@ class EmotionProbePipeline:
             f"Experiment ID '{old_exp_id}' already contains different models. "
             f"Auto‑adjusting to '{new_exp_id}' for model '{self.config.model}'."
         )
-        
 
     # ----------------------------------------------------------------------
     # Public helpers
@@ -1927,15 +2235,12 @@ class EmotionProbePipeline:
             self._run_extraction(dataset_obj)
         except RuntimeError as e:
             if "model matrix differs" in str(e):
-                # Generate a fallback unique experiment ID
                 old_id = self.config.experiment_id
                 model_slug = safe_model_path(self.config.model).as_posix().replace("/", "_")
                 self.config.experiment_id = f"{old_id}__{model_slug}_retry"
                 self.renderer.warning(
                     f"Model matrix conflict detected. Retrying with new experiment ID: {self.config.experiment_id}"
                 )
-                # Also update artifact_dir because it depends on experiment_id
-                # (self.artifact_dir is a property, so it will reflect the new config)
                 self._run_extraction(dataset_obj)
             else:
                 raise
@@ -1963,7 +2268,6 @@ class EmotionProbePipeline:
 
         self.ensure_extraction(run_if_missing=extract_if_missing)
 
-        # Basic artifact integrity
         if not np.all(self.artifact.completed):
             raise RuntimeError(
                 "Extraction completion map is incomplete. Refusing to probe."
@@ -1975,7 +2279,6 @@ class EmotionProbePipeline:
         ds_spec = DatasetFactory.spec(self.config.dataset)
         dataset_df = DatasetFactory.load(self.config.dataset)
 
-        # Use the probe module's contract and validation functions
         DatasetContract = getattr(self.probe_mod, "DatasetContract")
         contract = DatasetContract(
             target_type=ds_spec["target_type"],
@@ -2020,7 +2323,6 @@ class EmotionProbePipeline:
                 "Label alignment is not cryptographically verified by the artifact."
             )
 
-        # Audit existing probe runs in the same artifact directory
         auditor = ForensicAuditor(
             self.config.root,
             self.config.experiment_id,
@@ -2135,7 +2437,6 @@ class EmotionProbePipeline:
             f"{len(analyzer.layers)} layer(s), {self.config.repeats} repeat(s)."
         )
 
-        # Use a progress bar if available
         progress = self.renderer.progress("Probing", total=1)
         try:
             if progress:
@@ -2307,7 +2608,7 @@ class EmotionProbePipeline:
 
 
 # ============================================================================
-# 12. Interactive interface
+# 13. Interactive interface
 # ============================================================================
 
 class InteractiveApp:
@@ -2370,24 +2671,20 @@ class InteractiveApp:
             "A controlled interface for frozen hidden‑state emotion probing",
         )
 
-        # ------------------------------------------------------------------
-        # NEW: Display available models with artifact indicators
-        # ------------------------------------------------------------------
         list_available_models()
-        print()  # spacing
+        print()
 
-        # Ask user for model
         available_models = self.get_available_models()
         if not available_models:
             model = self.ask("Model", "google-bert/bert-base-uncased")
         else:
-            while True: 
+            while True:
                 raw = self.ask("Model (enter number or full name)", "google-bert/bert-base-uncased")
                 if raw.lower() == 'q':
                     self.renderer.info("Exiting.")
                     return {"status": "cancelled"}
                 try:
-                    model = resolve_model_name(raw) # keeps asking user for correct model name.
+                    model = resolve_model_name(raw)
                     break
                 except ValueError as e:
                     self.renderer.error(str(e))
@@ -2395,7 +2692,6 @@ class InteractiveApp:
 
         dataset = self.choose("Dataset", ["goEmo", "ISEAR"])
 
-        # ... rest of interactive flow unchanged ...
         print("\nProbe selection")
         print("  ENTER = logistic baseline")
         print("  1     = logistic")
@@ -2443,9 +2739,126 @@ class InteractiveApp:
         return pipeline.run(extract_if_missing=extract_if_missing, generate_plots=True)
 
 
+
+
+        
+def print_rich_help(parser):
+    """Display a rich help panel for the CLI."""
+    renderer = Renderer()
+    if not RICH_AVAILABLE:
+        parser.print_help()
+        return
+
+    renderer.title("EMOTION PROBE LAB", "Unified command-line interface")
+    sub_table = Table(title="Available Commands", show_lines=True, header_style="bold cyan")
+    sub_table.add_column("Command", style="bold magenta", min_width=15)
+    sub_table.add_column("Description", style="white")
+    sub_table.add_column("Shortcut", style="green")
+    subcommands = [
+        ("run", "Execute a full probing experiment", "r"),
+        ("models", "List available models and artifact status", "m"),
+        ("interactive", "Launch guided interactive mode", "i"),
+        ("audit", "Audit an existing probe run", "a"),
+        ("analyse", "Generate plots from result CSVs", "an"),
+        ("compare", "Compare multiple completed runs", "c"),
+    ]
+    for cmd, desc, short in subcommands:
+        sub_table.add_row(cmd, desc, short)
+    renderer.console.print(sub_table)
+
+    opt_table = Table(title="Global Options", show_lines=True, header_style="bold yellow")
+    opt_table.add_column("Option", style="bold")
+    opt_table.add_column("Description", style="white")
+    opt_table.add_row("-h, --help", "Show this help message and exit")
+    renderer.console.print(opt_table)
+    print("\nRun 'python Pipeline__.py <command> --help' for command-specific options.")
+
+def print_rich_run_help():
+    renderer = Renderer()
+    if not RICH_AVAILABLE:
+        print("Run help:\n")
+        return
+    table = Table(title="Run Command Options", show_lines=True, header_style="bold green")
+    table.add_column("Option", style="bold cyan")
+    table.add_column("Description", style="white")
+    options = [
+        ("-m, --model", "Hugging Face model name (full or alias)"),
+        ("-d, --dataset", "Dataset: goEmo or ISEAR"),
+        ("-R, --root", "Root directory for artifacts"),
+        ("-e, --experiment-id", "Experiment identifier"),
+        ("-o, --output-dir", "Output directory"),
+        ("-p, --probe", "Probe type (repeatable)"),
+        ("-r, --repeats", "Number of repeats"),
+        ("-n, --max-samples", "Max samples (use --full for all)"),
+        ("-f, --full", "Use all samples"),
+        ("-s, --seed", "Random seed"),
+        ("-S, --no-shuffle-control", "Disable shuffled-label control"),
+        ("-x, --extract-if-missing", "Run extraction if artifact missing"),
+        ("-P, --no-plot", "Skip generating plots"),
+        ("-q, --quiet", "Suppress non-essential output"),
+    ]
+    for opt, desc in options:
+        table.add_row(opt, desc)
+    renderer.console.print(table)
+
+def print_rich_models_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Models Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_row("python Pipeline__.py models")
+        renderer.console.print(table)
+    else:
+        print("Usage: python Pipeline__.py models")
+
+def print_rich_interactive_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Interactive Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_row("python Pipeline__.py interactive")
+        renderer.console.print(table)
+    else:
+        print("Usage: python Pipeline__.py interactive")
+
+def print_rich_audit_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Audit Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_column("Description", style="white")
+        table.add_row("python Pipeline__.py audit RUN_DIR", "Audit a specific run directory")
+        table.add_row("python Pipeline__.py audit --list", "List all auditable run directories")
+        renderer.console.print(table)
+    else:
+        print("Usage: python Pipeline__.py audit RUN_DIR | --list")
+
+def print_rich_analyse_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Analyse Command", show_lines=True)
+        table.add_column("Option", style="bold cyan")
+        table.add_column("Description", style="white")
+        table.add_row("-i, --input FILE", "Input CSV file (repeatable) or directory")
+        table.add_row("-o, --output-dir DIR", "Output directory for plots")
+        table.add_row("--list", "List all analysable run directories")
+        renderer.console.print(table)
+    else:
+        print("Usage: python Pipeline__.py analyse -i CSV [-i CSV2 ...] [-o DIR] | --list")
+
+def print_rich_compare_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Compare Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_row("python Pipeline__.py compare RUN_DIR1 RUN_DIR2 ... [-o OUTPUT_DIR]")
+        renderer.console.print(table)
+    else:
+        print("Usage: python Pipeline__.py compare RUN_DIR1 RUN_DIR2 ... [-o OUTPUT_DIR]")
 # ============================================================================
-# 13. Existing‑run audit mode
+# 14. CLI
 # ============================================================================
+
 
 def audit_existing_run(run_dir: str | Path) -> dict[str, Any]:
     """
@@ -2494,123 +2907,9 @@ def audit_existing_run(run_dir: str | Path) -> dict[str, Any]:
 
 
 
-############## ############## ############## ############## ##############    
-############## Section to be added :  RICH helper functions ##############
-############## ############## ############## ############## ############## 
-
-def print_rich_help(parser):
-    """Display a rich help panel for the CLI."""
-    renderer = Renderer()
-    if not RICH_AVAILABLE:
-        parser.print_help()
-        return
-
-    renderer.title("EMOTION PROBE LAB", "Unified command-line interface")
-    sub_table = Table(title="Available Commands", show_lines=True, header_style="bold cyan")
-    sub_table.add_column("Command", style="bold magenta", min_width=15)
-    sub_table.add_column("Description", style="white")
-    sub_table.add_column("Shortcut", style="green")
-    subcommands = [
-        ("run", "Execute a full probing experiment", "r"),
-        ("models", "List available models and artifact status", "m"),
-        ("interactive", "Launch guided interactive mode", "i"),
-        ("audit", "Audit an existing probe run", "a"),
-        ("analyse", "Generate plots from result CSVs", "an"),
-    ]
-    for cmd, desc, short in subcommands:
-        sub_table.add_row(cmd, desc, short)
-    renderer.console.print(sub_table)
-
-    opt_table = Table(title="Global Options", show_lines=True, header_style="bold yellow")
-    opt_table.add_column("Option", style="bold")
-    opt_table.add_column("Description", style="white")
-    opt_table.add_row("-h, --help", "Show this help message and exit")
-    renderer.console.print(opt_table)
-    print("\nRun 'python G_test.py <command> --help' for command-specific options.")
-
-def print_rich_run_help():
-    renderer = Renderer()
-    if not RICH_AVAILABLE:
-        print("Run help:\n")
-        return
-    table = Table(title="Run Command Options", show_lines=True, header_style="bold green")
-    table.add_column("Option", style="bold cyan")
-    table.add_column("Description", style="white")
-    options = [
-        ("-m, --model", "Hugging Face model name (full or alias)"),
-        ("-d, --dataset", "Dataset: goEmo or ISEAR"),
-        ("-R, --root", "Root directory for artifacts"),
-        ("-e, --experiment-id", "Experiment identifier"),
-        ("-o, --output-dir", "Output directory"),
-        ("-p, --probe", "Probe type (repeatable)"),
-        ("-r, --repeats", "Number of repeats"),
-        ("-n, --max-samples", "Max samples (use --full for all)"),
-        ("-f, --full", "Use all samples"),
-        ("-s, --seed", "Random seed"),
-        ("-S, --no-shuffle-control", "Disable shuffled-label control"),
-        ("-x, --extract-if-missing", "Run extraction if artifact missing"),
-        ("-P, --no-plot", "Skip generating plots"),
-    ]
-    for opt, desc in options:
-        table.add_row(opt, desc)
-    renderer.console.print(table)
-
-def print_rich_models_help():
-    renderer = Renderer()
-    if RICH_AVAILABLE:
-        table = Table(title="Models Command", show_lines=True)
-        table.add_column("Usage", style="bold cyan")
-        table.add_row("python G_test.py models")
-        renderer.console.print(table)
-    else:
-        print("Usage: python G_test.py models")
-
-def print_rich_interactive_help():
-    renderer = Renderer()
-    if RICH_AVAILABLE:
-        table = Table(title="Interactive Command", show_lines=True)
-        table.add_column("Usage", style="bold cyan")
-        table.add_row("python G_test.py interactive")
-        renderer.console.print(table)
-    else:
-        print("Usage: python G_test.py interactive")
-
-def print_rich_audit_help():
-    renderer = Renderer()
-    if RICH_AVAILABLE:
-        table = Table(title="Audit Command", show_lines=True)
-        table.add_column("Usage", style="bold cyan")
-        table.add_column("Argument", style="white")
-        table.add_row("python G_test.py audit", "run_dir")
-        renderer.console.print(table)
-    else:
-        print("Usage: python G_test.py audit RUN_DIR")
-
-def print_rich_analyse_help():
-    renderer = Renderer()
-    if RICH_AVAILABLE:
-        table = Table(title="Analyse Command", show_lines=True)
-        table.add_column("Option", style="bold cyan")
-        table.add_column("Description", style="white")
-        table.add_row("-i, --input", "Input CSV file (repeatable)")
-        table.add_row("-o, --output-dir", "Output directory for plots")
-        renderer.console.print(table)
-    else:
-        print("Usage: python G_test.py analyse -i CSV [-i CSV2 ...] [-o DIR]")
-
-############## ############## ############## ############## ##############    
-############## Section to be added :  RICH helper functions ##############
-############## ############## ############## ############## ############## 
-
-
-
-
-# ============================================================================
-# 14. CLI
-# ============================================================================
 
 def build_parser():
-    parser = argparse.ArgumentParser(add_help=False)  # disable default help
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-h", "--help", action="store_true", help="Show help")
 
     sub = parser.add_subparsers(dest="command")
@@ -2631,6 +2930,7 @@ def build_parser():
     run.add_argument("-S", "--no-shuffle-control", action="store_true")
     run.add_argument("-x", "--extract-if-missing", action="store_true")
     run.add_argument("-P", "--no-plot", action="store_true", help="Skip generating plots.")
+    run.add_argument("-q", "--quiet", action="store_true", help="Suppress non‑essential output.")
     run.add_argument("-h", "--help", action="store_true", help="Show run help")
 
     # models
@@ -2641,16 +2941,25 @@ def build_parser():
     interactive = sub.add_parser("interactive", aliases=["i"], help="Launch the guided interface.", add_help=False)
     interactive.add_argument("-h", "--help", action="store_true", help="Show interactive help")
 
-    # audit
-    audit = sub.add_parser("audit", aliases=["a"], help="Audit an existing probe run without retraining.", add_help=False)
-    audit.add_argument("run_dir")
-    audit.add_argument("-h", "--help", action="store_true", help="Show audit help")
-
     # analyse
     analyse = sub.add_parser("analyse", aliases=["an"], help="Generate visualisations from result CSV(s).", add_help=False)
-    analyse.add_argument("-i", "--input", action="append", required=True)
+    analyse.add_argument("-i", "--input", action="append", required=False)
     analyse.add_argument("-o", "--output-dir", default="./analysis_plots")
+    analyse.add_argument("-l", "--list", action="store_true", help="List analysable runs")
     analyse.add_argument("-h", "--help", action="store_true", help="Show analyse help")
+
+    # audit
+    audit = sub.add_parser("audit", aliases=["a"], help="Audit an existing probe run without retraining.", add_help=False)
+    audit.add_argument("run_dir", nargs="?")
+    audit.add_argument("-l", "--list", action="store_true", help="List auditable runs")
+    audit.add_argument("-h", "--help", action="store_true", help="Show audit help")
+
+    # compare
+    compare = sub.add_parser("compare", aliases=["c"], help="Compare multiple completed runs.", add_help=False)
+    compare.add_argument("run_dirs", nargs="*", help="Directories containing master_results.csv files.")
+    compare.add_argument("-a", "--all", action="store_true", help="Compare all available master runs.")
+    compare.add_argument("-o", "--output-dir", default="./comparison_plots")
+    compare.add_argument("-h", "--help", action="store_true", help="Show compare help")
 
     return parser
 
@@ -2659,13 +2968,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    # If no arguments or just '-h', show global rich help.
     if not argv or (len(argv) == 1 and argv[0] in ("-h", "--help")):
         parser = build_parser()
         print_rich_help(parser)
         return 0
 
-    # Pre‑parse scan: detect subcommand and help flag before argparse.
     subcommand = None
     for token in argv:
         if not token.startswith('-'):
@@ -2673,24 +2980,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
 
     help_requested = any(arg in ("-h", "--help") for arg in argv[1:])
-    
 
     if help_requested and subcommand:
-        # Map aliases to canonical command names.
         alias_to_canonical = {
-            "r": "run",
-            "run": "run",
-            "m": "models",
-            "models": "models",
-            "i": "interactive",
-            "interactive": "interactive",
-            "a": "audit",
-            "audit": "audit",
-            "an": "analyse",
-            "analyse": "analyse",
+            "r": "run", "run": "run",
+            "m": "models", "models": "models",
+            "i": "interactive", "interactive": "interactive",
+            "a": "audit", "audit": "audit",
+            "an": "analyse", "analyse": "analyse",
+            "c": "compare", "compare": "compare",
         }
         canonical = alias_to_canonical.get(subcommand)
-
         if canonical == "run":
             print_rich_run_help()
         elif canonical == "models":
@@ -2701,17 +3001,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_rich_audit_help()
         elif canonical == "analyse":
             print_rich_analyse_help()
+        elif canonical == "compare":
+            print_rich_compare_help()
         else:
-            # Unknown command – fall back to global help.
             parser = build_parser()
             print_rich_help(parser)
         return 0
 
-    # Normal argument parsing (required arguments will be enforced here).
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Dispatch actual commands.
     if args.command == "run":
         probes = list(dict.fromkeys(args.probe))
         try:
@@ -2719,7 +3018,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=args.model,
                 dataset=args.dataset,
                 root=args.root,
-                quiet=args.quiet,
                 experiment_id=args.experiment_id,
                 output_dir=args.output_dir,
                 probes=probes,
@@ -2727,6 +3025,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_samples=None if args.full else args.max_samples,
                 seed=args.seed,
                 shuffled_label_control=not args.no_shuffle_control,
+                quiet=args.quiet,
             )
             pipeline.run(
                 extract_if_missing=args.extract_if_missing,
@@ -2745,15 +3044,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         InteractiveApp().run()
         return 0
 
-    elif args.command == "audit":
-        report = audit_existing_run(args.run_dir)
-        return 1 if report["status"] == "FAIL" else 0
-
     elif args.command == "analyse":
+        if args.list:
+            list_analysable_runs()
+            return 0
+        if not args.input:
+            print("Error: either --list or --input must be provided.")
+            return 1
         csv_paths = [Path(p) for p in args.input]
         analyser = ResultAnalyser(Path(args.output_dir))
         df = analyser.load_csvs(csv_paths)
         analyser.generate_plots(df)
+        return 0
+
+    elif args.command == "audit":
+        if args.list:
+            list_auditable_runs()
+            return 0
+        if not args.run_dir:
+            print("Error: either --list or a run directory must be provided.")
+            return 1
+        report = audit_existing_run(args.run_dir)
+        return 1 if report["status"] == "FAIL" else 0
+
+    elif args.command == "compare":
+        if args.all:
+            run_dirs = discover_all_master_runs()
+            if not run_dirs:
+                print("No master runs found.")
+                return 1
+        else:
+            if not args.run_dirs:
+                print("Error: either provide run directories or use --all.")
+                return 1
+            run_dirs = [Path(p) for p in args.run_dirs]
+        compare_runs(run_dirs, Path(args.output_dir))
         return 0
 
     parser.print_help()
