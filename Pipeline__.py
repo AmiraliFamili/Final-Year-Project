@@ -445,20 +445,18 @@ def compact_path(path: Path, max_chars: int = 74) -> str:
 # ------------------------------------------------------------------------------
 def get_run_label(run_dir: Path) -> str:
     """
-    Generate a compact human‑readable label for a run directory.
-    Format: <model>_<dataset>_<short_hash>
+    Generate a compact, human‑readable label for a run directory.
+    Format: <model>_<dataset>_<short_hash_or_id>
     """
     run_dir = run_dir.resolve()
     parts = run_dir.parts
 
-    # Try to find dataset and model from path structure
-    # master_runs/<dataset>__<org>/<model>/<hash>
+    # Master runs: master_runs/<dataset>__<org>/<model>/<hash>
     if "master_runs" in parts:
         idx = parts.index("master_runs")
-        # parts after idx: dataset__org, model_name, hash
-        if len(parts) > idx + 2:
-            dataset_org = parts[idx + 1]      # e.g., "ISEAR__Qwen"
-            model_name = parts[idx + 2]       # e.g., "Qwen2-0.5B"
+        if len(parts) > idx + 3:
+            dataset_org = parts[idx + 1]
+            model_name = parts[idx + 2]
             hash_part = parts[idx + 3] if len(parts) > idx + 3 else ""
             if "__" in dataset_org:
                 dataset, org = dataset_org.split("__", 1)
@@ -466,29 +464,93 @@ def get_run_label(run_dir: Path) -> str:
             else:
                 dataset = dataset_org
                 full_model = model_name
-            short_hash = hash_part[:6] if hash_part else ""
-            # Replace slashes to keep label filesystem-safe
-            label = f"{full_model.replace('/', '_')}_{dataset}_{short_hash}"
-            return label
+            short_id = hash_part[:6] if hash_part else "master"
+            return f"{full_model.replace('/', '_')}_{dataset}_{short_id}"
 
-    # Fallback for probe output directories
-    # .../models/<org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>
+    # Probe output: models/<org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>
     if "models" in parts:
         idx = parts.index("models")
-        if len(parts) > idx + 3:
+        if len(parts) > idx + 4:
             org = parts[idx + 1]
             model_name = parts[idx + 2]
-            if parts[idx + 3] == "datasets" and len(parts) > idx + 4:
+            if parts[idx + 3] == "datasets" and len(parts) > idx + 5:
                 dataset = parts[idx + 4]
+                run_name = parts[-1]  # last directory, e.g., probe_run__... or matrix_runs/...
+                # Take a short identifier from the run directory name
+                # For matrix_runs, the parent directory contains the run identifier
+                if run_name == "matrix_runs":
+                    # The actual run dir is the one before matrix_runs? Actually path ends with matrix_runs/<run_folder>
+                    # Our glob returns the parent of layer_probe_results.csv, so run_dir is the actual run folder
+                    # We are already in the actual run folder, so parts[-1] is the run folder name
+                    short_id = parts[-1][-8:] if len(parts[-1]) > 8 else parts[-1]
+                else:
+                    # probe_run__... or notebook_...; use last 6 chars of hash if present
+                    m = re.search(r"__hash([a-f0-9]+)", parts[-1])
+                    if m:
+                        short_id = m.group(1)[:6]
+                    else:
+                        short_id = parts[-1][-8:]
                 full_model = f"{org}/{model_name}"
-                # Use last directory name as hash identifier
-                hash_part = parts[-1]
-                short_hash = hash_part[-6:] if hash_part else ""
-                label = f"{full_model.replace('/', '_')}_{dataset}_{short_hash}"
-                return label
+                return f"{full_model.replace('/', '_')}_{dataset}_{short_id}"
 
-    # If all else fails, use the directory name truncated
+    # Fallback
     return run_dir.name[:20]
+
+
+
+def list_available_models(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EXPERIMENT_ID) -> None:
+    """
+    Display a table of all available models and their artifact availability.
+
+    The table shows, for each model in the extraction module's registry:
+      - Model ID (full Hugging Face name)
+      - Family
+      - Number of parameters (B)
+      - Whether an artifact exists for goEmo and for ISEAR
+    """
+    renderer = Renderer()
+    extraction_mod = ModuleFactory.extraction(MasterConfig())
+    models = get_available_models(extraction_mod)
+
+    if not models:
+        renderer.warning("No models found in the extraction module's registry.")
+        return
+    # Build reverse alias for display
+    full_to_short = build_reverse_alias(MODEL_ALIASES)
+
+    if RICH_AVAILABLE:
+        table = Table(title="Available Models", show_lines=True, header_style="bold magenta", width=150, min_width=120)
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Model ID", style="cyan", no_wrap=True)
+        table.add_column("Short Name", style="green", min_width=12)
+        table.add_column("Family", style="magenta")
+        table.add_column("Params (B)", justify="right")
+        table.add_column("goEmo artifact", justify="center")
+        table.add_column("ISEAR artifact", justify="center")
+
+        for i, (name, family, params) in enumerate(models, 1):
+            has_go = has_artifact(root, experiment_id, name, "goEmo")
+            has_isear = has_artifact(root, experiment_id, name, "ISEAR")
+            go_mark = "[green]✓[/green]" if has_go else "[red]✗[/red]"
+            isear_mark = "[green]✓[/green]" if has_isear else "[red]✗[/red]"
+            short = full_to_short.get(name, "—")
+            table.add_row(str(i), name, short, family, f"{params:.3f}", go_mark, isear_mark)
+
+        renderer.console.print(table)
+        renderer.info(
+            "✓ = hidden‑state artifact exists (ready for probing)\n"
+            "✗ = artifact missing (extraction needed)"
+        )
+    else:
+        # Plain‑text fallback
+        print("\nAvailable models:")
+        for i, (name, family, params) in enumerate(models, 1):
+            has_go = has_artifact(root, experiment_id, name, "goEmo")
+            has_isear = has_artifact(root, experiment_id, name, "ISEAR")
+            status = f"goEmo:{'✓' if has_go else '✗'}, ISEAR:{'✓' if has_isear else '✗'}"
+            print(f"{i:3d}. {name:30s} {family:10s} {params:.3f}B  [{status}]")
+    print()
+
 
 
 def get_available_models(extraction_mod=None):
@@ -1937,14 +1999,27 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path):
 
 
 
-def discover_all_master_runs(root: Path = DEFAULT_ROOT) -> list[Path]:
+def discover_all_runs(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EXPERIMENT_ID) -> list[Path]:
     """
-    Return a list of all directories containing master_results.csv under master_runs.
+    Return a list of all directories that contain probe result CSVs.
+    Includes both master run directories and raw probe output directories.
     """
+    runs = []
+
+    # 1. Master runs: root/master_runs/<dataset>__<org>/<model>/<hash>/
     master_runs = root / "master_runs"
-    if not master_runs.exists():
-        return []
-    return sorted(set(p.parent for p in master_runs.glob("**/master_results.csv")))
+    if master_runs.exists():
+        for master_csv in master_runs.glob("**/master_results.csv"):
+            runs.append(master_csv.parent)
+
+    # 2. Probe output runs: root/experiments/<exp_id>/models/<org>/<model>/datasets/<dataset>/analysis/probes/<run_dir>/
+    exp_models = root / "experiments" / experiment_id / "models"
+    if exp_models.exists():
+        for probe_csv in exp_models.glob("**/layer_probe_results.csv"):
+            runs.append(probe_csv.parent)
+
+    # Remove duplicates and sort
+    return sorted(set(runs))
 
 # ============================================================================
 # 12. Main orchestrator
@@ -3069,7 +3144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     elif args.command == "compare":
         if args.all:
-            run_dirs = discover_all_master_runs()
+            run_dirs = discover_all_runs()
             if not run_dirs:
                 print("No master runs found.")
                 return 1
