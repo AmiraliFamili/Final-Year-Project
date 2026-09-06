@@ -1611,18 +1611,23 @@ def fit_logistic_single(X_train, y_train, X_val, y_val, X_test, y_test, classes,
     }
     return metrics, model
 
+class ConstantPredictor: # local helper class
+    """Trivial predictor used when a binary label has only one class in training."""
+    def __init__(self, constant: int):
+        self.constant = int(constant)
+
+    def predict(self, X):
+        return np.full(len(X), self.constant, dtype=np.int64)
+
+    def predict_proba(self, X):
+        p1 = np.full(len(X), float(self.constant), dtype=float)
+        return np.column_stack([1 - p1, p1])
 
 def _fit_one_binary(X_train, target_train, X_val, X_test, spec, seed):
     unique = np.unique(target_train)
     if len(unique) == 1:
         constant = int(unique[0])
-        class Constant:
-            def __init__(self, c): self.c = c
-            def predict(self, X): return np.full(len(X), self.c, dtype=np.int64)
-            def predict_proba(self, X):
-                p1 = np.full(len(X), float(self.c), dtype=float)
-                return np.column_stack([1 - p1, p1])
-        return Constant(constant)
+        return ConstantPredictor(constant)   # no longer local
     model = _make_logistic(spec, seed)
     model.fit(X_train, target_train)
     return model
@@ -2341,12 +2346,18 @@ class UnifiedProbeAnalyzer:
         save_json(d / "metrics.json", {"record": record, "results": results})
         if self.task_type == "single_label":
             save_npz(d / "confusion_matrix_test.npz", matrix=np.asarray(results["test"]["confusion_matrix"]))
-        if probe.type == "logistic":
-            joblib.dump(model, d / "probe.joblib")
-        else:
-            torch.save(model.state_dict(), d / "probe_state_dict.pt")
-        if scaler is not None:
-            joblib.dump(scaler, d / "scaler.joblib")
+        
+        try:
+            if probe.type == "logistic":
+                joblib.dump(model, d / "probe.joblib")
+            else:
+                torch.save(model.state_dict(), d / "probe_state_dict.pt")
+            if scaler is not None:
+                joblib.dump(scaler, d / "scaler.joblib")
+        except Exception as e:
+            self.logger.emit(f"Warning: could not save model artifact for {probe.name} layer {layer_name}: {e}", 1)
+                
+        
 
     def _job_key(self, repeat, layer_idx, probe_name, control_index=-1):
         return (repeat, layer_idx, probe_name, control_index)
