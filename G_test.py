@@ -1955,8 +1955,7 @@ class EmotionProbePipeline:
         # Use the probe module's contract and validation functions
         DatasetContract = getattr(self.probe_mod, "DatasetContract")
         contract = DatasetContract(
-            target_type=self.config.dataset.lower()
-            if self.config.dataset in {"goEmo", "ISEAR"} else "auto",
+            target_type=ds_spec["target_type"],
             type="python",
             module=ds_spec["module"],
             function=ds_spec["function"],
@@ -2058,7 +2057,7 @@ class EmotionProbePipeline:
         ds_spec = DatasetFactory.spec(self.config.dataset)
 
         contract = DatasetContract(
-            target_type=self.config.dataset.lower(),
+            target_type=ds_spec["target_type"],
             type="python",
             module=ds_spec["module"],
             function=ds_spec["function"],
