@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 EMOTION PROBE LAB – UNIFIED PIPELINE
 ====================================
@@ -59,11 +56,11 @@ except ImportError:
 try:
     import matplotlib.pyplot as plt
     import seaborn as sns
-    # Set a modern style for all plots
-    sns.set_theme(style="darkgrid", palette="viridis")
     PLOTTING_AVAILABLE = True
 except ImportError:
     PLOTTING_AVAILABLE = False
+    plt = None
+    sns = None
 
 
 # ============================================================================
@@ -109,6 +106,78 @@ DATASET_SPECS = {
         "class_count": 7,
     },
 }
+
+# Static model aliases – short names to full Hugging Face IDs
+MODEL_ALIASES = {
+    "BERT": "google-bert/bert-base-uncased",
+    "DBERT": "distilbert/distilbert-base-uncased",
+    "DISTILBERT": "distilbert/distilbert-base-uncased",
+    "ROBERTA": "FacebookAI/roberta-base",
+    "ELECTRA": "google/electra-small-discriminator",
+    "DEBERTA": "microsoft/deberta-v3-small",
+    "GPT2": "gpt2",
+    "GPT-NEO": "EleutherAI/gpt-neo-125m",
+    "OPT": "facebook/opt-125m",
+    "SMOL2-135M": "HuggingFaceTB/SmolLM2-135M",
+    "SMOL2-360M": "HuggingFaceTB/SmolLM2-360M",
+    "SMOL2-1.7B": "HuggingFaceTB/SmolLM2-1.7B",
+    "GEMMA-270M": "google/gemma-3-270m",
+    "GEMMA-1B": "google/gemma-3-1b-pt",
+    "GEMMA-4B": "google/gemma-3-4b-pt",
+    "QWEN2-0.5B": "Qwen/Qwen2-0.5B",
+    "QWEN2.5-0.5B": "Qwen/Qwen2.5-0.5B",
+    "QWEN2-1.5B": "Qwen/Qwen2-1.5B",
+    "QWEN2.5-1.5B": "Qwen/Qwen2.5-1.5B",
+    "QWEN2.5-3B": "Qwen/Qwen2.5-3B",
+    "QWEN3-0.6B": "Qwen/Qwen3-0.6B-Base",
+    "QWEN3-1.7B": "Qwen/Qwen3-1.7B-Base",
+    "QWEN3-4B": "Qwen/Qwen3-4B-Base",
+    "LLAMA-1B": "meta-llama/Llama-3.2-1B",
+    "LLAMA-3B": "meta-llama/Llama-3.2-3B",
+    "TINYLLAMA": "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+}
+
+def build_reverse_alias(aliases):
+    reverse = {}
+    for short, full in aliases.items():
+        if full not in reverse:
+            reverse[full] = short
+    return reverse
+
+
+FULL_TO_SHORT = build_reverse_alias(MODEL_ALIASES)
+
+
+def resolve_model_name(raw: str) -> str:
+    """
+    Resolve a user-provided model name to a full registry name.
+    Accepts full name, short alias (case-insensitive), or abbreviation.
+    Raises ValueError if not resolvable.
+    """
+    raw = raw.strip()
+    if not raw:
+        return "google-bert/bert-base-uncased"
+
+    alias_key = raw.upper()
+    if alias_key in MODEL_ALIASES:
+        return MODEL_ALIASES[alias_key]
+
+    for full in MODEL_ALIASES.values():
+        if raw.lower() == full.lower():
+            return full
+
+    matches = []
+    for alias, full in MODEL_ALIASES.items():
+        if raw.lower() in alias.lower() or raw.lower() in full.lower():
+            matches.append(full)
+    matches = list(dict.fromkeys(matches))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        choices = "\n".join([f"  - {m} (alias: {FULL_TO_SHORT.get(m, 'N/A')})" for m in matches])
+        raise ValueError(f"Ambiguous model name '{raw}'. Please choose one of:\n{choices}")
+    valid = "\n".join([f"  - {alias}: {full}" for alias, full in MODEL_ALIASES.items()])
+    raise ValueError(f"Model '{raw}' not recognized. Valid names:\n{valid}")
 
 # Predefined probe configurations
 DEFAULT_PROBE_PRESETS = {
@@ -272,21 +341,88 @@ def compact_path(path: Path, max_chars: int = 74) -> str:
     return s if len(s) <= max_chars else "…" + s[-(max_chars - 1):]
 
 
-def validate_model_name(model_name: str, extraction_mod) -> list[str]:
+# ------------------------------------------------------------------------------
+# NEW: Functions for listing available models and artifacts
+# ------------------------------------------------------------------------------
+
+def get_available_models(extraction_mod=None):
     """
-    Check if the model name is in the extraction module's registry.
-    Returns a list of suggestions (empty if exact match found).
+    Return a list of (model_name, family, params) from the extraction module's registry.
+
+    If no extraction module is given, it tries to import one using ModuleFactory.
+    Returns an empty list if no registry is found.
     """
-    if not hasattr(extraction_mod, "MODEL_REGISTRY"):
-        return []
-    registry_names = [m.name for m in extraction_mod.MODEL_REGISTRY]
-    if model_name in registry_names:
-        return []
-    # Fuzzy match (case‑insensitive and ignoring slashes)
-    normalized = model_name.lower().replace("/", "")
-    suggestions = [name for name in registry_names
-                   if name.lower().replace("/", "") == normalized]
-    return suggestions
+    if extraction_mod is None:
+        extraction_mod = ModuleFactory.extraction(MasterConfig())
+    if hasattr(extraction_mod, "MODEL_REGISTRY"):
+        return [
+            (m.name, m.family, m.parameter_billions)
+            for m in extraction_mod.MODEL_REGISTRY
+        ]
+    return []
+
+
+def has_artifact(root: Path, experiment_id: str, model: str, dataset: str) -> bool:
+    """
+    Check whether a frozen hidden‑state artifact exists for the given model and dataset.
+    """
+    ds_dir = dataset_artifact_dir(root, experiment_id, model, dataset)
+    return (ds_dir / "metadata" / "extraction.json").exists()
+
+
+def list_available_models(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EXPERIMENT_ID) -> None:
+    """
+    Display a table of all available models and their artifact availability.
+
+    The table shows, for each model in the extraction module's registry:
+      - Model ID (full Hugging Face name)
+      - Family
+      - Number of parameters (B)
+      - Whether an artifact exists for goEmo and for ISEAR
+    """
+    renderer = Renderer()
+    extraction_mod = ModuleFactory.extraction(MasterConfig())
+    models = get_available_models(extraction_mod)
+
+    if not models:
+        renderer.warning("No models found in the extraction module's registry.")
+        return
+    # Build reverse alias for display
+    full_to_short = build_reverse_alias(MODEL_ALIASES)
+    
+    if RICH_AVAILABLE:
+        table = Table(title="Available Models", show_lines=True, header_style="bold magenta", width=150, min_width=120)
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Model ID", style="cyan", no_wrap=True)
+        table.add_column("Short Name", style="green", min_width=12)
+        table.add_column("Family", style="magenta")
+        table.add_column("Params (B)", justify="right")
+        table.add_column("goEmo artifact", justify="center")
+        table.add_column("ISEAR artifact", justify="center")
+
+        for i, (name, family, params) in enumerate(models, 1):
+            has_go = has_artifact(root, experiment_id, name, "goEmo")
+            has_isear = has_artifact(root, experiment_id, name, "ISEAR")
+            go_mark = "[green]✓[/green]" if has_go else "[red]✗[/red]"
+            isear_mark = "[green]✓[/green]" if has_isear else "[red]✗[/red]"
+            short = full_to_short.get(name, "—")
+            # add everything to the table
+            table.add_row(str(i), name, short, family, f"{params:.3f}", go_mark, isear_mark)
+
+        renderer.console.print(table)
+        renderer.info(
+            "✓ = hidden‑state artifact exists (ready for probing)\n"
+            "✗ = artifact missing (extraction needed)"
+        )
+    else:
+        # Plain‑text fallback
+        print("\nAvailable models:")
+        for i, (name, family, params) in enumerate(models, 1):
+            has_go = has_artifact(root, experiment_id, name, "goEmo")
+            has_isear = has_artifact(root, experiment_id, name, "ISEAR")
+            status = f"goEmo:{'✓' if has_go else '✗'}, ISEAR:{'✓' if has_isear else '✗'}"
+            print(f"{i:3d}. {name:30s} {family:10s} {params:.3f}B  [{status}]")
+    print()
 
 
 # ============================================================================
@@ -1196,9 +1332,9 @@ class ResultAnalyser:
     def __init__(self, output_dir: Path):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        # Set a clean, modern style
-        sns.set_theme(style="whitegrid", palette="deep")
-        plt.rcParams.update({
+        if PLOTTING_AVAILABLE and sns is not None:
+            sns.set_theme(style="whitegrid", palette="deep")
+            plt.rcParams.update({
             "figure.facecolor": "white",
             "axes.facecolor": "white",
             "axes.edgecolor": "black",
@@ -1217,18 +1353,48 @@ class ResultAnalyser:
             "savefig.bbox": "tight",
         })
 
+
     def load_csvs(self, csv_paths: Iterable[Path]) -> pd.DataFrame:
-        """Concatenate multiple CSV files into a single DataFrame."""
+        """Concatenate multiple CSV files into a single DataFrame.
+        If a directory is provided, all CSV files inside it are loaded.
+        Handles non‑UTF‑8 files by falling back to latin‑1 or skipping with a warning.
+        """
         frames = []
         for p in csv_paths:
             p = Path(p)
             if not p.exists():
                 print(f"Warning: {p} not found, skipping.")
                 continue
-            frames.append(pd.read_csv(p))
+            if p.is_dir():
+                csv_files = [f for f in sorted(p.glob("*.csv")) if not f.name.startswith("._")]
+                if not csv_files:
+                    print(f"Warning: No valid CSV files found in {p}, skipping.")
+                    continue
+                print(f"Loading {len(csv_files)} CSV file(s) from directory {p}.")
+                for csv_file in csv_files:
+                    self._try_read_csv(csv_file, frames)
+            else:
+                self._try_read_csv(p, frames)
+
         if not frames:
             raise ValueError("No valid CSV files provided.")
         return pd.concat(frames, ignore_index=True)
+
+    def _try_read_csv(self, path: Path, frames: list) -> None:
+        try:
+            df = pd.read_csv(path)
+            frames.append(df)
+        except UnicodeDecodeError:
+            try:
+                df = pd.read_csv(path, encoding='latin-1')
+                print(f"Warning: {path} is not UTF‑8; read with latin‑1.")
+                frames.append(df)
+            except Exception as e:
+                print(f"Warning: Could not read {path}: {e}. Skipping.")
+        except pd.errors.ParserError as e:
+            print(f"Warning: Could not parse {path}: {e}. Skipping.")
+        except Exception as e:
+            print(f"Warning: Could not read {path}: {e}. Skipping.")
 
     def _available_metrics(self, df: pd.DataFrame) -> list[str]:
         """Return list of metric columns that contain numeric data."""
@@ -1487,22 +1653,6 @@ class EmotionProbePipeline:
         """
         self.renderer = Renderer()
 
-        # ------------------------------------------------------------------
-        # NEW: Early root accessibility check
-        # ------------------------------------------------------------------
-        root_path = Path(root).resolve()
-        if not root_path.exists():
-            raise RuntimeError(
-                f"Root directory '{root_path}' does not exist.\n"
-                "Please check that the external drive is mounted and the path is correct."
-            )
-        if not os.access(root_path, os.W_OK):
-            raise RuntimeError(
-                f"Root directory '{root_path}' is not writable.\n"
-                "Please verify permissions or mount the volume with write access."
-            )
-        # ------------------------------------------------------------------
-
         # Normalise probe choices
         normalized_choices = []
         for p in probes:
@@ -1510,11 +1660,20 @@ class EmotionProbePipeline:
                 normalized_choices.append(p)
             else:
                 normalized_choices.append(ProbeChoice(str(p)))
+                
+        # Normalise and resolve model name
+        raw_model = normalize_model_name(model)
+        try:
+            resolved_model = resolve_model_name(raw_model)
+        except ValueError as e:
+            raise ValueError(str(e)) from e
+        if resolved_model != raw_model:
+            self.renderer.warning(f"Model name '{raw_model}' resolved to '{resolved_model}'.")
 
         self.config = MasterConfig(
-            root=root_path,
+            root=Path(root).resolve(),
             experiment_id=experiment_id,
-            model=normalize_model_name(model),
+            model=resolved_model,
             dataset=str(dataset),
             output_dir=Path(output_dir).resolve(),
             probes=normalized_choices,
@@ -1725,19 +1884,6 @@ class EmotionProbePipeline:
                 "Run extraction first or call ensure_extraction(run_if_missing=True)."
             )
 
-        # ------------------------------------------------------------------
-        # Early model name sanity checks and automatic resolution
-        # ------------------------------------------------------------------
-        model_name = self.config.model
-
-        # Warn if the name lacks a namespace (org/user)
-        if "/" not in model_name:
-            self.renderer.warning(
-                f"Model name '{model_name}' does not contain a namespace (org/user). "
-                "Hugging Face models usually have the form 'org/model-name'. "
-                "Attempting to resolve against the extraction registry..."
-            )
-
         self.extraction_mod = ModuleFactory.extraction(self.config)
         if self.extraction_mod is None:
             raise ImportError(
@@ -1748,33 +1894,6 @@ class EmotionProbePipeline:
 
         if not hasattr(self.extraction_mod, "run_experiments"):
             raise AttributeError("Extraction module does not expose run_experiments(...).")
-
-        # Attempt to resolve model name using registry if available
-        if hasattr(self.extraction_mod, "MODEL_REGISTRY"):
-            registry_names = [m.name for m in self.extraction_mod.MODEL_REGISTRY]
-            if model_name not in registry_names:
-                # Case‑insensitive comparison ignoring slashes
-                normalized = model_name.lower().replace("/", "")
-                matches = [name for name in registry_names
-                        if name.lower().replace("/", "") == normalized]
-                if len(matches) == 1:
-                    self.renderer.warning(
-                        f"Model '{model_name}' not found exactly. "
-                        f"Using close match '{matches[0]}' instead."
-                    )
-                    self.config.model = matches[0]   # update config
-                    # Also update artifact_dir property accordingly
-                    # (it depends on config.model)
-                elif len(matches) > 1:
-                    self.renderer.warning(
-                        f"Model '{model_name}' is ambiguous. Multiple close matches found: "
-                        f"{', '.join(matches)}. Proceeding with original name."
-                    )
-                else:
-                    self.renderer.warning(
-                        f"Model '{model_name}' not found in extraction registry. "
-                        "Proceeding with original name; extraction may fail."
-                    )
 
         dataset_obj = DatasetFactory.load(self.config.dataset)
         self.renderer.warning(
@@ -1796,14 +1915,6 @@ class EmotionProbePipeline:
                 # (self.artifact_dir is a property, so it will reflect the new config)
                 self._run_extraction(dataset_obj)
             else:
-                # Re‑raise with a friendlier message for common Hugging Face errors
-                if "MODEL REVISION LOOKUP FAILED" in str(e) or "RepositoryNotFoundError" in str(e):
-                    raise RuntimeError(
-                        f"Could not find the model '{self.config.model}' on Hugging Face.\n"
-                        "Please check the model name. It should be the full repository ID, "
-                        "e.g. 'Qwen/Qwen2-0.5B' (note the capital 'B').\n"
-                        f"Original error: {e}"
-                    ) from e
                 raise
 
         if not self._artifact_exists():
@@ -2145,7 +2256,7 @@ class EmotionProbePipeline:
         self.report()
 
         if generate_plots and PLOTTING_AVAILABLE:
-            self.generate_plots()
+            self.generate_plots(self.config.output_dir)
 
         self.state.start(Stage.COMPLETE)
         save_json(
@@ -2237,96 +2348,38 @@ class InteractiveApp:
             "A controlled interface for frozen hidden‑state emotion probing",
         )
 
-        # ----- Model selection with rich table if available -----
-        all_models = self.get_available_models()
-        if not all_models:
+        # ------------------------------------------------------------------
+        # NEW: Display available models with artifact indicators
+        # ------------------------------------------------------------------
+        list_available_models()
+        print()  # spacing
+
+        # Ask user for model
+        available_models = self.get_available_models()
+        if not available_models:
             model = self.ask("Model", "google-bert/bert-base-uncased")
         else:
-            # Display models using rich Table if possible
-            if RICH_AVAILABLE and self.renderer.console:
-                from rich.table import Table
-                table = Table(title="Available Models", show_lines=True,
-                              header_style="bold magenta")
-                table.add_column("#", style="dim", justify="right")
-                table.add_column("Model", style="cyan", no_wrap=True)
-                table.add_column("Family", style="magenta")
-                table.add_column("Params (B)", justify="right")
-                table.add_column("goEmo artifact", justify="center")
-                table.add_column("ISEAR artifact", justify="center")
+            while True: 
+                raw = self.ask("Model (enter number or full name)", "google-bert/bert-base-uncased")
+                if raw.lower() == 'q':
+                    self.renderer.info("Exiting.")
+                    return {"status": "cancelled"}
+                try:
+                    model = resolve_model_name(raw) # keeps asking user for correct model name.
+                    break
+                except ValueError as e:
+                    self.renderer.error(str(e))
+                    print("Please try again.\n")
 
-                for i, (name, family, params) in enumerate(all_models, 1):
-                    has_go = self.has_artifact(name, "goEmo")
-                    has_isear = self.has_artifact(name, "ISEAR")
-                    go_mark = "[green]✓[/green]" if has_go else "[red]✗[/red]"
-                    isear_mark = "[green]✓[/green]" if has_isear else "[red]✗[/red]"
-                    table.add_row(
-                        str(i),
-                        name,
-                        family,
-                        f"{params:.3f}",
-                        go_mark,
-                        isear_mark,
-                    )
-                self.renderer.console.print(table)
-                self.renderer.info(
-                    "✓ = hidden‑state artifact exists (ready for probing)\n"
-                    "✗ = artifact missing (extraction needed)"
-                )
-            else:
-                # Plain‑text fallback
-                print("\nAvailable models (✓ = has artifact):")
-                for i, (name, family, params) in enumerate(all_models, 1):
-                    has_go = self.has_artifact(name, "goEmo")
-                    has_isear = self.has_artifact(name, "ISEAR")
-                    status = []
-                    if has_go:
-                        status.append("goEmo:✓")
-                    else:
-                        status.append("goEmo:✗")
-                    if has_isear:
-                        status.append("ISEAR:✓")
-                    else:
-                        status.append("ISEAR:✗")
-                    print(f"  {i:2d}. {name}  ({family}, {params:.3f}B)  [{', '.join(status)}]")
-
-            print("\nType a model name or number, or press ENTER for default.")
-            raw = input("Model [google-bert/bert-base-uncased]: ").strip()
-            if raw == "":
-                model = "google-bert/bert-base-uncased"
-            elif raw.isdigit():
-                idx = int(raw) - 1
-                if 0 <= idx < len(all_models):
-                    model = all_models[idx][0]
-                else:
-                    model = "google-bert/bert-base-uncased"
-            else:
-                # Resolve partial match
-                matches = [m[0] for m in all_models if raw.lower() in m[0].lower()]
-                if len(matches) == 1:
-                    model = matches[0]
-                elif len(matches) > 1:
-                    print("Multiple matches found. Please choose one:")
-                    for i, m in enumerate(matches, 1):
-                        print(f"  {i}. {m}")
-                    choice = input("Select number: ").strip()
-                    try:
-                        model = matches[int(choice) - 1]
-                    except (ValueError, IndexError):
-                        model = matches[0]
-                else:
-                    print(f"⚠️ Model '{raw}' not found in registry. Using it as‑is.")
-                    model = raw
-
-        # ----- Dataset -----
         dataset = self.choose("Dataset", ["goEmo", "ISEAR"])
 
-        # ----- Probes -----
+        # ... rest of interactive flow unchanged ...
         print("\nProbe selection")
         print("  ENTER = logistic baseline")
         print("  1     = logistic")
-        print("  2     = logistic + 1‑hidden MLP")
-        print("  3     = logistic + 1/2‑hidden MLP")
-        print("  4     = logistic + 1/2/3‑hidden MLP")
+        print("  2     = logistic + 1-hidden MLP")
+        print("  3     = logistic + 1/2-hidden MLP")
+        print("  4     = logistic + 1/2/3-hidden MLP")
 
         choice = input("Probe configuration: ").strip()
         probe_map = {
@@ -2338,18 +2391,16 @@ class InteractiveApp:
         }
         probes = probe_map.get(choice, ["logistic"])
 
-        # ----- Other settings -----
         max_raw = self.ask("Maximum samples (ENTER = 5000, type FULL for all)", "5000")
         max_samples = None if max_raw.upper() == "FULL" else int(max_raw)
 
         repeats = int(self.ask("Independent repeats", "3"))
-        controls = self.ask("Run shuffled‑label control? Y/N", "Y").upper() == "Y"
+        controls = self.ask("Run shuffled-label control? Y/N", "Y").upper() == "Y"
 
         output_dir = self.ask("Output directory (ENTER = ./demo_runs)", "./demo_runs") or "./demo_runs"
 
         extract_if_missing = self.ask("Extract hidden states if missing? Y/N", "Y").upper() == "Y"
 
-        # ----- Build pipeline -----
         pipeline = EmotionProbePipeline(
             model=model,
             dataset=dataset,
@@ -2419,88 +2470,266 @@ def audit_existing_run(run_dir: str | Path) -> dict[str, Any]:
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     return report
 
+
+
+############## ############## ############## ############## ##############    
+############## Section to be added :  RICH helper functions ##############
+############## ############## ############## ############## ############## 
+
+def print_rich_help(parser):
+    """Display a rich help panel for the CLI."""
+    renderer = Renderer()
+    if not RICH_AVAILABLE:
+        parser.print_help()
+        return
+
+    renderer.title("EMOTION PROBE LAB", "Unified command-line interface")
+    sub_table = Table(title="Available Commands", show_lines=True, header_style="bold cyan")
+    sub_table.add_column("Command", style="bold magenta", min_width=15)
+    sub_table.add_column("Description", style="white")
+    sub_table.add_column("Shortcut", style="green")
+    subcommands = [
+        ("run", "Execute a full probing experiment", "r"),
+        ("models", "List available models and artifact status", "m"),
+        ("interactive", "Launch guided interactive mode", "i"),
+        ("audit", "Audit an existing probe run", "a"),
+        ("analyse", "Generate plots from result CSVs", "an"),
+    ]
+    for cmd, desc, short in subcommands:
+        sub_table.add_row(cmd, desc, short)
+    renderer.console.print(sub_table)
+
+    opt_table = Table(title="Global Options", show_lines=True, header_style="bold yellow")
+    opt_table.add_column("Option", style="bold")
+    opt_table.add_column("Description", style="white")
+    opt_table.add_row("-h, --help", "Show this help message and exit")
+    renderer.console.print(opt_table)
+    print("\nRun 'python G_test.py <command> --help' for command-specific options.")
+
+def print_rich_run_help():
+    renderer = Renderer()
+    if not RICH_AVAILABLE:
+        print("Run help:\n")
+        return
+    table = Table(title="Run Command Options", show_lines=True, header_style="bold green")
+    table.add_column("Option", style="bold cyan")
+    table.add_column("Description", style="white")
+    options = [
+        ("-m, --model", "Hugging Face model name (full or alias)"),
+        ("-d, --dataset", "Dataset: goEmo or ISEAR"),
+        ("-R, --root", "Root directory for artifacts"),
+        ("-e, --experiment-id", "Experiment identifier"),
+        ("-o, --output-dir", "Output directory"),
+        ("-p, --probe", "Probe type (repeatable)"),
+        ("-r, --repeats", "Number of repeats"),
+        ("-n, --max-samples", "Max samples (use --full for all)"),
+        ("-f, --full", "Use all samples"),
+        ("-s, --seed", "Random seed"),
+        ("-S, --no-shuffle-control", "Disable shuffled-label control"),
+        ("-x, --extract-if-missing", "Run extraction if artifact missing"),
+        ("-P, --no-plot", "Skip generating plots"),
+    ]
+    for opt, desc in options:
+        table.add_row(opt, desc)
+    renderer.console.print(table)
+
+def print_rich_models_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Models Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_row("python G_test.py models")
+        renderer.console.print(table)
+    else:
+        print("Usage: python G_test.py models")
+
+def print_rich_interactive_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Interactive Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_row("python G_test.py interactive")
+        renderer.console.print(table)
+    else:
+        print("Usage: python G_test.py interactive")
+
+def print_rich_audit_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Audit Command", show_lines=True)
+        table.add_column("Usage", style="bold cyan")
+        table.add_column("Argument", style="white")
+        table.add_row("python G_test.py audit", "run_dir")
+        renderer.console.print(table)
+    else:
+        print("Usage: python G_test.py audit RUN_DIR")
+
+def print_rich_analyse_help():
+    renderer = Renderer()
+    if RICH_AVAILABLE:
+        table = Table(title="Analyse Command", show_lines=True)
+        table.add_column("Option", style="bold cyan")
+        table.add_column("Description", style="white")
+        table.add_row("-i, --input", "Input CSV file (repeatable)")
+        table.add_row("-o, --output-dir", "Output directory for plots")
+        renderer.console.print(table)
+    else:
+        print("Usage: python G_test.py analyse -i CSV [-i CSV2 ...] [-o DIR]")
+
+############## ############## ############## ############## ##############    
+############## Section to be added :  RICH helper functions ##############
+############## ############## ############## ############## ############## 
+
+
+
+
 # ============================================================================
 # 14. CLI
 # ============================================================================
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser for the CLI."""
-    parser = argparse.ArgumentParser(
-        description="Master interface for the frozen hidden‑state emotion probing project."
-    )
+def build_parser():
+    parser = argparse.ArgumentParser(add_help=False)  # disable default help
+    parser.add_argument("-h", "--help", action="store_true", help="Show help")
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
-    # ----- run -----
-    run = sub.add_parser("run", help="Run an experiment.")
-    run.add_argument("--model", required=True)
-    run.add_argument("--dataset", choices=sorted(DATASET_SPECS), required=True)
-    run.add_argument("--root", default=str(DEFAULT_ROOT))
-    run.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
-    run.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    run.add_argument("--probe", action="append", default=["logistic"],
+    # run
+    run = sub.add_parser("run", aliases=["r"], help="Run an experiment.", add_help=False)
+    run.add_argument("-m", "--model", required=True)
+    run.add_argument("-d", "--dataset", choices=sorted(DATASET_SPECS), required=True)
+    run.add_argument("-R", "--root", default=str(DEFAULT_ROOT))
+    run.add_argument("-e", "--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    run.add_argument("-o", "--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    run.add_argument("-p", "--probe", action="append", default=["logistic"],
                      choices=["logistic", "mlp1", "mlp2", "mlp3"])
-    run.add_argument("--repeats", type=int, default=3)
-    run.add_argument("--max-samples", type=int, default=5000)
-    run.add_argument("--full", action="store_true")
-    run.add_argument("--seed", type=int, default=42)
-    run.add_argument("--no-shuffle-control", action="store_true")
-    run.add_argument("--extract-if-missing", action="store_true")
-    run.add_argument("--no-plot", action="store_true", help="Skip generating plots.")
+    run.add_argument("-r", "--repeats", type=int, default=3)
+    run.add_argument("-n", "--max-samples", type=int, default=5000)
+    run.add_argument("-f", "--full", action="store_true")
+    run.add_argument("-s", "--seed", type=int, default=42)
+    run.add_argument("-S", "--no-shuffle-control", action="store_true")
+    run.add_argument("-x", "--extract-if-missing", action="store_true")
+    run.add_argument("-P", "--no-plot", action="store_true", help="Skip generating plots.")
+    run.add_argument("-h", "--help", action="store_true", help="Show run help")
 
-    # ----- audit -----
-    audit = sub.add_parser("audit", help="Audit an existing probe run without retraining.")
+    # models
+    models = sub.add_parser("models", aliases=["m"], help="List available models and their artifact status.", add_help=False)
+    models.add_argument("-h", "--help", action="store_true", help="Show models help")
+
+    # interactive
+    interactive = sub.add_parser("interactive", aliases=["i"], help="Launch the guided interface.", add_help=False)
+    interactive.add_argument("-h", "--help", action="store_true", help="Show interactive help")
+
+    # audit
+    audit = sub.add_parser("audit", aliases=["a"], help="Audit an existing probe run without retraining.", add_help=False)
     audit.add_argument("run_dir")
+    audit.add_argument("-h", "--help", action="store_true", help="Show audit help")
 
-    # ----- analyse (from light_Pipeline) -----
-    analyse = sub.add_parser("analyse", help="Generate visualisations from result CSV(s).")
-    analyse.add_argument("--input", "-i", action="append", required=True)
-    analyse.add_argument("--output-dir", "-o", default="./analysis_plots")
-
-    # ----- interactive -----
-    interactive = sub.add_parser("interactive", help="Launch the guided interface.")
+    # analyse
+    analyse = sub.add_parser("analyse", aliases=["an"], help="Generate visualisations from result CSV(s).", add_help=False)
+    analyse.add_argument("-i", "--input", action="append", required=True)
+    analyse.add_argument("-o", "--output-dir", default="./analysis_plots")
+    analyse.add_argument("-h", "--help", action="store_true", help="Show analyse help")
 
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point for the CLI."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # If no arguments or just '-h', show global rich help.
+    if not argv or (len(argv) == 1 and argv[0] in ("-h", "--help")):
+        parser = build_parser()
+        print_rich_help(parser)
+        return 0
+
+    # Pre‑parse scan: detect subcommand and help flag before argparse.
+    subcommand = None
+    for token in argv:
+        if not token.startswith('-'):
+            subcommand = token
+            break
+
+    help_requested = any(arg in ("-h", "--help") for arg in argv[1:])
+
+    if help_requested and subcommand:
+        # Map aliases to canonical command names.
+        alias_to_canonical = {
+            "r": "run",
+            "run": "run",
+            "m": "models",
+            "models": "models",
+            "i": "interactive",
+            "interactive": "interactive",
+            "a": "audit",
+            "audit": "audit",
+            "an": "analyse",
+            "analyse": "analyse",
+        }
+        canonical = alias_to_canonical.get(subcommand)
+
+        if canonical == "run":
+            print_rich_run_help()
+        elif canonical == "models":
+            print_rich_models_help()
+        elif canonical == "interactive":
+            print_rich_interactive_help()
+        elif canonical == "audit":
+            print_rich_audit_help()
+        elif canonical == "analyse":
+            print_rich_analyse_help()
+        else:
+            # Unknown command – fall back to global help.
+            parser = build_parser()
+            print_rich_help(parser)
+        return 0
+
+    # Normal argument parsing (required arguments will be enforced here).
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "interactive":
+    # Dispatch actual commands.
+    if args.command == "run":
+        probes = list(dict.fromkeys(args.probe))
+        try:
+            pipeline = EmotionProbePipeline(
+                model=args.model,
+                dataset=args.dataset,
+                root=args.root,
+                experiment_id=args.experiment_id,
+                output_dir=args.output_dir,
+                probes=probes,
+                repeats=args.repeats,
+                max_samples=None if args.full else args.max_samples,
+                seed=args.seed,
+                shuffled_label_control=not args.no_shuffle_control,
+            )
+            pipeline.run(
+                extract_if_missing=args.extract_if_missing,
+                generate_plots=not args.no_plot,
+            )
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+        return 0
+
+    elif args.command == "models":
+        list_available_models()
+        return 0
+
+    elif args.command == "interactive":
         InteractiveApp().run()
         return 0
 
-    if args.command == "audit":
+    elif args.command == "audit":
         report = audit_existing_run(args.run_dir)
         return 1 if report["status"] == "FAIL" else 0
 
-    if args.command == "analyse":
+    elif args.command == "analyse":
         csv_paths = [Path(p) for p in args.input]
         analyser = ResultAnalyser(Path(args.output_dir))
         df = analyser.load_csvs(csv_paths)
         analyser.generate_plots(df)
-        return 0
-
-    if args.command == "run":
-        probes = list(dict.fromkeys(args.probe))
-        pipeline = EmotionProbePipeline(
-            model=args.model,
-            dataset=args.dataset,
-            root=args.root,
-            experiment_id=args.experiment_id,
-            output_dir=args.output_dir,
-            probes=probes,
-            repeats=args.repeats,
-            max_samples=None if args.full else args.max_samples,
-            seed=args.seed,
-            shuffled_label_control=not args.no_shuffle_control,
-        )
-        pipeline.run(
-            extract_if_missing=args.extract_if_missing,
-            generate_plots=not args.no_plot,
-        )
         return 0
 
     parser.print_help()
@@ -2509,7 +2738,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 # ============================================================================
 # 15. Command usage documentation (appears in --help and as a comment)
