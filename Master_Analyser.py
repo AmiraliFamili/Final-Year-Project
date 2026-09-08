@@ -53,7 +53,8 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Iterable
+import random
 import torch
 import numpy as np
 import pandas as pd
@@ -68,6 +69,7 @@ try:
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
     from rich.text import Text
     from rich import box
+    from rich.align import Align
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
@@ -224,20 +226,165 @@ def resolve_model_name(raw: str) -> str:
     raise ValueError(f"Model '{raw}' not recognized. Valid names:\n{valid}")
 
 
+def compact(value: Any, limit: int = 240) -> str:
+    """Shorten a value for display."""
+    text = str(value).replace("\n", " ")
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 # ============================================================================
-# 3. Renderer (Rich or fallback)
+# 3. Renderer (Rich or fallback) – enhanced with dynamic palettes and menus
 # ============================================================================
 
 class Renderer:
-    """Handles all terminal output with optional Rich support."""
+    """Centralized presentation layer with dynamic colour palettes and rich components."""
+
+    # Hand-selected light foreground colours – fresh permutation per table.
+    LIGHT_COLORS = [
+        "#B8E7FF", "#C8F7DC", "#FFD6A5", "#E0C3FF", "#FFB7CE", "#BDE0FE",
+        "#CDEAC0", "#FFE5B4", "#D8D6FF", "#F6C6EA", "#C7F9E9", "#FDE2A7",
+        "#C9D9FF", "#D7F9F1", "#FFD1DC", "#E7D8FF", "#D4F1F4", "#F7D6E0",
+    ]
+    BACKGROUND_COLORS = [
+        "#18202A", "#1B2430", "#202735", "#20242E", "#192329", "#22212D",
+    ]
 
     def __init__(self, silent: bool = False):
         self.silent = silent
         self.console = None if silent else (Console() if RICH_AVAILABLE else None)
+        self._table_counter = 0
+        self._previous_palette: tuple[str, ...] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(not self.silent and RICH_AVAILABLE and self.console is not None)
+
+    def _palette(self, count: int) -> tuple[list[str], str, str]:
+        """Create a fresh visual identity for every table invocation."""
+        rng = random.SystemRandom()
+        for _ in range(12):
+            palette = tuple(rng.sample(self.LIGHT_COLORS, k=min(count, len(self.LIGHT_COLORS))))
+            if palette != self._previous_palette:
+                break
+        else:
+            palette = tuple(self.LIGHT_COLORS[i % len(self.LIGHT_COLORS)] for i in range(count))
+            if palette == self._previous_palette and count > 1:
+                palette = palette[1:] + palette[:1]
+        self._previous_palette = palette
+        self._table_counter += 1
+        return list(palette), rng.choice(self.BACKGROUND_COLORS), rng.choice(self.LIGHT_COLORS)
+
+    def panel(self, title: str, body: str, *, border: Optional[str] = None) -> None:
+        """Display a prominent panel."""
+        if not self.enabled:
+            return
+        border_colour = border or random.SystemRandom().choice(self.LIGHT_COLORS)
+        self.console.print(
+            Panel(
+                Align.center(Text(body, style="white")),
+                title=title,
+                title_align="center",
+                border_style=border_colour,
+                box=box.DOUBLE,
+                padding=(1, 2),
+            )
+        )
+
+    def table(self, title: str, columns: Sequence[str], rows: Iterable[Sequence[Any]],
+              *, caption: Optional[str] = None, max_width: int = 180, show_lines: bool = False) -> None:
+        """Display a table with dynamic column colours."""
+        if not self.enabled:
+            return
+        row_list = [list(row) for row in rows]
+        palette, background, title_colour = self._palette(len(columns))
+        table = Table(
+            title=Text(title, style=f"bold {title_colour}"),
+            box=box.ROUNDED,
+            border_style=title_colour,
+            header_style="bold white",
+            show_lines=show_lines,
+            expand=True,
+            padding=(0, 1),
+            width=min(max_width, self.console.width or max_width),
+        )
+        for i, column in enumerate(columns):
+            colour = palette[i % len(palette)]
+            table.add_column(
+                str(column),
+                style=colour,
+                header_style=f"bold {colour} on {background}",
+                overflow="fold",
+                no_wrap=False,
+            )
+        for row in row_list:
+            cells = []
+            for i, value in enumerate(row):
+                cells.append(Text(compact(str(value), 240), style=palette[i % len(palette)]))
+            table.add_row(*cells)
+        self.console.print(table)
+        if caption:
+            self.console.print(Text(caption, style=f"italic {title_colour}"))
+
+    def status(self, kind: str, message: str) -> None:
+        """Display a status message with icon and colour."""
+        if not self.enabled:
+            return
+        symbols = {"ok": "✓", "warn": "⚠", "error": "✗", "info": "◆"}
+        colours = {"ok": "#B7F7C7", "warn": "#FFE6A7", "error": "#FFB3C1", "info": "#B8E7FF"}
+        self.table(
+            "STATUS",
+            ["State", "Message"],
+            [[symbols.get(kind, "•"), message]],
+            show_lines=False,
+        )
+
+    def success(self, text: str) -> None:
+        self.status("ok", text)
+
+    def warning(self, text: str) -> None:
+        self.status("warn", text)
+
+    def error(self, text: str) -> None:
+        self.status("error", text)
+
+    def info(self, text: str) -> None:
+        self.status("info", text)
+
+    def menu(self, title: str, options: Sequence[tuple[str, str, str]], footer: str = "") -> None:
+        """Display an interactive menu with keys, actions, and shortcuts."""
+        if not self.enabled:
+            return
+        colours, background, title_colour = self._palette(max(3, min(3, len(options))))
+        table = Table(
+            title=Text(title, style=f"bold {title_colour}"),
+            box=box.HEAVY_HEAD,
+            border_style=title_colour,
+            show_header=True,
+            expand=True,
+        )
+        table.add_column("Key", style=colours[0], header_style=f"bold {colours[0]} on {background}", justify="center", width=8)
+        table.add_column("Action", style=colours[1], header_style=f"bold {colours[1]} on {background}")
+        table.add_column("Command / shortcut", style=colours[2], header_style=f"bold {colours[2]} on {background}")
+        for key, action, command in options:
+            table.add_row(Text(key, style=colours[0]), Text(action, style=colours[1]), Text(command, style=colours[2]))
+        self.console.print(table)
+        if footer:
+            self.console.print(Panel(Text(footer, style="#EAF4FF"), border_style=title_colour, box=box.ROUNDED))
+
+    def rule(self, title: str) -> None:
+        """Draw a horizontal rule with a title."""
+        if self.enabled and self.console:
+            self.console.rule(title)
+        else:
+            print("\n" + "-" * 80)
+            print(title)
+            print("-" * 80)
 
     def title(self, title: str, subtitle: str = "") -> None:
-        if self.silent: return
-        if self.console:
+        """Display a title panel (compatible with old code)."""
+        if self.silent:
+            return
+        if self.enabled and self.console:
             body = Text(subtitle) if subtitle else ""
             self.console.print(Panel(body, title=title, expand=False))
         else:
@@ -247,58 +394,18 @@ class Renderer:
                 print(subtitle)
             print("=" * 88)
 
-    def rule(self, title: str) -> None:
-        """Draw a horizontal rule with a title."""
-        if self.silent: return
-        if self.console:
-            self.console.rule(title)
-        else:
-            print("\n" + "-" * 80)
-            print(title)
-            print("-" * 80)
-
-    def info(self, text: str) -> None:
-        if self.silent: return
-        if self.console:
-            self.console.print(text)
-        else:
-            print(text)
-
-    def warning(self, text: str) -> None:
-        if self.silent: return
-        if self.console:
-            self.console.print(f"[yellow]WARNING[/yellow] {text}")
-        else:
-            print(f"WARNING: {text}")
-
-    def success(self, text: str) -> None:
-        if self.silent: return
-        if self.console:
-            self.console.print(f"[green]✓[/green] {text}")
-        else:
-            print(f"✓ {text}")
-
-    def error(self, text: str) -> None:
-        if self.silent: return
-        if self.console:
-            self.console.print(f"[red]✗[/red] {text}")
-        else:
-            print(f"ERROR: {text}")
-
     def progress(self, description: str, total: int):
         """Return a Rich progress bar if available, else None."""
-        if self.silent or not self.console:
+        if not self.enabled or not self.console:
             return None
-        if self.console:
-            return Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeRemainingColumn(),
-                console=self.console,
-            )
-        return None
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+        )
 
 
 # ============================================================================
@@ -731,6 +838,55 @@ class ProjectAnalyser:
             "inf_rows": inf_rows,
             "total_rows": len(df_all),
         }
+        
+        # ----  Master Comparison Table  ----
+        if not df_all.empty:
+            model_col = next((c for c in ["model", "model_name"] if c in df_all.columns), None)
+            dataset_col = next((c for c in ["dataset", "dataset_name"] if c in df_all.columns), None)
+            layer_col = next((c for c in ["layer", "layer_idx", "layer_index"] if c in df_all.columns), None)
+            probe_col = "probe" if "probe" in df_all.columns else None
+
+            if model_col and dataset_col and layer_col and probe_col:
+                # For each (model, dataset), pick the row with highest test_macro_f1
+                if "test_macro_f1" in df_all.columns:
+                    best_rows = df_all.loc[df_all.groupby([model_col, dataset_col])["test_macro_f1"].idxmax()]
+                    # Add parameter count from registry
+                    try:
+                        from Extraction import MODEL_BY_NAME
+                        best_rows["parameters_B"] = best_rows[model_col].apply(
+                            lambda m: MODEL_BY_NAME.get(m, None).parameter_billions if MODEL_BY_NAME.get(m) else None
+                        )
+                    except ImportError:
+                        best_rows["parameters_B"] = None
+
+                    # Select columns for master table
+                    master_cols = [model_col, dataset_col, layer_col, probe_col,
+                                "test_macro_f1", "test_mcc", "test_balanced_accuracy", "parameters_B"]
+                    # Keep only those that exist
+                    available_cols = [c for c in master_cols if c in best_rows.columns]
+                    master_table = best_rows[available_cols].sort_values([dataset_col, "test_macro_f1"],
+                                                                        ascending=[True, False])
+
+                    # Display with rich
+                    if RICH_AVAILABLE:
+                        table = Table(title="Master Comparison Table (best layer per model/dataset)", show_lines=True, box=box.HEAVY)
+                        for col in available_cols:
+                            style = "cyan" if col == model_col else "green" if col == dataset_col else "white"
+                            table.add_column(col, style=style)
+                        for _, row in master_table.iterrows():
+                            table.add_row(*[str(v) for v in row])
+                        self.renderer.console.print(table)
+                    else:
+                        print("\nMaster Comparison Table:")
+                        print(master_table.to_string(index=False))
+
+                    # Save to CSV
+                    master_csv = self.project_root / "master_comparison.csv"
+                    master_table.to_csv(master_csv, index=False)
+                    self.renderer.info(f"Master comparison table saved to {master_csv}")
+
+                    # Also store in report
+                    report["master_table"] = master_table.to_dict(orient="records")
 
         self._display_probe_summary(report, df_all, model_col, dataset_col, layer_col, primary_metric)
         self.probe_report = report
@@ -1519,7 +1675,7 @@ def discover_all_runs(root: Path = DEFAULT_ROOT, experiment_id: str = DEFAULT_EX
 
 
 def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer) -> None:
-    """Compare multiple completed runs by loading their result CSVs."""
+    """Compare multiple completed runs and generate a comprehensive visualisation dashboard."""
     frames = []
     for d in run_dirs:
         d = Path(d)
@@ -1535,78 +1691,511 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
 
         label = get_run_label(d)
         for csv_file in csv_files:
-            df = pd.read_csv(csv_file)
-            df["run"] = label
-            frames.append(df)
+            try:
+                df = pd.read_csv(csv_file)
+                df["run"] = label
+                df["run_path"] = str(d)
+                frames.append(df)
+            except Exception as e:
+                renderer.warning(f"Failed to read {csv_file}: {e}")
 
     if not frames:
         raise ValueError("No result CSV files found in provided run directories.")
 
+    # --- Combine with proper column handling ---
     combined = pd.concat(frames, ignore_index=True)
+    
+    # Fix fragmentation by creating a fresh DataFrame
+    combined = combined.copy()
+    
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save combined CSV
     combined.to_csv(output_dir / "combined_results.csv", index=False)
 
-    # Summary
-    summary = combined.groupby(["run", "probe"]).agg(
-        best_macro_f1=("test_macro_f1", "max"),
-        mean_macro_f1=("test_macro_f1", "mean"),
-        best_layer=("layer_index", lambda x: x[combined.loc[x.index, "test_macro_f1"].idxmax()] if len(x) else None)
-    ).reset_index()
+    # --- Ensure model and dataset columns exist ---
+    if "model" not in combined.columns:
+        combined["model"] = combined["run"].apply(
+            lambda x: "_".join(x.split("_")[:-2]) if "_" in x else x
+        )
+    if "dataset" not in combined.columns:
+        combined["dataset"] = combined["run"].apply(
+            lambda x: x.split("_")[-2] if "_" in x and len(x.split("_")) >= 2 else "unknown"
+        )
 
-    # Display summary
-    if RICH_AVAILABLE:
-        table = Table(title="Comparison Summary", show_lines=True, header_style="bold magenta")
-        table.add_column("Run", style="cyan", no_wrap=True)
-        table.add_column("Probe", style="green")
-        table.add_column("Best Macro-F1", justify="right")
-        table.add_column("Mean Macro-F1", justify="right")
-        table.add_column("Best Layer", justify="right")
-        for _, row in summary.iterrows():
-            table.add_row(
-                str(row["run"]),
-                str(row["probe"]),
-                f"{row['best_macro_f1']:.4f}",
-                f"{row['mean_macro_f1']:.4f}",
-                str(int(row["best_layer"])) if pd.notna(row["best_layer"]) else "",
-            )
-        renderer.console.print(table)
-    else:
-        print("\nComparison Summary:")
-        print(summary.to_string(index=False))
+    # --- Ensure required columns exist ---
+    has_model = "model" in combined.columns
+    has_dataset = "dataset" in combined.columns
+    has_run = "run" in combined.columns
+    has_layer = "layer_index" in combined.columns
+    has_probe = "probe" in combined.columns
+    has_mcc = "test_mcc" in combined.columns
+    has_accuracy = "test_balanced_accuracy" in combined.columns
+    has_macro_f1 = "test_macro_f1" in combined.columns
+    has_control = "control_macro_f1" in combined.columns
+    has_train_n = "train_n" in combined.columns
 
-    # Generate comparison plots if plotting available
-    if PLOTTING_AVAILABLE:
-        if "test_macro_f1" in combined.columns:
-            best_per_run_probe = combined.groupby(["run", "probe"])["test_macro_f1"].max().reset_index()
-            plt.figure(figsize=(10, 6))
-            sns.barplot(data=best_per_run_probe, x="run", y="test_macro_f1", hue="probe")
-            plt.title("Best Test Macro-F1 per Run and Probe")
-            plt.xticks(rotation=45, ha="right")
+    if not has_run:
+        renderer.error("No 'run' column found in data.")
+        return
+
+    # --- Model parameter mapping (fallback if Extraction not available) ---
+    MODEL_PARAMS = {
+        "google-bert/bert-base-uncased": 0.110,
+        "distilbert/distilbert-base-uncased": 0.066,
+        "FacebookAI/roberta-base": 0.125,
+        "google/electra-small-discriminator": 0.014,
+        "microsoft/deberta-v3-small": 0.140,
+        "gpt2": 0.124,
+        "EleutherAI/gpt-neo-125m": 0.125,
+        "facebook/opt-125m": 0.125,
+        "HuggingFaceTB/SmolLM2-135M": 0.135,
+        "HuggingFaceTB/SmolLM2-360M": 0.360,
+        "google/gemma-3-270m": 0.270,
+        "Qwen/Qwen2-0.5B": 0.500,
+        "Qwen/Qwen2.5-0.5B": 0.500,
+        "Qwen/Qwen3-0.6B-Base": 0.600,
+        "Qwen/Qwen2-1.5B": 1.500,
+        "Qwen/Qwen2.5-1.5B": 1.540,
+        "Qwen/Qwen2.5-3B": 3.090,
+        "Qwen/Qwen3-1.7B-Base": 1.700,
+        "HuggingFaceTB/SmolLM2-1.7B": 1.700,
+        "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T": 1.100,
+        "google/gemma-3-1b-pt": 1.000,
+        "meta-llama/Llama-3.2-1B": 1.000,
+        "Qwen/Qwen3-4B-Base": 4.000,
+        "meta-llama/Llama-3.2-3B": 3.000,
+        "google/gemma-3-4b-pt": 4.000,
+    }
+
+    def get_params(model_name: str) -> float:
+        """Return parameter count in billions."""
+        if model_name in MODEL_PARAMS:
+            return MODEL_PARAMS[model_name]
+        try:
+            from Extraction import MODEL_BY_NAME
+            spec = MODEL_BY_NAME.get(model_name)
+            if spec:
+                return spec.parameter_billions
+        except ImportError:
+            pass
+        return None
+
+    # --- Add parameters column if possible ---
+    if has_model:
+        combined["parameters_B"] = combined["model"].apply(get_params)
+
+    generated_plots = []
+    skipped_plots = []
+
+    # -------- VISUALISATION 1: Multi-Panel Performance Dashboard --------
+    if PLOTTING_AVAILABLE and has_macro_f1:
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+            fig.suptitle("Performance Dashboard", fontsize=16, fontweight='bold')
+
+            # Top-Left: Best Macro-F1 per Run (Bar Chart)
+            ax = axes[0, 0]
+            best_per_run = combined.groupby("run")["test_macro_f1"].max().sort_values(ascending=True).reset_index()
+            colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(best_per_run)))
+            bars = ax.barh(best_per_run["run"], best_per_run["test_macro_f1"], color=colors)
+            ax.set_xlabel("Best Macro-F1")
+            ax.set_title("Best Macro-F1 per Run")
+            ax.grid(alpha=0.3, axis='x')
+            for bar, val in zip(bars, best_per_run["test_macro_f1"]):
+                ax.text(val + 0.01, bar.get_y() + bar.get_height()/2, f"{val:.3f}", va='center', fontsize=8)
+
+            # Top-Right: Probe Performance Heatmap
+            ax = axes[0, 1]
+            if has_probe:
+                pivot = combined.groupby(["run", "probe"])["test_macro_f1"].max().unstack()
+                if not pivot.empty:
+                    sns.heatmap(pivot, annot=True, fmt=".3f", cmap="coolwarm", ax=ax, cbar_kws={"label": "Macro-F1"})
+                    ax.set_title("Macro-F1 by Run and Probe")
+                    ax.set_xlabel("Probe")
+                    ax.set_ylabel("Run")
+
+            # Bottom-Left: Model Performance Comparison
+            ax = axes[1, 0]
+            if has_model and has_probe:
+                model_pivot = combined.groupby(["model", "probe"])["test_macro_f1"].max().unstack()
+                if not model_pivot.empty:
+                    model_pivot.plot(kind="bar", ax=ax, colormap="viridis", legend=True)
+                    ax.set_title("Model Performance by Probe")
+                    ax.set_xlabel("Model")
+                    ax.set_ylabel("Macro-F1")
+                    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+                    ax.grid(alpha=0.3, axis='y')
+                    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+            # Bottom-Right: Performance Distribution (Boxplot)
+            ax = axes[1, 1]
+            runs = combined["run"].unique()
+            if len(runs) > 1:
+                data_to_plot = [combined[combined["run"] == r]["test_macro_f1"].dropna().values for r in runs]
+                bp = ax.boxplot(data_to_plot, labels=runs, patch_artist=True)
+                for patch, color in zip(bp['boxes'], plt.cm.plasma(np.linspace(0.2, 0.8, len(data_to_plot)))):
+                    patch.set_facecolor(color)
+                ax.set_title("Performance Distribution per Run")
+                ax.set_xlabel("Run")
+                ax.set_ylabel("Macro-F1")
+                ax.grid(alpha=0.3, axis='y')
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
             plt.tight_layout()
-            plt.savefig(output_dir / "comparison_best_macro_f1.png", dpi=240)
+            plt.savefig(output_dir / "01_dashboard.png", dpi=300, bbox_inches="tight")
             plt.close()
+            generated_plots.append("01_dashboard.png")
+        except Exception as e:
+            skipped_plots.append(f"01_dashboard.png ({str(e)})")
 
-        if "layer_index" in combined.columns and "probe" in combined.columns:
-            for probe in combined["probe"].unique():
-                plt.figure(figsize=(12, 6))
-                for run in combined["run"].unique():
-                    sub = combined[(combined["probe"] == probe) & (combined["run"] == run)]
-                    avg = sub.groupby("layer_index")["test_macro_f1"].mean().sort_index()
-                    plt.plot(avg.index, avg.values, marker="o", label=run)
-                plt.xlabel("Layer index")
-                plt.ylabel("Test Macro-F1")
-                plt.title(f"Layer-wise Macro-F1 for {probe} across runs")
-                plt.legend()
-                plt.grid(alpha=0.3)
+    # -------- VISUALISATION 2: Layer Curves with Confidence Bands --------
+    if PLOTTING_AVAILABLE and has_layer and has_macro_f1 and has_probe:
+        try:
+            probes = list(combined["probe"].unique())
+            if len(probes) > 4:
+                probes = ["linear_logistic", "mlp_1_hidden", "mlp_2_hidden", "mlp_3_hidden"]
+                probes = [p for p in probes if p in combined["probe"].unique()]
+
+            n_probes = len(probes)
+            if n_probes > 0:
+                fig, axes = plt.subplots(1, n_probes, figsize=(6*n_probes, 6))
+                if n_probes == 1:
+                    axes = [axes]
+
+                for idx, probe in enumerate(probes):
+                    ax = axes[idx]
+                    sub = combined[combined["probe"] == probe]
+                    runs = sub["run"].unique()
+
+                    for run in runs:
+                        run_data = sub[sub["run"] == run]
+                        grouped = run_data.groupby("layer_index")["test_macro_f1"].agg(["mean", "std", "count"])
+                        if not grouped.empty:
+                            ax.plot(grouped.index, grouped["mean"], marker='o', label=run, linewidth=2)
+                            ax.fill_between(grouped.index,
+                                            grouped["mean"] - grouped["std"],
+                                            grouped["mean"] + grouped["std"],
+                                            alpha=0.15)
+
+                    ax.set_title(f"{probe}", fontweight='bold')
+                    ax.set_xlabel("Layer Index")
+                    if idx == 0:
+                        ax.set_ylabel("Macro-F1")
+                    ax.grid(alpha=0.3)
+                    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+
+                fig.suptitle("Layer-wise Performance by Probe", fontsize=16, fontweight='bold')
                 plt.tight_layout()
-                safe_probe = probe.replace("/", "_").replace(" ", "_")
-                plt.savefig(output_dir / f"comparison_layer_curves_{safe_probe}.png", dpi=240)
+                plt.savefig(output_dir / "02_layer_curves_all_probes.png", dpi=300, bbox_inches="tight")
                 plt.close()
+                generated_plots.append("02_layer_curves_all_probes.png")
+        except Exception as e:
+            skipped_plots.append(f"02_layer_curves_all_probes.png ({str(e)})")
 
-    renderer.success(f"Comparison plots saved to {output_dir}")
+    # -------- VISUALISATION 3: Model vs Dataset Heatmap --------
+    if PLOTTING_AVAILABLE and has_model and has_dataset and has_macro_f1:
+        try:
+            pivot = combined.groupby(["model", "dataset"])["test_macro_f1"].max().unstack()
+            if not pivot.empty:
+                fig, ax = plt.subplots(figsize=(max(10, len(pivot.columns)*1.2), max(8, len(pivot.index)*0.6)))
+                sns.heatmap(pivot, annot=True, fmt=".3f", cmap="RdYlGn", center=0.5,
+                            linewidths=0.5, cbar_kws={"label": "Macro-F1"}, ax=ax)
+                ax.set_title("Model vs Dataset Performance", fontweight='bold')
+                plt.tight_layout()
+                plt.savefig(output_dir / "03_model_dataset_heatmap.png", dpi=300, bbox_inches="tight")
+                plt.close()
+                generated_plots.append("03_model_dataset_heatmap.png")
+        except Exception as e:
+            skipped_plots.append(f"03_model_dataset_heatmap.png ({str(e)})")
 
+    # -------- VISUALISATION 4: Parameter Count vs Performance --------
+    if PLOTTING_AVAILABLE and has_model and has_macro_f1:
+        try:
+            if "parameters_B" not in combined.columns:
+                combined["parameters_B"] = combined["model"].apply(get_params)
+            param_data = combined.dropna(subset=["parameters_B"])
+            if not param_data.empty:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                for probe in param_data["probe"].unique():
+                    sub = param_data[param_data["probe"] == probe]
+                    ax.scatter(sub["parameters_B"], sub["test_macro_f1"],
+                               label=probe, alpha=0.7, s=80)
+                ax.set_xlabel("Model Parameters (Billions)")
+                ax.set_ylabel("Macro-F1")
+                ax.set_title("Performance vs Model Size", fontweight='bold')
+                ax.legend()
+                ax.grid(alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(output_dir / "04_params_vs_performance.png", dpi=300, bbox_inches="tight")
+                plt.close()
+                generated_plots.append("04_params_vs_performance.png")
+        except Exception as e:
+            skipped_plots.append(f"04_params_vs_performance.png ({str(e)})")
+
+    # -------- VISUALISATION 5: Radar Chart --------
+    if PLOTTING_AVAILABLE and has_macro_f1:
+        try:
+            metrics = ["test_macro_f1"]
+            if has_mcc:
+                metrics.append("test_mcc")
+            if has_accuracy:
+                metrics.append("test_balanced_accuracy")
+
+            if len(metrics) >= 2:
+                fig, ax = plt.subplots(figsize=(10, 8), subplot_kw=dict(projection='polar'))
+                runs = combined["run"].unique()[:8]
+
+                for run in runs:
+                    run_data = combined[combined["run"] == run]
+                    values = []
+                    for metric in metrics:
+                        val = run_data[metric].max()
+                        values.append(val if not np.isnan(val) else 0)
+
+                    values += values[:1]
+                    angles = np.linspace(0, 2*np.pi, len(metrics), endpoint=False).tolist()
+                    angles += angles[:1]
+
+                    ax.plot(angles, values, 'o-', linewidth=2, label=run)
+                    ax.fill(angles, values, alpha=0.1)
+
+                ax.set_xticks(np.linspace(0, 2*np.pi, len(metrics), endpoint=False))
+                ax.set_xticklabels([m.replace("test_", "").replace("_", " ").title() for m in metrics])
+                ax.set_title("Multi-Metric Radar Comparison", fontweight='bold', pad=20)
+                ax.legend(bbox_to_anchor=(1.3, 1), loc="upper left")
+                plt.tight_layout()
+                plt.savefig(output_dir / "05_radar_chart.png", dpi=300, bbox_inches="tight")
+                plt.close()
+                generated_plots.append("05_radar_chart.png")
+        except Exception as e:
+            skipped_plots.append(f"05_radar_chart.png ({str(e)})")
+
+    # -------- VISUALISATION 6: Performance Ranking --------
+    if PLOTTING_AVAILABLE and has_macro_f1:
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ranking = combined.groupby("run")["test_macro_f1"].mean().sort_values(ascending=False).reset_index()
+            colors = plt.cm.RdYlGn(np.linspace(0.1, 0.9, len(ranking)))[::-1]
+            ax.bar(ranking["run"], ranking["test_macro_f1"], color=colors)
+            ax.set_xlabel("Run")
+            ax.set_ylabel("Mean Macro-F1")
+            ax.set_title("Performance Ranking (Mean Macro-F1)", fontweight='bold')
+            ax.grid(alpha=0.3, axis='y')
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            for i, (run, val) in enumerate(zip(ranking["run"], ranking["test_macro_f1"])):
+                ax.text(i, val + 0.01, f"{val:.3f}", ha='center', va='bottom', fontsize=8)
+            plt.tight_layout()
+            plt.savefig(output_dir / "06_performance_ranking.png", dpi=300, bbox_inches="tight")
+            plt.close()
+            generated_plots.append("06_performance_ranking.png")
+        except Exception as e:
+            skipped_plots.append(f"06_performance_ranking.png ({str(e)})")
+
+    # -------- VISUALISATION 7: True vs Shuffled Label --------
+    if PLOTTING_AVAILABLE and has_macro_f1 and has_control:
+        try:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            true = combined.groupby("run")["test_macro_f1"].mean().reset_index()
+            ctrl = combined.groupby("run")["control_macro_f1"].mean().reset_index()
+
+            x = np.arange(len(true))
+            width = 0.35
+
+            bars1 = ax.bar(x - width/2, true["test_macro_f1"], width, label='True Label', color='#2ecc71')
+            bars2 = ax.bar(x + width/2, ctrl["control_macro_f1"], width, label='Shuffled Label', color='#e74c3c')
+
+            ax.set_xlabel("Run")
+            ax.set_ylabel("Macro-F1")
+            ax.set_title("True vs Shuffled Label Control", fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(true["run"], rotation=45, ha='right')
+            ax.legend()
+            ax.grid(alpha=0.3, axis='y')
+            plt.tight_layout()
+            plt.savefig(output_dir / "07_true_vs_control.png", dpi=300, bbox_inches="tight")
+            plt.close()
+            generated_plots.append("07_true_vs_control.png")
+        except Exception as e:
+            skipped_plots.append(f"07_true_vs_control.png ({str(e)})")
+
+    # -------- VISUALISATION 8: Dataset Difficulty Comparison --------
+    if PLOTTING_AVAILABLE and has_dataset and has_macro_f1:
+        try:
+            datasets = combined["dataset"].unique()
+            if len(datasets) > 1:
+                fig, ax = plt.subplots(figsize=(12, 6))
+                for dataset in datasets:
+                    sub = combined[combined["dataset"] == dataset]
+                    means = sub.groupby("run")["test_macro_f1"].mean().sort_index()
+                    ax.plot(means.index, means.values, 'o-', label=dataset, linewidth=2, markersize=8)
+                ax.set_xlabel("Run")
+                ax.set_ylabel("Macro-F1")
+                ax.set_title("Performance by Dataset", fontweight='bold')
+                ax.legend()
+                ax.grid(alpha=0.3)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(output_dir / "08_dataset_comparison.png", dpi=300, bbox_inches="tight")
+                plt.close()
+                generated_plots.append("08_dataset_comparison.png")
+            else:
+                skipped_plots.append("08_dataset_comparison.png (only one dataset present - use bar chart instead)")
+        except Exception as e:
+            skipped_plots.append(f"08_dataset_comparison.png ({str(e)})")
+
+    # -------- VISUALISATION 9: Probe Architecture Comparison --------
+    if PLOTTING_AVAILABLE and has_probe and has_macro_f1:
+        try:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            probes = sorted(combined["probe"].unique())
+            x = np.arange(len(probes))
+            width = 0.8 / max(1, len(combined["run"].unique()))
+
+            for i, run in enumerate(sorted(combined["run"].unique())):
+                sub = combined[combined["run"] == run]
+                values = [sub[sub["probe"] == p]["test_macro_f1"].max() if p in sub["probe"].unique() else 0 for p in probes]
+                ax.bar(x + i*width - 0.4, values, width, label=run)
+
+            ax.set_xlabel("Probe Architecture")
+            ax.set_ylabel("Macro-F1")
+            ax.set_title("Probe Architecture Comparison", fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(probes, rotation=15)
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+            ax.grid(alpha=0.3, axis='y')
+            plt.tight_layout()
+            plt.savefig(output_dir / "09_probe_architecture.png", dpi=300, bbox_inches="tight")
+            plt.close()
+            generated_plots.append("09_probe_architecture.png")
+        except Exception as e:
+            skipped_plots.append(f"09_probe_architecture.png ({str(e)})")
+
+    # -------- VISUALISATION 10: Learning Saturation --------
+    if PLOTTING_AVAILABLE and has_train_n and has_macro_f1:
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for probe in combined["probe"].unique():
+                sub = combined[combined["probe"] == probe]
+                if not sub.empty:
+                    grouped = sub.groupby("train_n")["test_macro_f1"].agg(["mean", "std"]).reset_index()
+                    if not grouped.empty and len(grouped) > 1:
+                        ax.plot(grouped["train_n"], grouped["mean"], 'o-', label=probe, linewidth=2)
+                        ax.fill_between(grouped["train_n"],
+                                        grouped["mean"] - grouped["std"],
+                                        grouped["mean"] + grouped["std"],
+                                        alpha=0.15)
+            if ax.has_data():
+                ax.set_xlabel("Training Samples")
+                ax.set_ylabel("Macro-F1")
+                ax.set_title("Learning Saturation (Sample Size Effect)", fontweight='bold')
+                ax.legend()
+                ax.grid(alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(output_dir / "10_learning_saturation.png", dpi=300, bbox_inches="tight")
+                plt.close()
+                generated_plots.append("10_learning_saturation.png")
+        except Exception as e:
+            skipped_plots.append(f"10_learning_saturation.png ({str(e)})")
+
+    # -------- VISUALISATION 11: Best Layer Heatmap --------
+    if PLOTTING_AVAILABLE and has_layer and has_macro_f1:
+        try:
+            best_layers = []
+            for run in combined["run"].unique():
+                for probe in combined["probe"].unique():
+                    sub = combined[(combined["run"] == run) & (combined["probe"] == probe)]
+                    if not sub.empty:
+                        best_layer = sub.loc[sub["test_macro_f1"].idxmax()]["layer_index"]
+                        best_layers.append({"run": run, "probe": probe, "best_layer": best_layer})
+
+            if best_layers:
+                best_df = pd.DataFrame(best_layers)
+                pivot = best_df.pivot(index="run", columns="probe", values="best_layer")
+                if not pivot.empty:
+                    fig, ax = plt.subplots(figsize=(12, 6))
+                    sns.heatmap(pivot, annot=True, fmt=".0f", cmap="viridis", ax=ax,
+                                cbar_kws={"label": "Best Layer"})
+                    ax.set_title("Best Layer per Run and Probe", fontweight='bold')
+                    plt.tight_layout()
+                    plt.savefig(output_dir / "11_best_layer_heatmap.png", dpi=300, bbox_inches="tight")
+                    plt.close()
+                    generated_plots.append("11_best_layer_heatmap.png")
+        except Exception as e:
+            skipped_plots.append(f"11_best_layer_heatmap.png ({str(e)})")
+
+    # -------- Generate HTML Dashboard --------
+    # Build list of existing plots for the HTML
+    plot_files = [
+        "01_dashboard.png", "02_layer_curves_all_probes.png", "03_model_dataset_heatmap.png",
+        "04_params_vs_performance.png", "05_radar_chart.png", "06_performance_ranking.png",
+        "07_true_vs_control.png", "08_dataset_comparison.png", "09_probe_architecture.png",
+        "10_learning_saturation.png", "11_best_layer_heatmap.png"
+    ]
+    existing_plots = [f for f in plot_files if (output_dir / f).exists()]
+
+    html_content = f"""
+    <html>
+    <head><title>Comparison Dashboard</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
+        h1 {{ color: #2c3e50; text-align: center; }}
+        h2 {{ color: #34495e; margin-top: 30px; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+        .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+        .plot {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }}
+        .plot img {{ max-width: 100%; height: auto; }}
+        .full {{ grid-column: 1 / -1; }}
+        .footer {{ text-align: center; margin-top: 40px; color: #7f8c8d; font-size: 12px; }}
+        .skipped {{ color: #e67e22; font-style: italic; }}
+    </style>
+    </head>
+    <body>
+    <h1>🚀 Model Comparison Dashboard</h1>
+    <p style="text-align: center; color: #7f8c8d;">Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <p style="text-align: center;">{len(generated_plots)} of 11 plots generated</p>
+
+    <h2>📊 Performance Overview</h2>
+    <div class="grid">
+        <div class="plot"><img src="01_dashboard.png" alt="Dashboard"></div>
+        <div class="plot"><img src="06_performance_ranking.png" alt="Ranking"></div>
+    </div>
+
+    <h2>📈 Layer-wise Analysis</h2>
+    <div class="grid">
+        <div class="plot full"><img src="02_layer_curves_all_probes.png" alt="Layer Curves"></div>
+        <div class="plot"><img src="11_best_layer_heatmap.png" alt="Best Layer"></div>
+        <div class="plot"><img src="03_model_dataset_heatmap.png" alt="Model Dataset"></div>
+    </div>
+
+    <h2>🔬 Deep Analysis</h2>
+    <div class="grid">
+        <div class="plot"><img src="04_params_vs_performance.png" alt="Parameters"></div>
+        <div class="plot"><img src="05_radar_chart.png" alt="Radar"></div>
+        <div class="plot"><img src="07_true_vs_control.png" alt="Control"></div>
+        <div class="plot"><img src="08_dataset_comparison.png" alt="Dataset"></div>
+        <div class="plot"><img src="09_probe_architecture.png" alt="Probe"></div>
+        <div class="plot"><img src="10_learning_saturation.png" alt="Saturation"></div>
+    </div>
+
+    <div class="footer">
+        Generated by Master_Analyser.py v{MASTER_VERSION} | {len(combined)} combined records | {len(run_dirs)} runs
+    </div>
+    </body>
+    </html>
+    """
+
+    with open(output_dir / "comparison_dashboard.html", "w") as f:
+        f.write(html_content)
+
+    # ---- Report Results ----
+    if skipped_plots:
+        renderer.warning(f"The following plots were skipped ({len(skipped_plots)}):")
+        for s in skipped_plots:
+            renderer.warning(f"  ✗ {s}")
+
+    renderer.success(f"✅ Comparison dashboard saved to {output_dir}/comparison_dashboard.html")
+    renderer.info(f"📊 Generated {len(generated_plots)} of {len(plot_files)} visualisations.")
 
 # ============================================================================
 # 9. Model-based Comparison
@@ -1665,68 +2254,86 @@ def compare_models(model_a: str, model_b: str, root: Path, exp_id: str, output_d
 # 10. Interactive Mode
 # ============================================================================
 
+# ============================================================================
+# 10. Interactive Mode (enhanced with rich menu and prompt)
+# ============================================================================
+
 class InteractiveApp:
     """
-    Friendly terminal front‑end for the analyser.
-
-    Exposes a guided menu that asks for analysis type, filtering options,
-    and runs the selected analysis.
+    Friendly terminal front‑end with a rich interactive menu.
     """
 
     def __init__(self):
         self.renderer = Renderer()
 
-    def ask(self, prompt: str, default: str | None = None) -> str:
-        """Ask a question with an optional default."""
-        suffix = f" [{default}]" if default is not None else ""
-        value = input(f"{prompt}{suffix}: ").strip()
-        return value if value else (default or "")
-
-    def choose(self, title: str, options: Sequence[str]) -> str:
-        """Present a menu of options and return the selected one."""
-        print("\n" + title)
-        for i, option in enumerate(options, 1):
-            print(f"  {i}. {option}")
-
-        while True:
-            raw = input("Select: ").strip()
-            try:
-                idx = int(raw) - 1
-                if 0 <= idx < len(options):
-                    return options[idx]
-            except ValueError:
-                pass
-            print("Please select a valid number.")
+    def _prompt(self, message: str, default: str = "") -> str:
+        """Prompt the user with optional Rich Prompt if available."""
+        if RICH_AVAILABLE and self.renderer.enabled:
+            from rich.prompt import Prompt
+            return Prompt.ask(message, default=default)
+        else:
+            value = input(f"{message} [{default}]: ").strip()
+            return value or default
 
     def run(self) -> Dict[str, Any]:
-        """Launch the interactive session."""
-        self.renderer.title(
+        self.renderer.panel(
             "EMOTION PROBE LAB – ANALYSER",
-            "Guided analysis interface",
+            "Guided analysis interface with rich visualisation",
         )
 
-        # Analysis type
-        analysis_type = self.choose(
-            "What would you like to analyse?",
+        # Show main menu with options
+        self.renderer.menu(
+            "MAIN MENU",
             [
-                "Extraction health check (hidden states)",
-                "Probe results (CSV analysis)",
-                "Full analysis (both extraction and probes)",
-                "Compare multiple runs",
-                "Generate plots from probe results",
-                "Audit a specific run",
-                "List analysable runs",
-                "List models with artifact status",
-            ]
+                ("1", "Extraction health check (hidden states)", "extraction"),
+                ("2", "Probe results (CSV analysis)", "probes"),
+                ("3", "Full analysis (both extraction and probes)", "all"),
+                ("4", "Compare multiple runs", "compare"),
+                ("5", "Generate plots from probe results", "plots"),
+                ("6", "Audit a specific run", "audit"),
+                ("7", "List analysable runs", "list-runs"),
+                ("8", "List models with artifact status", "list-models"),
+                ("0", "Exit", "exit"),
+            ],
+            footer="Aliases: e=extraction, p=probes, a=all, c=compare, pl=plots, au=audit, l=list-runs, m=list-models, q=exit"
         )
 
-        # Common options
-        project_root = self.ask("Project root directory", ".")
-        result_root = self.ask("Result root directory", str(DEFAULT_ROOT))
-        exp_id = self.ask("Experiment ID", DEFAULT_EXPERIMENT_ID)
-        quiet = self.ask("Quiet mode? (y/n)", "n").lower() == "y"
+        choice = self._prompt("Select action", "0").lower().strip()
 
-        # Create analyser
+        # Map to analysis type
+        mapping = {
+            "1": "Extraction",
+            "2": "Probe",
+            "3": "Full",
+            "4": "Compare",
+            "5": "Generate plots",
+            "6": "Audit",
+            "7": "List analysable",
+            "8": "List models",
+            "0": "Exit",
+            "exit": "Exit",
+            "q": "Exit",
+            "e": "Extraction",
+            "p": "Probe",
+            "a": "Full",
+            "c": "Compare",
+            "pl": "Generate plots",
+            "au": "Audit",
+            "l": "List analysable",
+            "m": "List models",
+        }
+
+        analysis_type = mapping.get(choice)
+        if not analysis_type or analysis_type == "Exit":
+            self.renderer.success("Exiting.")
+            return {"status": "cancelled"}
+
+        # Gather common options
+        project_root = self._prompt("Project root directory", ".")
+        result_root = self._prompt("Result root directory", str(DEFAULT_ROOT))
+        exp_id = self._prompt("Experiment ID", DEFAULT_EXPERIMENT_ID)
+        quiet = self._prompt("Quiet mode? (y/n)", "n").lower() == "y"
+
         analyser = ProjectAnalyser(
             project_root=project_root,
             result_root=result_root,
@@ -1734,19 +2341,18 @@ class InteractiveApp:
             quiet=quiet,
         )
 
-        # Dispatch based on choice
-        if analysis_type.startswith("Extraction"):
+        # Dispatch
+        if analysis_type == "Extraction":
             analyser.analyse_extraction()
-        elif analysis_type.startswith("Probe"):
+        elif analysis_type == "Probe":
             analyser.analyse_probes()
-        elif analysis_type.startswith("Full"):
+        elif analysis_type == "Full":
             analyser.analyse_all()
-            html = self.ask("Save HTML report? (y/n)", "y").lower() == "y"
+            html = self._prompt("Save HTML report? (y/n)", "y").lower() == "y"
             if html:
-                output = self.ask("Output HTML file", "report.html")
+                output = self._prompt("Output HTML file", "report.html")
                 analyser.generate_report(output_html=output)
-        elif analysis_type.startswith("Compare"):
-            # Show available runs first
+        elif analysis_type == "Compare":
             list_analysable_runs(Path(result_root), exp_id)
             self.renderer.info("Enter the indices (space-separated) of the runs to compare, or paste the full paths:")
             raw_input = input("Runs: ").strip()
@@ -1755,14 +2361,12 @@ class InteractiveApp:
                 return {"status": "cancelled"}
 
             run_dirs = []
-            # Try to parse as indices first
             parts = raw_input.split()
             indices = []
             for p in parts:
                 if p.isdigit():
                     indices.append(int(p))
                 else:
-                    # Treat as raw path string (maybe garbage)
                     cleaned = clean_path_input(p)
                     run_dirs.extend(cleaned)
 
@@ -1775,7 +2379,6 @@ class InteractiveApp:
                         else:
                             self.renderer.warning(f"Index {idx} out of range.")
 
-            # If still empty, try to parse the entire raw input as paths
             if not run_dirs:
                 run_dirs = clean_path_input(raw_input)
 
@@ -1783,14 +2386,14 @@ class InteractiveApp:
                 self.renderer.error("No valid run directories provided.")
                 return {"status": "cancelled"}
 
-            output_dir = self.ask("Output directory for comparison plots", "./comparison_plots")
+            output_dir = self._prompt("Output directory for comparison plots", "./comparison_plots")
             compare_runs(run_dirs, Path(output_dir), analyser.renderer)
-        elif analysis_type.startswith("Generate plots"):
-            analyser.analyse_probes()  # ensure data loaded
-            output_dir = self.ask("Output directory for plots", "./analysis_plots")
+        elif analysis_type == "Generate plots":
+            analyser.analyse_probes()
+            output_dir = self._prompt("Output directory for plots", "./analysis_plots")
             analyser.generate_plots(Path(output_dir))
-        elif analysis_type.startswith("Audit"):
-            run_dir = self.ask("Run directory to audit")
+        elif analysis_type == "Audit":
+            run_dir = self._prompt("Run directory to audit")
             if not run_dir:
                 self.renderer.error("No run directory provided.")
                 return {"status": "cancelled"}
@@ -1801,9 +2404,9 @@ class InteractiveApp:
             )
             report = auditor.audit_trial(Path(run_dir))
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
-        elif analysis_type.startswith("List analysable"):
+        elif analysis_type == "List analysable":
             list_analysable_runs(Path(result_root), exp_id)
-        elif analysis_type.startswith("List models"):
+        elif analysis_type == "List models":
             list_available_models(Path(result_root), exp_id)
         else:
             self.renderer.warning("Unknown selection.")
@@ -1811,69 +2414,63 @@ class InteractiveApp:
         self.renderer.success("Analysis complete.")
         return {"status": "done"}
 
-
 # ============================================================================
 # 11. CLI
 # ============================================================================
 
+# ============================================================================
+# 11. CLI – Rich Help System
+# ============================================================================
+
 def build_parser():
+    """Build argument parser without automatic help."""
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("-h", "--help", action="store_true", help="Show help")
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", required=False)
 
     # extraction
-    ext = sub.add_parser("extraction", help="Analyse extraction outputs.", add_help=False)
+    ext = sub.add_parser("extraction", aliases=["e"], add_help=False)
     ext.add_argument("--model", help="Filter by model name (substring)")
     ext.add_argument("--dataset", help="Filter by dataset name (substring)")
-    ext.add_argument("-h", "--help", action="store_true", help="Show help")
 
     # probes
-    probes = sub.add_parser("probes", help="Analyse probe results.", add_help=False)
+    probes = sub.add_parser("probes", aliases=["p"], add_help=False)
     probes.add_argument("--model", help="Filter by model name (substring)")
     probes.add_argument("--dataset", help="Filter by dataset name (substring)")
-    probes.add_argument("-h", "--help", action="store_true", help="Show help")
 
     # all
-    all_cmd = sub.add_parser("all", aliases=["report"], help="Full analysis.", add_help=False)
+    all_cmd = sub.add_parser("all", aliases=["report", "a"], add_help=False)
     all_cmd.add_argument("--model", help="Filter by model name (substring)")
     all_cmd.add_argument("--dataset", help="Filter by dataset name (substring)")
     all_cmd.add_argument("--output-html", default="report.html", help="HTML report file")
-    all_cmd.add_argument("-h", "--help", action="store_true", help="Show help")
 
     # compare
-    compare = sub.add_parser("compare", help="Compare multiple runs or two models.", add_help=False)
+    compare = sub.add_parser("compare", aliases=["c"], add_help=False)
     compare.add_argument("run_dirs", nargs="*", help="Directories containing result CSVs.")
     compare.add_argument("-a", "--all", action="store_true", help="Compare all available runs.")
-    compare.add_argument("--model1", help="First model name to compare (e.g., 'BERT')")
-    compare.add_argument("--model2", help="Second model name to compare")
+    compare.add_argument("--models", nargs="+", help="Compare specific models (e.g., BERT GPT2 OPT).")
+    compare.add_argument("--datasets", nargs="+", help="Filter by dataset names (e.g., ISEAR goEmo).")
     compare.add_argument("-o", "--output-dir", default="./comparison_plots")
-    compare.add_argument("-h", "--help", action="store_true", help="Show help")
 
     # audit
-    audit = sub.add_parser("audit", help="Audit a specific run directory.", add_help=False)
+    audit = sub.add_parser("audit", aliases=["au"], add_help=False)
     audit.add_argument("run_dir", help="Run directory to audit.")
-    audit.add_argument("-h", "--help", action="store_true", help="Show help")
 
     # list-runs
-    list_runs = sub.add_parser("list-runs", help="List analysable runs.", add_help=False)
-    list_runs.add_argument("-h", "--help", action="store_true", help="Show help")
+    list_runs = sub.add_parser("list-runs", aliases=["l"], add_help=False)
 
     # list-models
-    list_models = sub.add_parser("list-models", help="List models with artifact status.", add_help=False)
-    list_models.add_argument("-h", "--help", action="store_true", help="Show help")
+    list_models = sub.add_parser("list-models", aliases=["m"], add_help=False)
 
     # plots
-    plots = sub.add_parser("plots", help="Generate plots from probe results.", add_help=False)
+    plots = sub.add_parser("plots", aliases=["pl"], add_help=False)
     plots.add_argument("--model", help="Filter by model name (substring)")
     plots.add_argument("--dataset", help="Filter by dataset name (substring)")
-    plots.add_argument("-o", "--output-dir", help="Output directory for plots.", default="./analysis_plots")
-    plots.add_argument("-h", "--help", action="store_true", help="Show help")
+    plots.add_argument("-o", "--output-dir", default="./analysis_plots")
 
     # interactive
-    interactive = sub.add_parser("interactive", help="Launch guided interactive mode.", add_help=False)
-    interactive.add_argument("-h", "--help", action="store_true", help="Show help")
+    interactive = sub.add_parser("interactive", aliases=["i"], add_help=False)
 
-    # Common options
+    # Common options for all subcommands
     for p in [ext, probes, all_cmd, plots, list_runs, list_models, interactive, audit, compare]:
         p.add_argument("--project-root", default=".", help="Path to Final-Year-Project")
         p.add_argument("--result-root", default=str(DEFAULT_ROOT), help="Path to hidden_states")
@@ -1881,6 +2478,89 @@ def build_parser():
         p.add_argument("--quiet", action="store_true", help="Suppress non-essential output")
 
     return parser
+
+
+def print_rich_help_general(renderer: Renderer):
+    """Display the main help as a rich panel with command list."""
+    renderer.panel(
+        "EMOTION PROBE LAB – ANALYSER",
+        "Unified analysis tool • rich visualisation • forensic auditing"
+    )
+    commands = [
+        ("extraction", "Analyse extraction artifacts (hidden states)", "e"),
+        ("probes", "Analyse probe result CSV files", "p"),
+        ("all", "Full analysis (both extraction and probes)", "a"),
+        ("compare", "Compare multiple runs or two models (--model1/--model2)", "c"),
+        ("audit", "Forensic audit of a run directory", "au"),
+        ("list-runs", "List analysable runs", "l"),
+        ("list-models", "List models with artifact status", "m"),
+        ("plots", "Generate plots from probe results", "pl"),
+        ("interactive", "Launch guided interactive mode", "i"),
+    ]
+    rows = []
+    for cmd, desc, alias in commands:
+        rows.append([cmd, desc, alias])
+    renderer.table(
+        "AVAILABLE COMMANDS",
+        ["Command", "Description", "Shortcut"],
+        rows,
+        caption="Use 'python Master_Analyser.py <command> --help' for detailed options."
+    )
+    # Global options
+    renderer.table(
+        "GLOBAL OPTIONS",
+        ["Option", "Description", "Default"],
+        [
+            ("--project-root", "Path to Final-Year-Project", "."),
+            ("--result-root", "Path to hidden_states", str(DEFAULT_ROOT)),
+            ("--exp-id", "Experiment ID", DEFAULT_EXPERIMENT_ID),
+            ("--quiet", "Suppress non-essential output", "False"),
+            ("--help", "Show this help", ""),
+        ]
+    )
+    renderer.success("For subcommand help, run: python Master_Analyser.py <command> --help")
+
+
+def print_rich_help_for_command(renderer: Renderer, command: str, subparser):
+    """Display detailed help for a specific command."""
+    renderer.panel(
+        f"COMMAND: {command.upper()}",
+        subparser.description or "No description provided."
+    )
+    # Gather options
+    rows = []
+    for action in subparser._actions:
+        if action.dest in ['command', 'help']:
+            continue
+        opts = ", ".join(action.option_strings) if action.option_strings else f"[{action.dest}]"
+        help_text = action.help or ""
+        default = getattr(action, 'default', None)
+        if default is not None:
+            help_text += f" (default: {default})"
+        rows.append([opts, help_text])
+    if rows:
+        renderer.table(
+            "OPTIONS",
+            ["Option", "Description"],
+            rows
+        )
+    else:
+        renderer.info("No additional options for this command.")
+    renderer.info("Example: python Master_Analyser.py " + command + " [options]")
+
+
+def print_rich_help(parser, command: Optional[str] = None):
+    """Dispatch to the appropriate help renderer."""
+    renderer = Renderer()
+    if command is None:
+        print_rich_help_general(renderer)
+    else:
+        subparsers = parser._subparsers._group_actions[0].choices
+        if command in subparsers:
+            print_rich_help_for_command(renderer, command, subparsers[command])
+        else:
+            renderer.error(f"Unknown command: {command}")
+            print_rich_help_general(renderer)
 
 
 def print_help(parser):
@@ -1906,11 +2586,24 @@ def print_help(parser):
 
 
 def main() -> int:
+    # Check for help request before parsing
+    if '-h' in sys.argv or '--help' in sys.argv:
+        parser = build_parser()
+        # Determine if a command is specified
+        for token in sys.argv[1:]:
+            if token not in ['-h', '--help'] and not token.startswith('-'):
+                command = token
+                break
+        else:
+            command = None
+        print_rich_help(parser, command)
+        return 0
+
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command is None or args.help:
-        print_help(parser)
+    if args.command is None:
+        print_rich_help(parser, None)
         return 0
 
     # Create analyser
@@ -1923,65 +2616,78 @@ def main() -> int:
         dataset_filter=getattr(args, "dataset", None),
     )
 
-    if args.command == "interactive":
-        app = InteractiveApp()
-        app.run()
-        return 0
-
-    if args.command == "extraction":
+    # Command dispatch with alias support
+    if args.command in ("extraction", "e"):
         analyser.analyse_extraction()
-    elif args.command == "probes":
+    elif args.command in ("probes", "p"):
         analyser.analyse_probes()
-    elif args.command in ("all", "report"):
+    elif args.command in ("all", "report", "a"):
         analyser.analyse_all()
         analyser.generate_report(output_html=getattr(args, "output_html", "report.html"))
-    elif args.command == "compare":
-        if args.model1 and args.model2:
-            # Resolve model names if needed
-            try:
-                model1 = resolve_model_name(args.model1)
-                model2 = resolve_model_name(args.model2)
-            except ValueError as e:
-                analyser.renderer.error(str(e))
-                return 1
-            compare_models(model1, model2, Path(args.result_root), args.exp_id,
-                           Path(args.output_dir), analyser.renderer)
-        elif args.all:
-            run_dirs = discover_all_runs(args.result_root, args.exp_id)
+    elif args.command in ("compare", "c"):
+        result_root = Path(args.result_root)
+        output_dir = Path(args.output_dir)
+        
+        if args.all:
+            run_dirs = discover_all_runs(result_root, args.exp_id)
             if not run_dirs:
                 analyser.renderer.error("No runs found.")
                 return 1
-            compare_runs(run_dirs, Path(args.output_dir), analyser.renderer)
+            compare_runs(run_dirs, output_dir, analyser.renderer)
+        elif args.models:
+            # Resolve model names and collect their run directories
+            model_names = [resolve_model_name(m) for m in args.models]
+            all_entries = get_analysable_entries(result_root, args.exp_id)
+            run_dirs = []
+            for entry in all_entries:
+                if entry["model"] in model_names:
+                    if args.datasets and entry["dataset"] not in args.datasets:
+                        continue
+                    run_dirs.append(Path(entry["path"]))
+            if not run_dirs:
+                analyser.renderer.error(f"No runs found for models: {model_names}")
+                return 1
+            analyser.renderer.info(f"Comparing {len(run_dirs)} runs for models: {model_names}")
+            compare_runs(run_dirs, output_dir, analyser.renderer)
         else:
             if not args.run_dirs:
-                analyser.renderer.error("No run directories or models provided.")
+                analyser.renderer.error("No run directories, models, or --all provided.")
                 return 1
-            # Also allow clean_path_input on each argument to handle garbage paths
             all_paths = []
             for arg in args.run_dirs:
                 cleaned = clean_path_input(arg)
                 if cleaned:
                     all_paths.extend(cleaned)
                 else:
-                    # Fallback to raw Path
                     all_paths.append(Path(arg))
-            compare_runs(all_paths, Path(args.output_dir), analyser.renderer)
-    elif args.command == "audit":
+            compare_runs(all_paths, output_dir, analyser.renderer)
+    elif args.command in ("audit", "au"):
         auditor = ForensicAuditor(
             root=Path(args.result_root) / "experiments" / args.exp_id,
             experiment_id=args.exp_id,
             renderer=analyser.renderer,
         )
         report = auditor.audit_trial(Path(args.run_dir))
+        analyser.renderer.panel("AUDIT REPORT", f"Run: {report['run_dir']}")
+        if report['errors']:
+            analyser.renderer.table("ERRORS", ["#", "Error"], [[i+1, e] for i, e in enumerate(report['errors'])], show_lines=True)
+        if report['warnings']:
+            analyser.renderer.table("WARNINGS", ["#", "Warning"], [[i+1, w] for i, w in enumerate(report['warnings'])], show_lines=True)
+        if report['checks']:
+            analyser.renderer.table("CHECKS", ["Check", "Status"], [[k, str(v)] for k, v in report['checks'].items()])
+        analyser.renderer.info(f"Status: {report['status']}")
         print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
-    elif args.command == "list-runs":
+    elif args.command in ("list-runs", "l"):
         list_analysable_runs(Path(args.result_root), args.exp_id)
-    elif args.command == "list-models":
+    elif args.command in ("list-models", "m"):
         list_available_models(Path(args.result_root), args.exp_id)
-    elif args.command == "plots":
+    elif args.command in ("plots", "pl"):
         if analyser.probe_report is None:
             analyser.analyse_probes()
         analyser.generate_plots(Path(args.output_dir))
+    elif args.command in ("interactive", "i"):
+        app = InteractiveApp()
+        app.run()
     else:
         parser.print_help()
         return 1
