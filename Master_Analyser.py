@@ -1702,45 +1702,55 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
     if not frames:
         raise ValueError("No result CSV files found in provided run directories.")
 
-    # --- Combine with proper column handling ---
     combined = pd.concat(frames, ignore_index=True)
-    
-    # Fix fragmentation by creating a fresh DataFrame
-    combined = combined.copy()
-    
+    combined = combined.copy()  # defragment
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save combined CSV
     combined.to_csv(output_dir / "combined_results.csv", index=False)
 
-    # --- Ensure model and dataset columns exist ---
+    # ---------- FIXED: Extract model and dataset from run label ----------
+    KNOWN_DATASETS = ["ISEAR", "goEmo", "GoEmotion"]
+
+    def extract_model_dataset(run_label: str) -> tuple:
+        parts = run_label.split("_")
+        # Find known dataset in parts
+        dataset = None
+        for part in parts:
+            if part in KNOWN_DATASETS:
+                dataset = part
+                break
+        if dataset:
+            idx = parts.index(dataset)
+            model = "_".join(parts[:idx])
+            # Clean model name: replace underscores with slashes for full HF names
+            # But keep as is for display; we'll map later
+            return model, dataset
+        else:
+            # Fallback: assume last part is hash, second last is dataset (but this may be wrong)
+            if len(parts) >= 2:
+                dataset = parts[-2]
+                model = "_".join(parts[:-2])
+                return model, dataset
+            return run_label, "unknown"
+
     if "model" not in combined.columns:
-        combined["model"] = combined["run"].apply(
-            lambda x: "_".join(x.split("_")[:-2]) if "_" in x else x
-        )
-    if "dataset" not in combined.columns:
-        combined["dataset"] = combined["run"].apply(
-            lambda x: x.split("_")[-2] if "_" in x and len(x.split("_")) >= 2 else "unknown"
-        )
+        extracted = combined["run"].apply(extract_model_dataset)
+        combined["model"] = extracted.apply(lambda x: x[0])
+        combined["dataset"] = extracted.apply(lambda x: x[1])
+    else:
+        # If model exists but dataset missing, derive dataset
+        if "dataset" not in combined.columns:
+            def extract_dataset(run_label):
+                parts = run_label.split("_")
+                for part in parts:
+                    if part in KNOWN_DATASETS:
+                        return part
+                return parts[-2] if len(parts) >= 2 else "unknown"
+            combined["dataset"] = combined["run"].apply(extract_dataset)
 
-    # --- Ensure required columns exist ---
-    has_model = "model" in combined.columns
-    has_dataset = "dataset" in combined.columns
-    has_run = "run" in combined.columns
-    has_layer = "layer_index" in combined.columns
-    has_probe = "probe" in combined.columns
-    has_mcc = "test_mcc" in combined.columns
-    has_accuracy = "test_balanced_accuracy" in combined.columns
-    has_macro_f1 = "test_macro_f1" in combined.columns
-    has_control = "control_macro_f1" in combined.columns
-    has_train_n = "train_n" in combined.columns
-
-    if not has_run:
-        renderer.error("No 'run' column found in data.")
-        return
-
-    # --- Model parameter mapping (fallback if Extraction not available) ---
+    # ---------- FIXED: Parameter extraction ----------
     MODEL_PARAMS = {
         "google-bert/bert-base-uncased": 0.110,
         "distilbert/distilbert-base-uncased": 0.066,
@@ -1770,32 +1780,76 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
     }
 
     def get_params(model_name: str) -> float:
-        """Return parameter count in billions."""
+        # Try exact match first
         if model_name in MODEL_PARAMS:
             return MODEL_PARAMS[model_name]
+        # Try replacing underscores with slashes (for HF names)
+        cleaned = model_name.replace("_", "/")
+        if cleaned in MODEL_PARAMS:
+            return MODEL_PARAMS[cleaned]
+        # Try Extraction import
         try:
             from Extraction import MODEL_BY_NAME
-            spec = MODEL_BY_NAME.get(model_name)
+            spec = MODEL_BY_NAME.get(model_name) or MODEL_BY_NAME.get(cleaned)
             if spec:
                 return spec.parameter_billions
         except ImportError:
             pass
+        # Heuristic: look for patterns like "1.5B", "135M", etc.
+        import re
+        # Try to find "X.XB" or "XB"
+        match = re.search(r'(\d+\.?\d*)(B|M)', model_name, re.IGNORECASE)
+        if match:
+            val = float(match.group(1))
+            if match.group(2).upper() == 'M':
+                val /= 1000
+            return val
+        # Common patterns
+        if "135M" in model_name: return 0.135
+        if "360M" in model_name: return 0.360
+        if "270M" in model_name: return 0.270
+        if "0.5B" in model_name: return 0.5
+        if "1.5B" in model_name: return 1.5
+        if "1.7B" in model_name: return 1.7
+        if "3B" in model_name: return 3.0
+        if "4B" in model_name: return 4.0
         return None
 
-    # --- Add parameters column if possible ---
-    if has_model:
-        combined["parameters_B"] = combined["model"].apply(get_params)
+    combined["parameters_B"] = combined["model"].apply(get_params)
+
+    # ---------- Check columns ----------
+    has_model = "model" in combined.columns
+    has_dataset = "dataset" in combined.columns
+    has_run = "run" in combined.columns
+    has_layer = "layer_index" in combined.columns
+    has_probe = "probe" in combined.columns
+    has_mcc = "test_mcc" in combined.columns
+    has_accuracy = "test_balanced_accuracy" in combined.columns
+    has_macro_f1 = "test_macro_f1" in combined.columns
+    has_control = "control_macro_f1" in combined.columns
+    has_train_n = "train_n" in combined.columns
+
+    if not has_run:
+        renderer.error("No 'run' column found in data.")
+        return
 
     generated_plots = []
     skipped_plots = []
 
-    # -------- VISUALISATION 1: Multi-Panel Performance Dashboard --------
+    # ---------- Helper to save individual dashboard panels ----------
+    def save_dashboard_panel(fig, filename, dpi=300):
+        fig.savefig(output_dir / filename, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        generated_plots.append(filename)
+
+    # -------- VISUALISATION 1: Dashboard (4 panels) --------
     if PLOTTING_AVAILABLE and has_macro_f1:
         try:
+            # Create the 4 subplots
             fig, axes = plt.subplots(2, 2, figsize=(16, 12))
             fig.suptitle("Performance Dashboard", fontsize=16, fontweight='bold')
 
-            # Top-Left: Best Macro-F1 per Run (Bar Chart)
+            # Panel 1: Best per run (bar)
             ax = axes[0, 0]
             best_per_run = combined.groupby("run")["test_macro_f1"].max().sort_values(ascending=True).reset_index()
             colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(best_per_run)))
@@ -1806,7 +1860,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
             for bar, val in zip(bars, best_per_run["test_macro_f1"]):
                 ax.text(val + 0.01, bar.get_y() + bar.get_height()/2, f"{val:.3f}", va='center', fontsize=8)
 
-            # Top-Right: Probe Performance Heatmap
+            # Panel 2: Probe heatmap
             ax = axes[0, 1]
             if has_probe:
                 pivot = combined.groupby(["run", "probe"])["test_macro_f1"].max().unstack()
@@ -1816,7 +1870,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                     ax.set_xlabel("Probe")
                     ax.set_ylabel("Run")
 
-            # Bottom-Left: Model Performance Comparison
+            # Panel 3: Model performance
             ax = axes[1, 0]
             if has_model and has_probe:
                 model_pivot = combined.groupby(["model", "probe"])["test_macro_f1"].max().unstack()
@@ -1829,12 +1883,16 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                     ax.grid(alpha=0.3, axis='y')
                     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
-            # Bottom-Right: Performance Distribution (Boxplot)
+            # Panel 4: Distribution boxplot
             ax = axes[1, 1]
             runs = combined["run"].unique()
             if len(runs) > 1:
                 data_to_plot = [combined[combined["run"] == r]["test_macro_f1"].dropna().values for r in runs]
-                bp = ax.boxplot(data_to_plot, labels=runs, patch_artist=True)
+                # Check matplotlib version for tick_labels vs labels
+                try:
+                    bp = ax.boxplot(data_to_plot, tick_labels=runs, patch_artist=True)
+                except TypeError:
+                    bp = ax.boxplot(data_to_plot, labels=runs, patch_artist=True)
                 for patch, color in zip(bp['boxes'], plt.cm.plasma(np.linspace(0.2, 0.8, len(data_to_plot)))):
                     patch.set_facecolor(color)
                 ax.set_title("Performance Distribution per Run")
@@ -1844,13 +1902,35 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                 plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
             plt.tight_layout()
-            plt.savefig(output_dir / "01_dashboard.png", dpi=300, bbox_inches="tight")
-            plt.close()
-            generated_plots.append("01_dashboard.png")
-        except Exception as e:
-            skipped_plots.append(f"01_dashboard.png ({str(e)})")
+            save_dashboard_panel(fig, "01_dashboard.png")
 
-    # -------- VISUALISATION 2: Layer Curves with Confidence Bands --------
+            # Also save each panel separately for clarity
+            # Panel 1: best per run
+            fig1, ax1 = plt.subplots(figsize=(10, 6))
+            colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(best_per_run)))
+            bars = ax1.barh(best_per_run["run"], best_per_run["test_macro_f1"], color=colors)
+            ax1.set_xlabel("Best Macro-F1")
+            ax1.set_title("Best Macro-F1 per Run")
+            ax1.grid(alpha=0.3, axis='x')
+            for bar, val in zip(bars, best_per_run["test_macro_f1"]):
+                ax1.text(val + 0.01, bar.get_y() + bar.get_height()/2, f"{val:.3f}", va='center', fontsize=8)
+            plt.tight_layout()
+            save_dashboard_panel(fig1, "01a_best_per_run.png")
+
+            # Panel 2: probe heatmap
+            if has_probe:
+                pivot = combined.groupby(["run", "probe"])["test_macro_f1"].max().unstack()
+                if not pivot.empty:
+                    fig2, ax2 = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(pivot, annot=True, fmt=".3f", cmap="coolwarm", ax=ax2, cbar_kws={"label": "Macro-F1"})
+                    ax2.set_title("Macro-F1 by Run and Probe")
+                    plt.tight_layout()
+                    save_dashboard_panel(fig2, "01b_probe_heatmap.png")
+
+        except Exception as e:
+            skipped_plots.append(f"Dashboard plots: {str(e)}")
+
+    # -------- VISUALISATION 2: Layer Curves --------
     if PLOTTING_AVAILABLE and has_layer and has_macro_f1 and has_probe:
         try:
             probes = list(combined["probe"].unique())
@@ -1888,35 +1968,38 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
 
                 fig.suptitle("Layer-wise Performance by Probe", fontsize=16, fontweight='bold')
                 plt.tight_layout()
-                plt.savefig(output_dir / "02_layer_curves_all_probes.png", dpi=300, bbox_inches="tight")
-                plt.close()
-                generated_plots.append("02_layer_curves_all_probes.png")
+                save_dashboard_panel(fig, "02_layer_curves_all_probes.png")
         except Exception as e:
             skipped_plots.append(f"02_layer_curves_all_probes.png ({str(e)})")
 
-    # -------- VISUALISATION 3: Model vs Dataset Heatmap --------
+    # -------- VISUALISATION 3: Model vs Dataset Heatmap (FIXED) --------
     if PLOTTING_AVAILABLE and has_model and has_dataset and has_macro_f1:
         try:
-            pivot = combined.groupby(["model", "dataset"])["test_macro_f1"].max().unstack()
+            # Ensure we use correct dataset names
+            dataset_col = "dataset"
+            # Filter out rows with unknown dataset
+            valid = combined[combined[dataset_col].isin(KNOWN_DATASETS)]
+            if valid.empty:
+                valid = combined  # fallback
+
+            pivot = valid.groupby(["model", dataset_col])["test_macro_f1"].max().unstack()
             if not pivot.empty:
+                # Sort columns for consistency
+                pivot = pivot.reindex(sorted(pivot.columns, key=lambda x: 0 if x == "ISEAR" else 1 if x == "goEmo" else 2), axis=1)
                 fig, ax = plt.subplots(figsize=(max(10, len(pivot.columns)*1.2), max(8, len(pivot.index)*0.6)))
                 sns.heatmap(pivot, annot=True, fmt=".3f", cmap="RdYlGn", center=0.5,
                             linewidths=0.5, cbar_kws={"label": "Macro-F1"}, ax=ax)
                 ax.set_title("Model vs Dataset Performance", fontweight='bold')
                 plt.tight_layout()
-                plt.savefig(output_dir / "03_model_dataset_heatmap.png", dpi=300, bbox_inches="tight")
-                plt.close()
-                generated_plots.append("03_model_dataset_heatmap.png")
+                save_dashboard_panel(fig, "03_model_dataset_heatmap.png")
         except Exception as e:
             skipped_plots.append(f"03_model_dataset_heatmap.png ({str(e)})")
 
-    # -------- VISUALISATION 4: Parameter Count vs Performance --------
+    # -------- VISUALISATION 4: Parameter Count vs Performance (FIXED) --------
     if PLOTTING_AVAILABLE and has_model and has_macro_f1:
         try:
-            if "parameters_B" not in combined.columns:
-                combined["parameters_B"] = combined["model"].apply(get_params)
             param_data = combined.dropna(subset=["parameters_B"])
-            if not param_data.empty:
+            if not param_data.empty and len(param_data["parameters_B"].unique()) > 1:
                 fig, ax = plt.subplots(figsize=(10, 6))
                 for probe in param_data["probe"].unique():
                     sub = param_data[param_data["probe"] == probe]
@@ -1928,9 +2011,9 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                 ax.legend()
                 ax.grid(alpha=0.3)
                 plt.tight_layout()
-                plt.savefig(output_dir / "04_params_vs_performance.png", dpi=300, bbox_inches="tight")
-                plt.close()
-                generated_plots.append("04_params_vs_performance.png")
+                save_dashboard_panel(fig, "04_params_vs_performance.png")
+            else:
+                skipped_plots.append("04_params_vs_performance.png (insufficient parameter data or only one model size)")
         except Exception as e:
             skipped_plots.append(f"04_params_vs_performance.png ({str(e)})")
 
@@ -1966,9 +2049,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                 ax.set_title("Multi-Metric Radar Comparison", fontweight='bold', pad=20)
                 ax.legend(bbox_to_anchor=(1.3, 1), loc="upper left")
                 plt.tight_layout()
-                plt.savefig(output_dir / "05_radar_chart.png", dpi=300, bbox_inches="tight")
-                plt.close()
-                generated_plots.append("05_radar_chart.png")
+                save_dashboard_panel(fig, "05_radar_chart.png")
         except Exception as e:
             skipped_plots.append(f"05_radar_chart.png ({str(e)})")
 
@@ -1987,9 +2068,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
             for i, (run, val) in enumerate(zip(ranking["run"], ranking["test_macro_f1"])):
                 ax.text(i, val + 0.01, f"{val:.3f}", ha='center', va='bottom', fontsize=8)
             plt.tight_layout()
-            plt.savefig(output_dir / "06_performance_ranking.png", dpi=300, bbox_inches="tight")
-            plt.close()
-            generated_plots.append("06_performance_ranking.png")
+            save_dashboard_panel(fig, "06_performance_ranking.png")
         except Exception as e:
             skipped_plots.append(f"06_performance_ranking.png ({str(e)})")
 
@@ -2014,20 +2093,21 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
             ax.legend()
             ax.grid(alpha=0.3, axis='y')
             plt.tight_layout()
-            plt.savefig(output_dir / "07_true_vs_control.png", dpi=300, bbox_inches="tight")
-            plt.close()
-            generated_plots.append("07_true_vs_control.png")
+            save_dashboard_panel(fig, "07_true_vs_control.png")
         except Exception as e:
             skipped_plots.append(f"07_true_vs_control.png ({str(e)})")
 
-    # -------- VISUALISATION 8: Dataset Difficulty Comparison --------
+    # -------- VISUALISATION 8: Dataset Difficulty Comparison (FIXED) --------
     if PLOTTING_AVAILABLE and has_dataset and has_macro_f1:
         try:
-            datasets = combined["dataset"].unique()
+            valid = combined[combined["dataset"].isin(KNOWN_DATASETS)]
+            if valid.empty:
+                valid = combined
+            datasets = valid["dataset"].unique()
             if len(datasets) > 1:
                 fig, ax = plt.subplots(figsize=(12, 6))
-                for dataset in datasets:
-                    sub = combined[combined["dataset"] == dataset]
+                for dataset in sorted(datasets):
+                    sub = valid[valid["dataset"] == dataset]
                     means = sub.groupby("run")["test_macro_f1"].mean().sort_index()
                     ax.plot(means.index, means.values, 'o-', label=dataset, linewidth=2, markersize=8)
                 ax.set_xlabel("Run")
@@ -2037,9 +2117,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                 ax.grid(alpha=0.3)
                 plt.xticks(rotation=45, ha='right')
                 plt.tight_layout()
-                plt.savefig(output_dir / "08_dataset_comparison.png", dpi=300, bbox_inches="tight")
-                plt.close()
-                generated_plots.append("08_dataset_comparison.png")
+                save_dashboard_panel(fig, "08_dataset_comparison.png")
             else:
                 skipped_plots.append("08_dataset_comparison.png (only one dataset present - use bar chart instead)")
         except Exception as e:
@@ -2066,9 +2144,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
             ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
             ax.grid(alpha=0.3, axis='y')
             plt.tight_layout()
-            plt.savefig(output_dir / "09_probe_architecture.png", dpi=300, bbox_inches="tight")
-            plt.close()
-            generated_plots.append("09_probe_architecture.png")
+            save_dashboard_panel(fig, "09_probe_architecture.png")
         except Exception as e:
             skipped_plots.append(f"09_probe_architecture.png ({str(e)})")
 
@@ -2076,6 +2152,7 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
     if PLOTTING_AVAILABLE and has_train_n and has_macro_f1:
         try:
             fig, ax = plt.subplots(figsize=(10, 6))
+            has_data = False
             for probe in combined["probe"].unique():
                 sub = combined[combined["probe"] == probe]
                 if not sub.empty:
@@ -2086,16 +2163,17 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                                         grouped["mean"] - grouped["std"],
                                         grouped["mean"] + grouped["std"],
                                         alpha=0.15)
-            if ax.has_data():
+                        has_data = True
+            if has_data:
                 ax.set_xlabel("Training Samples")
                 ax.set_ylabel("Macro-F1")
                 ax.set_title("Learning Saturation (Sample Size Effect)", fontweight='bold')
                 ax.legend()
                 ax.grid(alpha=0.3)
                 plt.tight_layout()
-                plt.savefig(output_dir / "10_learning_saturation.png", dpi=300, bbox_inches="tight")
-                plt.close()
-                generated_plots.append("10_learning_saturation.png")
+                save_dashboard_panel(fig, "10_learning_saturation.png")
+            else:
+                skipped_plots.append("10_learning_saturation.png (no multiple sample sizes)")
         except Exception as e:
             skipped_plots.append(f"10_learning_saturation.png ({str(e)})")
 
@@ -2119,16 +2197,63 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
                                 cbar_kws={"label": "Best Layer"})
                     ax.set_title("Best Layer per Run and Probe", fontweight='bold')
                     plt.tight_layout()
-                    plt.savefig(output_dir / "11_best_layer_heatmap.png", dpi=300, bbox_inches="tight")
-                    plt.close()
-                    generated_plots.append("11_best_layer_heatmap.png")
+                    save_dashboard_panel(fig, "11_best_layer_heatmap.png")
         except Exception as e:
             skipped_plots.append(f"11_best_layer_heatmap.png ({str(e)})")
+            
+        # -------- VISUALISATION 12: Per-Model Layer-wise Plots --------
+    if PLOTTING_AVAILABLE and has_layer and has_macro_f1 and has_model:
+        try:
+            # Create subfolder
+            layer_dir = output_dir / "layer_wise_scores"
+            layer_dir.mkdir(parents=True, exist_ok=True)
+
+            # Group by model, dataset, probe, layer
+            grouped = combined.groupby(["model", "dataset", "probe", "layer_index"])["test_macro_f1"].agg(["mean", "std", "count"]).reset_index()
+
+            # For each model+dataset, create one plot
+            for (model, dataset), sub in grouped.groupby(["model", "dataset"]):
+                # Skip if insufficient data
+                if sub.empty:
+                    continue
+                fig, ax = plt.subplots(figsize=(10, 6))
+                probes = sub["probe"].unique()
+                for probe in probes:
+                    data = sub[sub["probe"] == probe].sort_values("layer_index")
+                    if len(data) < 2:
+                        continue
+                    ax.plot(data["layer_index"], data["mean"], marker='o', label=probe, linewidth=2)
+                    ax.fill_between(data["layer_index"],
+                                    data["mean"] - data["std"],
+                                    data["mean"] + data["std"],
+                                    alpha=0.15)
+                ax.set_xlabel("Layer Index")
+                ax.set_ylabel("Macro-F1")
+                ax.set_title(f"{model} – {dataset} (layer‑wise performance)")
+                ax.legend()
+                ax.grid(alpha=0.3)
+                # Safe filenames
+                safe_model = model.replace("/", "_").replace(" ", "_")
+                safe_dataset = dataset.replace("/", "_")
+                filename = f"{safe_model}_{safe_dataset}.png"
+                plt.tight_layout()
+                plt.savefig(layer_dir / filename, dpi=300, bbox_inches="tight")
+                plt.close()
+                generated_plots.append(f"layer_wise_scores/{filename}")
+
+            # Also create a combined heatmap of best layer per model/dataset/probe
+            # (optional) – we already have best_layer_heatmap (plot 11) which is similar,
+            # but we could add a heatmap of per‑layer accuracy averaged across probes.
+            # We'll skip that for brevity, but you can add it.
+
+            renderer.info(f"📂 Saved {len(generated_plots)} layer‑wise plots in {layer_dir}")
+        except Exception as e:
+            skipped_plots.append(f"layer_wise_scores/ : {str(e)}")
 
     # -------- Generate HTML Dashboard --------
-    # Build list of existing plots for the HTML
     plot_files = [
-        "01_dashboard.png", "02_layer_curves_all_probes.png", "03_model_dataset_heatmap.png",
+        "01_dashboard.png", "01a_best_per_run.png", "01b_probe_heatmap.png",
+        "02_layer_curves_all_probes.png", "03_model_dataset_heatmap.png",
         "04_params_vs_performance.png", "05_radar_chart.png", "06_performance_ranking.png",
         "07_true_vs_control.png", "08_dataset_comparison.png", "09_probe_architecture.png",
         "10_learning_saturation.png", "11_best_layer_heatmap.png"
@@ -2147,18 +2272,19 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
         .plot img {{ max-width: 100%; height: auto; }}
         .full {{ grid-column: 1 / -1; }}
         .footer {{ text-align: center; margin-top: 40px; color: #7f8c8d; font-size: 12px; }}
-        .skipped {{ color: #e67e22; font-style: italic; }}
     </style>
     </head>
     <body>
     <h1>🚀 Model Comparison Dashboard</h1>
     <p style="text-align: center; color: #7f8c8d;">Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
-    <p style="text-align: center;">{len(generated_plots)} of 11 plots generated</p>
+    <p style="text-align: center;">{len(generated_plots)} of {len(plot_files)} plots generated</p>
 
     <h2>📊 Performance Overview</h2>
     <div class="grid">
         <div class="plot"><img src="01_dashboard.png" alt="Dashboard"></div>
         <div class="plot"><img src="06_performance_ranking.png" alt="Ranking"></div>
+        <div class="plot"><img src="01a_best_per_run.png" alt="Best per run"></div>
+        <div class="plot"><img src="01b_probe_heatmap.png" alt="Probe heatmap"></div>
     </div>
 
     <h2>📈 Layer-wise Analysis</h2>
@@ -2177,6 +2303,15 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
         <div class="plot"><img src="09_probe_architecture.png" alt="Probe"></div>
         <div class="plot"><img src="10_learning_saturation.png" alt="Saturation"></div>
     </div>
+    <h2>📊 Layer‑wise per Model</h2>
+    <div class="grid">
+        <div class="plot full">
+            <p style="text-align: center;">
+                <a href="layer_wise_scores/index.html" target="_blank">View all layer‑wise plots</a>
+                ({{ len(layer_plots) }} images)
+            </p>
+        </div>
+    </div>
 
     <div class="footer">
         Generated by Master_Analyser.py v{MASTER_VERSION} | {len(combined)} combined records | {len(run_dirs)} runs
@@ -2187,16 +2322,29 @@ def compare_runs(run_dirs: Sequence[Path], output_dir: Path, renderer: Renderer)
 
     with open(output_dir / "comparison_dashboard.html", "w") as f:
         f.write(html_content)
+    
+    # Generate a simple index.html inside layer_wise_scores
+    with open(layer_dir / "index.html", "w") as f:
+        f.write("<html><head><title>Layer-wise Plots</title>")
+        f.write("<style>body{font-family:sans-serif;margin:20px;} .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;} .plot{border:1px solid #ddd;padding:10px;border-radius:8px;}</style>")
+        f.write("</head><body><h1>Layer‑wise Performance per Model</h1><div class='grid'>")
+        for p in generated_plots:
+            if p.startswith("layer_wise_scores/") and p.endswith(".png"):
+                f.write(f"<div class='plot'><img src='{p.split('/')[-1]}' style='max-width:100%;'><p>{p.split('/')[-1]}</p></div>")
+        f.write("</div></body></html>")
 
-    # ---- Report Results ----
-    if skipped_plots:
-        renderer.warning(f"The following plots were skipped ({len(skipped_plots)}):")
-        for s in skipped_plots:
-            renderer.warning(f"  ✗ {s}")
+    
+    # ---- Report Results ---- # -------- Count generated plots --------
+    main_plots = [f for f in generated_plots if not f.startswith("layer_wise_scores/")]
+    layer_plots = [f for f in generated_plots if f.startswith("layer_wise_scores/")]
 
     renderer.success(f"✅ Comparison dashboard saved to {output_dir}/comparison_dashboard.html")
-    renderer.info(f"📊 Generated {len(generated_plots)} of {len(plot_files)} visualisations.")
+    renderer.info(f"📊 Generated {len(main_plots)} main visualisations and {len(layer_plots)} layer‑wise plots.")
 
+    if skipped_plots:
+        renderer.warning(f"Skipped {len(skipped_plots)} plot(s):")
+        for s in skipped_plots:
+            renderer.warning(f"  ✗ {s}")
 # ============================================================================
 # 9. Model-based Comparison
 # ============================================================================

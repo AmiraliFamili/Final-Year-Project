@@ -1,43 +1,71 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MASTER DATASET PROCESSOR v4
+MASTER DATASET PROCESSOR v5
 ===========================
 
 A research-grade, dataset-agnostic preprocessing and target-independent
 sentiment scoring laboratory.
 
-Design goals
+DESIGN GOALS
 ------------
-* Accept local files, HTTP(S) dataset links, and optional ``hf://`` datasets.
-* Detect text and target columns conservatively, with explicit overrides.
-* Canonicalise EVERY label into the same list representation.
-* Preserve Unicode and semantic text rather than applying destructive ASCII
-  filtering.
-* Produce exactly three canonical fields:
-      clean_text, label, sentiment_score
-* Compute sentiment independently from target labels.
-* Use native PyTorch inference for transformer sentiment scoring.
-* Degrade gracefully when an incompatible Transformers/PyTorch environment
-  is installed instead of emitting misleading ``torch is not defined`` errors.
-* Provide deeply diagnostic profiling and strict validation.
-* Use a fresh colour palette for every Rich table invocation and a distinct
-  colour for every table column, with intentionally light text.
-* Provide a visual command-line help system supporting ``-h``, ``--help`` and
-  the requested convenience alias ``-help``.
-* Provide dedicated command help pages.
-* Provide a persistent interactive laboratory rather than a one-shot menu.
-* Write machine-readable manifests for provenance and reproducibility.
+- Accept local files, HTTP(S) dataset links, and ``hf://`` Hugging Face datasets.
+- Detect text and target columns conservatively, with explicit overrides.
+- Canonicalise EVERY label into a list representation (single → [27], multi → [6,22]).
+- Preserve Unicode and semantic text (no destructive ASCII filtering).
+- Output exactly three canonical fields: clean_text, label, sentiment_score.
+- Compute sentiment independently from target labels.
+- Use native PyTorch inference for transformer sentiment scoring.
+- Provide deeply diagnostic profiling and strict validation.
+- Offer a unified CLI with rich visual output (using ``rich`` if installed).
+- Provide a persistent interactive laboratory.
 
-Canonical label contract
+CANONICAL LABEL CONTRACT
 ------------------------
-In memory, ``label`` is ALWAYS a Python ``list``. Single labels are therefore
-represented as ``[27]`` rather than ``27``. Multi-label rows are ``[6, 22]``.
-For text labels the analogous representations are ``["joy"]`` and
-``["joy", "excitement"]``.
+In memory, ``label`` is ALWAYS a Python ``list``. Single labels are represented
+as ``[27]``; multi-label rows as ``[6, 22]``. For text labels, analogous
+representations are ``["joy"]`` and ``["joy", "excitement"]``.
 
-CSV output serialises these lists as JSON strings, e.g. ``[27]`` or
-``[6, 22]``, so every saved row has exactly the same representation.
+CSV output serialises these lists as JSON strings, e.g. ``[27]`` or ``[6, 22]``.
+
+SUPPORTED DATASETS (with official sources)
+------------------------------------------
+1. GoEmotions       : https://github.com/google-research/google-research/tree/master/goemotions
+2. ISEAR            : https://www.unige.ch/cisa/research/materials-and-online-research/research-material/
+3. EmpatheticDialogues : https://github.com/facebookresearch/EmpatheticDialogues
+4. EmoBank          : https://github.com/JULIELab/EmoBank
+
+All can be loaded via local files or Hugging Face identifiers:
+- GoEmotions (HF) : ``hf://go_emotions``
+- ISEAR (HF)      : Not available on HF; use local CSV.
+- EmpatheticDialogues (HF) : ``hf://empathetic_dialogues``
+- EmoBank (HF)    : ``hf://emobank``
+
+USAGE EXAMPLES
+--------------
+# Process GoEmotions from local CSV:
+python master_dataset.py process go_emotions_train.csv -t text -l labels -o goemo_clean.csv
+
+# Process ISEAR from local CSV:
+python master_dataset.py process isear.csv -t SIT -l EMOT -o isear_clean.csv
+
+# Process EmpatheticDialogues from Hugging Face:
+python master_dataset.py process hf://empathetic_dialogues -t prompt -l context -o emp_clean.csv
+
+# Process EmoBank from Hugging Face:
+python master_dataset.py process hf://emobank -t text -l emotion -o emobank_clean.csv
+
+# Use a unified preparation command (new):
+python master_dataset.py prepare --dataset goemo --output clean_goemo.csv
+python master_dataset.py prepare --dataset isear --output clean_isear.csv
+python master_dataset.py prepare --dataset empathetic --output clean_emp.csv
+python master_dataset.py prepare --dataset emobank --output clean_emobank.csv
+
+# List all available datasets:
+python master_dataset.py --list-datasets
+
+# Launch interactive laboratory:
+python master_dataset.py interactive
 """
 
 from __future__ import annotations
@@ -53,7 +81,6 @@ import math
 import os
 import random
 import re
-import statistics
 import sys
 import tempfile
 import time
@@ -140,7 +167,7 @@ except ImportError:  # pragma: no cover
 # CONSTANTS
 # =============================================================================
 
-VERSION = "4.1.0"
+VERSION = "5.0.0"
 OUTPUT_COLUMNS = ["clean_text", "label", "sentiment_score"]
 
 DEFAULT_SENTIMENT_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
@@ -183,6 +210,49 @@ BACKGROUND_COLORS = [
     "#18202A", "#1B2430", "#202735", "#20242E", "#192329", "#22212D",
 ]
 
+# Known datasets for quick configuration
+KNOWN_DATASETS = {
+    "goemo": {
+        "name": "GoEmotions",
+        "source": "hf://go_emotions",  # or local path
+        "text_column": "text",
+        "label_column": "labels",
+        "task_type": "multi_label",
+        "class_count": 28,
+        "url": "https://github.com/google-research/google-research/tree/master/goemotions",
+        "notes": "Reddit comments with 28 emotion labels (multi-label)."
+    },
+    "isear": {
+        "name": "ISEAR",
+        "source": "isear_dataset-master/isear.csv",  # default local path
+        "text_column": "SIT",
+        "label_column": "EMOT",
+        "task_type": "single_label",
+        "class_count": 7,
+        "url": "https://www.unige.ch/cisa/research/materials-and-online-research/research-material/",
+        "notes": "International survey on emotion antecedents, 7 basic emotions."
+    },
+    "empathetic": {
+        "name": "EmpatheticDialogues",
+        "source": "hf://empathetic_dialogues",
+        "text_column": "prompt",
+        "label_column": "context",
+        "task_type": "single_label",
+        "class_count": 32,
+        "url": "https://github.com/facebookresearch/EmpatheticDialogues",
+        "notes": "Conversational dataset with 32 emotion labels."
+    },
+    "emobank": {
+        "name": "EmoBank",
+        "source": "hf://emobank",
+        "text_column": "text",
+        "label_column": "emotion",
+        "task_type": "single_label",
+        "class_count": 15,
+        "url": "https://github.com/JULIELab/EmoBank",
+        "notes": "Categorical emotion labels plus VAD scores."
+    },
+}
 
 # =============================================================================
 # EXCEPTIONS
@@ -707,15 +777,26 @@ class DatasetLoader:
 
         if source.startswith("hf://"):
             if hf_load_dataset is None:
-                raise DatasetSourceError("hf:// input requires datasets. Install: pip install datasets")
+                raise DatasetSourceError(
+                    "hf:// input requires the 'datasets' library. "
+                    "Install it with: pip install datasets"
+                )
             repo = source[len("hf://"):]
             config = hf_config
             if ":" in repo and config is None:
                 repo, config = repo.split(":", 1)
             try:
-                loaded = hf_load_dataset(repo, name=config)
+                loaded = hf_load_dataset(repo, name=config, trust_remote_code=True)
             except Exception as exc:
-                raise DatasetSourceError(f"Could not load Hugging Face dataset '{repo}': {type(exc).__name__}: {exc}") from exc
+                raise DatasetSourceError(
+                    f"Could not load Hugging Face dataset '{repo}'. "
+                    f"Error: {type(exc).__name__}: {exc}\n"
+                    "Possible reasons:\n"
+                    "  - The dataset name is misspelled. Check https://huggingface.co/datasets\n"
+                    "  - The dataset requires authentication or is gated.\n"
+                    "  - You are offline. Use a local file instead.\n"
+                    "  - The 'datasets' library is outdated. Update with: pip install --upgrade datasets"
+                ) from exc
             if hasattr(loaded, "items"):
                 frames = []
                 for split, part in loaded.items():
@@ -2142,7 +2223,7 @@ class MasterDatasetProcessor:
 
 
 # =============================================================================
-# HELP SYSTEM
+# HELP SYSTEM & NEW COMMANDS
 # =============================================================================
 
 COMMAND_INFO: dict[str, dict[str, Any]] = {
@@ -2198,6 +2279,19 @@ COMMAND_INFO: dict[str, dict[str, Any]] = {
             ("--no-manifest", "Do not write provenance manifest"),
         ],
     },
+    "prepare": {
+        "purpose": "Download, preprocess, and save a known dataset in one command.",
+        "usage": "python master_dataset.py prepare --dataset {goemo,isear,empathetic,emobank} -o OUTPUT",
+        "options": [
+            ("--dataset", "Dataset name: goemo, isear, empathetic, emobank"),
+            ("-o, --output", "Output file path (required)"),
+            ("--source", "Optional override source (local file or hf://...)"),
+            ("--text-column", "Override text column"),
+            ("--label-column", "Override label column"),
+            ("--overwrite", "Overwrite existing output"),
+            ("--no-manifest", "Skip writing manifest"),
+        ],
+    },
     "score": {
         "purpose": "Process and score sentiment, optionally persisting the result.",
         "usage": "python master_dataset.py score DATASET [options]",
@@ -2251,6 +2345,11 @@ COMMAND_INFO: dict[str, dict[str, Any]] = {
             ("-q, --quiet", "Reduce rendering"),
         ],
     },
+    "list-datasets": {
+        "purpose": "List all known datasets with their sources and column hints.",
+        "usage": "python master_dataset.py --list-datasets",
+        "options": [],
+    },
 }
 
 
@@ -2266,12 +2365,14 @@ def render_root_help(renderer: Renderer) -> None:
             ["inspect", "Inspect source and schema intelligence", "detection report"],
             ["profile", "Deep structural/text/label profiling", "profile dashboard"],
             ["process", "Clean + canonicalize + score + validate", "dataset + optional manifest"],
+            ["prepare", "Quick prepare known datasets", "cleaned dataset"],
             ["score", "Process + target-independent sentiment", "scored dataset"],
             ["preview", "Inspect canonical rows", "terminal preview"],
             ["validate", "Strict integrity checks", "validation matrix"],
             ["save", "Process + validate + persist", "dataset + manifest"],
             ["summary", "Summarise labels and sentiment", "summary dashboard"],
             ["interactive", "Persistent guided laboratory", "interactive workspace"],
+            ["list-datasets", "List known datasets with sources", "table"],
         ],
     )
     renderer.table(
@@ -2283,6 +2384,7 @@ def render_root_help(renderer: Renderer) -> None:
             ["--quiet / --quite", "-q", "Suppress presentation output"],
             ["--no-visuals", "—", "Disable terminal rendering"],
             ["--version", "-V", "Display version"],
+            ["--list-datasets", "—", "Show known dataset configurations"],
         ],
     )
     renderer.table(
@@ -2306,8 +2408,10 @@ def render_root_help(renderer: Renderer) -> None:
             ["Inspect", "python master_dataset.py inspect ./data.csv"],
             ["Profile", "python master_dataset.py profile ./data.csv --sample 10000"],
             ["Process", "python master_dataset.py process ./data.csv -o clean.csv --overwrite"],
-            ["Explicit schema", "python master_dataset.py process ./data.csv -t sentence -l emotion"],
-            ["PyTorch transformer", "python master_dataset.py process ./data.csv -B transformer -m cardiffnlp/twitter-roberta-base-sentiment-latest"],
+            ["Prepare GoEmotions", "python master_dataset.py prepare --dataset goemo -o goemo_clean.csv"],
+            ["Prepare ISEAR", "python master_dataset.py prepare --dataset isear --source isear.csv -o isear_clean.csv"],
+            ["Prepare Empathetic", "python master_dataset.py prepare --dataset empathetic -o emp_clean.csv"],
+            ["Prepare EmoBank", "python master_dataset.py prepare --dataset emobank -o emobank_clean.csv"],
             ["Preview", "python master_dataset.py preview ./data.csv --rows 15 --tail"],
             ["Validate", "python master_dataset.py validate ./data.csv"],
             ["Interactive", "python master_dataset.py interactive"],
@@ -2316,13 +2420,39 @@ def render_root_help(renderer: Renderer) -> None:
 
 
 def render_command_help(renderer: Renderer, command: str) -> None:
-    info = COMMAND_INFO[command]
+    info = COMMAND_INFO.get(command)
+    if not info:
+        renderer.error(f"Unknown command: {command}")
+        render_root_help(renderer)
+        return
     renderer.panel(command.upper(), info["purpose"])
     renderer.table("COMMAND USAGE", ["Field", "Value"], [["Usage", info["usage"]]])
     if info["options"]:
         renderer.table("COMMAND OPTIONS", ["Option", "Purpose"], info["options"])
     else:
         renderer.table("COMMAND OPTIONS", ["Option", "Purpose"], [["—", "No command-specific options"]])
+
+
+def render_known_datasets(renderer: Renderer) -> None:
+    """Display a table of all known datasets with their sources and column hints."""
+    rows = []
+    for key, spec in KNOWN_DATASETS.items():
+        rows.append([
+            key,
+            spec["name"],
+            spec.get("url", "—"),
+            spec.get("text_column", "?"),
+            spec.get("label_column", "?"),
+            spec.get("task_type", "?"),
+            spec.get("class_count", "?"),
+            spec.get("notes", ""),
+        ])
+    renderer.table(
+        "KNOWN DATASETS",
+        ["Key", "Name", "URL", "Text col", "Label col", "Task", "# classes", "Notes"],
+        rows,
+        caption="Use 'prepare --dataset KEY' to process one.",
+    )
 
 
 # =============================================================================
@@ -2349,9 +2479,20 @@ class InteractiveApp:
         return True
 
     def _load_dialog(self) -> None:
-        source = self._prompt("Dataset URL / path")
-        text_column = self._prompt("Text column (blank = auto)", "") or None
-        label_column = self._prompt("Label column (blank = auto)", "") or None
+        # Show known datasets first
+        render_known_datasets(self.renderer)
+        dataset_key = self._prompt("Dataset key (or path/URL)", "").strip()
+        if dataset_key in KNOWN_DATASETS:
+            spec = KNOWN_DATASETS[dataset_key]
+            source = spec["source"]
+            text_col = spec["text_column"]
+            label_col = spec["label_column"]
+            self.renderer.info(f"Using known dataset: {spec['name']}")
+        else:
+            source = dataset_key
+            text_col = self._prompt("Text column (blank = auto)", "") or None
+            label_col = self._prompt("Label column (blank = auto)", "") or None
+
         backend = self._prompt("Sentiment backend", "auto") or "auto"
         model = self._prompt("Sentiment model (blank = default)", "") or None
         batch_size = int(self._prompt("PyTorch batch size", str(DEFAULT_BATCH_SIZE)))
@@ -2360,8 +2501,8 @@ class InteractiveApp:
 
         self.processor = MasterDatasetProcessor(
             source,
-            text_column=text_column,
-            label_column=label_column,
+            text_column=text_col,
+            label_column=label_col,
             sentiment_backend=backend,
             sentiment_model=model,
             sentiment_batch_size=batch_size,
@@ -2393,10 +2534,11 @@ class InteractiveApp:
                 ("7", "Save", "save"),
                 ("8", "Summary", "summary"),
                 ("9", "Configuration", "config"),
+                ("d", "List known datasets", "datasets"),
                 ("h", "Help", "help"),
                 ("0", "Exit", "exit"),
             ],
-            footer="Aliases: p=profile, x=process, v=validate, s=save, r=summary, q=exit",
+            footer="Aliases: p=profile, x=process, v=validate, s=save, r=summary, q=exit, d=datasets",
         )
 
     def run(self) -> None:
@@ -2454,6 +2596,8 @@ class InteractiveApp:
                 elif choice in {"9", "config", "configuration"}:
                     if self._ensure_processor():
                         self.processor.show_configuration()
+                elif choice in {"d", "datasets"}:
+                    render_known_datasets(self.renderer)
                 elif choice in {"h", "help"}:
                     render_root_help(self.renderer)
                 else:
@@ -2531,6 +2675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", "--quite", "-q", dest="quiet", action="store_true")
     parser.add_argument("--no-visuals", action="store_true")
     parser.add_argument("--version", "-V", action="store_true")
+    parser.add_argument("--list-datasets", action="store_true", help="List known datasets and their configurations")
     sub = parser.add_subparsers(dest="command")
 
     inspect = sub.add_parser("inspect", add_help=False)
@@ -2550,6 +2695,18 @@ def build_parser() -> argparse.ArgumentParser:
     common_source_options(process)
     cleaning_options(process)
     output_options(process)
+
+    prepare = sub.add_parser("prepare", add_help=False)
+    prepare.add_argument("--dataset", choices=list(KNOWN_DATASETS.keys()), required=True,
+                         help="Key of the known dataset (goemo, isear, empathetic, emobank)")
+    prepare.add_argument("--source", help="Override source (local path or hf://...)")
+    prepare.add_argument("-o", "--output", required=True, help="Output file path")
+    prepare.add_argument("--text-column", help="Override text column")
+    prepare.add_argument("--label-column", help="Override label column")
+    prepare.add_argument("--overwrite", action="store_true", help="Overwrite existing output")
+    prepare.add_argument("--no-manifest", action="store_true", help="Skip manifest")
+    # Reuse common cleaning options (we'll add them manually)
+    cleaning_options(prepare)
 
     score = sub.add_parser("score", add_help=False)
     score.add_argument("dataset")
@@ -2624,11 +2781,6 @@ def build_processor(args: argparse.Namespace) -> MasterDatasetProcessor:
     )
 
 
-# =============================================================================
-# CLI MAIN
-# =============================================================================
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     command, help_requested = requested_help(raw)
@@ -2638,6 +2790,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         set_verbose(False)
 
     renderer = Renderer(quiet=quiet, no_visuals=no_visuals)
+
+    # Handle --list-datasets
+    if "--list-datasets" in raw:
+        render_known_datasets(renderer)
+        return 0
 
     if not raw or (help_requested and command is None):
         render_root_help(renderer)
@@ -2652,12 +2809,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "interactive":
-        InteractiveApp(quiet=args.quiet, no_visuals=args.no_visuals, start_dataset=args.dataset).run()
+        InteractiveApp(quiet=args.quiet, no_visuals=args.no_visuals, start_dataset=getattr(args, "dataset", None)).run()
         return 0
 
     if not args.command:
         render_root_help(renderer)
         return 1
+
+    # Special handling for 'prepare'
+    if args.command == "prepare":
+        if args.dataset not in KNOWN_DATASETS:
+            renderer.error(f"Unknown dataset key: {args.dataset}")
+            render_known_datasets(renderer)
+            return 1
+        spec = KNOWN_DATASETS[args.dataset]
+        source = args.source if args.source else spec["source"]
+        text_col = args.text_column if args.text_column else spec["text_column"]
+        label_col = args.label_column if args.label_column else spec["label_column"]
+
+        renderer.info(f"Preparing dataset: {spec['name']}")
+        renderer.info(f"  Source: {source}")
+        renderer.info(f"  Text column: {text_col}")
+        renderer.info(f"  Label column: {label_col}")
+
+        # Use the processor with the same cleaning settings
+        processor = MasterDatasetProcessor(
+            source,
+            text_column=text_col,
+            label_column=label_col,
+            # Use the default cleaning (matching other datasets)
+            lowercase=not getattr(args, "no_lowercase", False),
+            demojize=not getattr(args, "no_demojize", False),
+            normalize_urls=not getattr(args, "no_url_normalization", False),
+            normalize_usernames=not getattr(args, "no_user_normalization", False),
+            normalize_hashtags=getattr(args, "normalize_hashtags", False),
+            strip_html=not getattr(args, "no_html_strip", False),
+            drop_missing_text=not getattr(args, "keep_missing_text", False),
+            drop_missing_label=not getattr(args, "keep_missing_label", False),
+            drop_empty_text=not getattr(args, "keep_empty_text", False),
+            drop_short_text=getattr(args, "drop_short", None) is not None,
+            min_text_chars=getattr(args, "drop_short", None) or 1,
+            drop_duplicates=not getattr(args, "no_deduplicate", False),
+            quiet=args.quiet,
+            no_visuals=args.no_visuals,
+            # We don't need sentiment scoring here; we can skip it
+            sentiment_backend="lexicon",  # quick fallback if needed
+        )
+        # Process and save
+        df = processor.process(force=True)
+        # Override output format if not specified
+        fmt = getattr(args, "format", "csv")
+        processor.save(args.output, fmt=fmt, overwrite=args.overwrite, manifest=not args.no_manifest)
+        return 0
 
     try:
         processor = build_processor(args)
@@ -2665,7 +2868,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "inspect":
             processor.load()
             detection = processor.detect_schema()
-            if args.candidates:
+            if getattr(args, "candidates", False):
                 processor.renderer.table("TEXT CANDIDATES", ["Rank", "Column", "Score"], [[i, c, s] for i, (c, s) in enumerate(detection.text_candidates[:10], 1)])
                 processor.renderer.table("LABEL CANDIDATES", ["Rank", "Column", "Score"], [[i, c, s] for i, (c, s) in enumerate(detection.label_candidates[:10], 1)])
 
@@ -2713,6 +2916,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         renderer.error(f"Unexpected {type(exc).__name__}: {exc}")
         return 3
+
+
+
+"""
+# See all known datasets
+python master_dataset.py --list-datasets
+
+# Prepare GoEmotions from Hugging Face (or local CSV)
+python master_dataset.py prepare --dataset goemo -o goemo_clean.csv
+
+# Prepare ISEAR (adjust source path if needed)
+python master_dataset.py prepare --dataset isear --source isear_dataset-master/isear.csv -o isear_clean.csv
+
+# Prepare EmpatheticDialogues
+python master_dataset.py prepare --dataset empathetic -o emp_clean.csv
+
+# Prepare EmoBank
+python master_dataset.py prepare --dataset emobank -o emobank_clean.csv
+
+# Inspect any dataset
+python master_dataset.py inspect hf://emobank
+
+# Launch interactive lab
+python master_dataset.py interactive
+
+
+
+##############################################
+
+
+
+Official Dataset Links
+
+Dataset	Link
+GoEmotions  	https://github.com/google-research/google-research/tree/master/goemotions
+ISEAR   	https://www.unige.ch/cisa/research/materials-and-online-research/research-material/
+EmpatheticDialogues 	https://github.com/facebookresearch/EmpatheticDialogues
+EmoBank	    https://github.com/JULIELab/EmoBank
+"""
 
 
 if __name__ == "__main__":
