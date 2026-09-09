@@ -73,6 +73,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import csv
 import hashlib
 import html
 import io
@@ -82,6 +83,7 @@ import os
 import random
 import re
 import sys
+import tarfile
 import tempfile
 import time
 import unicodedata
@@ -177,6 +179,15 @@ DEFAULT_MAX_LENGTH = 256
 DEFAULT_SAMPLE = 10_000
 DEFAULT_CACHE_DIR = Path(tempfile.gettempdir()) / "master_dataset_cache"
 
+
+# ---------------------------------------------------------------------------
+# PROJECT DATASET STORE
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_DATASETS_DIR = PROJECT_ROOT / "datasets"
+
+
 TEXT_NAME_HINTS = {
     "text", "sentence", "content", "utterance", "tweet", "review", "comment",
     "message", "post", "document", "description", "prompt", "response", "body",
@@ -214,43 +225,101 @@ BACKGROUND_COLORS = [
 KNOWN_DATASETS = {
     "goemo": {
         "name": "GoEmotions",
-        "source": "hf://go_emotions",  # or local path
+        "source": "known://goemo",
+        "source_type": "goemotions_tsv",
+        "online_urls": {
+            "train": (
+                "https://raw.githubusercontent.com/google-research/"
+                "google-research/master/goemotions/data/train.tsv"
+            ),
+            "validation": (
+                "https://raw.githubusercontent.com/google-research/"
+                "google-research/master/goemotions/data/dev.tsv"
+            ),
+            "test": (
+                "https://raw.githubusercontent.com/google-research/"
+                "google-research/master/goemotions/data/test.tsv"
+            ),
+        },
+        "local_raw": "goemotions.csv",
         "text_column": "text",
         "label_column": "labels",
         "task_type": "multi_label",
         "class_count": 28,
         "url": "https://github.com/google-research/google-research/tree/master/goemotions",
-        "notes": "Reddit comments with 28 emotion labels (multi-label)."
+        "notes": (
+            "Official agreement-filtered train/dev/test data; "
+            "27 emotions + neutral."
+        ),
     },
+
     "isear": {
         "name": "ISEAR",
-        "source": "isear_dataset-master/isear.csv",  # default local path
+        "source": "known://isear",
+        "source_type": "delimited",
+        "online_urls": {
+            "raw": (
+                "https://raw.githubusercontent.com/sinmaniphel/"
+                "py_isear_dataset/master/isear.csv"
+            ),
+        },
+        "delimiter": "|",
+        "local_raw": "isear.csv",
         "text_column": "SIT",
         "label_column": "EMOT",
         "task_type": "single_label",
         "class_count": 7,
-        "url": "https://www.unige.ch/cisa/research/materials-and-online-research/research-material/",
-        "notes": "International survey on emotion antecedents, 7 basic emotions."
+        "url": (
+            "https://www.unige.ch/cisa/research/materials-and-online-research/"
+            "research-material/"
+        ),
+        "notes": (
+            "Official ISEAR documentation; acquisition uses a verified "
+            "pipe-delimited dataset file."
+        ),
     },
+
     "empathetic": {
         "name": "EmpatheticDialogues",
-        "source": "hf://empathetic_dialogues",
-        "text_column": "prompt",
+        "source": "known://empathetic",
+        "source_type": "empathetic_archive",
+        "online_url": (
+            "https://dl.fbaipublicfiles.com/parlai/"
+            "empatheticdialogues/empatheticdialogues.tar.gz"
+        ),
+        "local_raw": "empathetic_dialogues.csv",
+        "text_column": "utterance",
         "label_column": "context",
         "task_type": "single_label",
         "class_count": 32,
         "url": "https://github.com/facebookresearch/EmpatheticDialogues",
-        "notes": "Conversational dataset with 32 emotion labels."
+        "notes": (
+            "Official Meta/Facebook archive. The context field is retained "
+            "as the emotion/situation target and utterance is the text."
+        ),
     },
+
     "emobank": {
         "name": "EmoBank",
-        "source": "hf://emobank",
+        "source": "known://emobank",
+        "source_type": "emobank_csv",
+        "online_urls": {
+            "raw": (
+                "https://github.com/JULIELab/EmoBank/raw/master/"
+                "corpus/emobank.csv"
+            ),
+        },
+        "local_raw": "emobank.csv",
         "text_column": "text",
-        "label_column": "emotion",
-        "task_type": "single_label",
-        "class_count": 15,
+        "label_column": "__VAD__",
+        "target_columns": ["V", "A", "D"],
+        "task_type": "dimensional_regression",
+        "class_count": 0,
         "url": "https://github.com/JULIELab/EmoBank",
-        "notes": "Categorical emotion labels plus VAD scores."
+        "notes": (
+            "EmoBank is a dimensional VAD dataset, not a categorical "
+            "emotion-classification dataset. Label is preserved as [V,A,D]."
+        ),
     },
 }
 
@@ -450,6 +519,28 @@ def quantiles(values: pd.Series) -> dict[str, float]:
         "max": float(numeric.max()),
     }
 
+def _read_known_local(
+    self,
+    key: str,
+    path: Path,
+) -> pd.DataFrame:
+
+    spec = KNOWN_DATASETS[key]
+
+    if spec["source_type"] == "delimited":
+        frame = pd.read_csv(
+            path,
+            sep=spec["delimiter"],
+        )
+    else:
+        frame = pd.read_csv(path)
+
+    if frame.empty:
+        raise DatasetSourceError(
+            f"Known dataset '{key}' contains zero rows."
+        )
+
+    return frame
 
 # =============================================================================
 # RICH PRESENTATION LAYER
@@ -551,14 +642,29 @@ class Renderer:
                     cells.append(Text(compact(value, 240), style=palette[i]))
                 table.add_row(*cells)
             self.console.print(table)
+            print()
             if caption:
-                self.console.print(Text(caption, style=f"italic {title_colour}"))
+                self.console.print(
+                    Text(
+                        caption,
+                        style=f"italic {title_colour}",
+                    )
+                )
+
+            
         else:
             print(f"\n{title}")
             print(" | ".join(str(c) for c in columns))
             print("-" * 120)
             for row in row_list:
-                print(" | ".join(compact(v, 120) for v in row))
+                print(
+                    " | ".join(
+                        compact(v, 120)
+                        for v in row
+                    )
+                )
+
+            print()
 
     def status(self, kind: str, message: str) -> None:
         if not self.enabled:
@@ -713,34 +819,85 @@ class DatasetLoader:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
 
-    def _download(self, url: str) -> Path:
+    def _download(
+    self,
+    url: str,
+    destination: Optional[str | Path] = None,) -> Path:
         if requests is None:
-            raise DatasetSourceError("URL input requires requests. Install: pip install requests")
+            raise DatasetSourceError(
+                "URL input requires requests. Install: pip install requests"
+            )
+
         parsed = urlparse(url)
-        filename = Path(parsed.path).name or f"dataset_{stable_hash(url)}.csv"
-        if Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
-            filename = f"dataset_{stable_hash(url)}.csv"
-        destination = self.cache_dir / f"{stable_hash(url)}_{filename}"
-        if destination.exists() and destination.stat().st_size > 0:
-            return destination
-        tmp = destination.with_suffix(destination.suffix + ".part")
+
+        if destination is None:
+            filename = Path(parsed.path).name or f"dataset_{stable_hash(url)}.csv"
+            if Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
+                filename = f"dataset_{stable_hash(url)}.csv"
+
+            destination_path = self.cache_dir / f"{stable_hash(url)}_{filename}"
+        else:
+            destination_path = Path(destination).expanduser().resolve()
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if destination_path.exists() and destination_path.stat().st_size > 0:
+            return destination_path
+
+        tmp = destination_path.with_suffix(
+            destination_path.suffix + ".part"
+        )
+
         try:
             with requests.get(
                 url,
                 stream=True,
                 timeout=self.timeout,
-                headers={"User-Agent": f"MasterDatasetProcessor/{VERSION}"},
+                headers={
+                    "User-Agent": f"MasterDatasetProcessor/{VERSION}"
+                },
             ) as response:
                 response.raise_for_status()
+
+                content_type = response.headers.get(
+                    "Content-Type", ""
+                ).lower()
+
+                if "text/html" in content_type:
+                    raise DatasetSourceError(
+                        f"Remote source returned HTML instead of a dataset "
+                        f"file: {url}. Use a direct/raw dataset URL."
+                    )
+
                 with tmp.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    for chunk in response.iter_content(
+                        chunk_size=1024 * 1024
+                    ):
                         if chunk:
                             handle.write(chunk)
-            tmp.replace(destination)
+
+            head = tmp.read_bytes()[:512].lower()
+
+            if b"<!doctype html" in head or b"<html" in head:
+                raise DatasetSourceError(
+                    f"Remote source returned an HTML page instead of a "
+                    f"dataset file: {url}"
+                )
+
+            tmp.replace(destination_path)
+
+        except DatasetSourceError:
+            tmp.unlink(missing_ok=True)
+            raise
+
         except Exception as exc:
             tmp.unlink(missing_ok=True)
-            raise DatasetSourceError(f"Could not download dataset: {type(exc).__name__}: {exc}") from exc
-        return destination
+            raise DatasetSourceError(
+                f"Could not download dataset: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        return destination_path
 
     @staticmethod
     def _read_path(path: Path) -> pd.DataFrame:
@@ -770,8 +927,214 @@ class DatasetLoader:
             raise DatasetSourceError(f"Failed parsing '{path}': {type(exc).__name__}: {exc}") from exc
         raise DatasetSourceError(f"Unsupported format '{suffix}'. Supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}")
 
-    def load(self, source: str, *, hf_config: Optional[str] = None) -> tuple[pd.DataFrame, Optional[Path]]:
+    def load_known(
+    self,
+    key: str,
+    *,
+    offline: bool = False,
+) -> tuple[pd.DataFrame, Path]:
+
+        if key not in KNOWN_DATASETS:
+            raise DatasetSourceError(
+                f"Unknown known dataset key: {key}"
+            )
+
+        spec = KNOWN_DATASETS[key]
+
+        dataset_root = PROJECT_DATASETS_DIR / key
+        raw_root = dataset_root / "raw"
+        raw_root.mkdir(parents=True, exist_ok=True)
+
+        local_path = (known_dataset_raw_dir(key) / spec["local_raw"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ---------------------------------------------------------------
+        # LOCAL-FIRST INVARIANT
+        # ---------------------------------------------------------------
+        if local_path.exists() and local_path.stat().st_size > 0:
+            return self._read_known_local(key, local_path), local_path
+
+        # ---------------------------------------------------------------
+        # TRUE OFFLINE MODE
+        # ---------------------------------------------------------------
+        if offline:
+            raise DatasetSourceError(
+                f"Known dataset '{key}' is not available locally.\n"
+                f"Expected local file:\n{local_path}\n"
+                f"Run once online to acquire it."
+            )
+
+        kind = spec["source_type"]
+
+        # ===============================================================
+        # GOEMOTIONS
+        # ===============================================================
+        if kind == "goemotions_tsv":
+
+            frames = []
+
+            for split, url in spec["online_urls"].items():
+
+                split_path = self._download(
+                    url,
+                    raw_root / f"goemotions_{split}.tsv",
+                )
+
+                part = pd.read_csv(
+                    split_path,
+                    sep="\t",
+                    header=None,
+                    names=["text", "labels", "id"],
+                    dtype=str,
+                    keep_default_na=False,
+                )
+
+                part["__source_split"] = split
+                frames.append(part)
+
+            frame = pd.concat(
+                frames,
+                ignore_index=True,
+            )
+
+            frame.to_csv(
+                local_path,
+                index=False,
+            )
+
+        # ===============================================================
+        # ISEAR
+        # ===============================================================
+        elif kind == "delimited":
+
+            self._download(
+                spec["online_urls"]["raw"],
+                local_path,
+            )
+
+            frame = pd.read_csv(
+                local_path,
+                sep=spec["delimiter"],
+            )
+
+        # ===============================================================
+        # EMOBANK
+        # ===============================================================
+        elif kind == "emobank_csv":
+
+            self._download(
+                spec["online_urls"]["raw"],
+                local_path,
+            )
+
+            frame = pd.read_csv(local_path)
+
+        # ===============================================================
+        # EMPATHETIC DIALOGUES
+        # ===============================================================
+        elif kind == "empathetic_archive":
+
+            archive_path = self._download(
+                spec["online_url"],
+                raw_root / "empatheticdialogues.tar.gz",
+            )
+
+            archive_members = {
+                "train": "empatheticdialogues/train.csv",
+                "validation": "empatheticdialogues/valid.csv",
+                "test": "empatheticdialogues/test.csv",
+            }
+
+            rows = []
+
+            try:
+                with tarfile.open(
+                    archive_path,
+                    "r:gz",
+                ) as archive:
+
+                    for split, member_name in archive_members.items():
+
+                        member = archive.getmember(member_name)
+                        extracted = archive.extractfile(member)
+
+                        if extracted is None:
+                            raise DatasetSourceError(
+                                f"EmpatheticDialogues archive is missing "
+                                f"{member_name}"
+                            )
+
+                        reader = csv.DictReader(
+                            io.TextIOWrapper(
+                                extracted,
+                                encoding="utf-8",
+                            )
+                        )
+
+                        for row in reader:
+                            row["__source_split"] = split
+                            rows.append(row)
+
+            except (tarfile.TarError, KeyError) as exc:
+                raise DatasetSourceError(
+                    "Failed to read EmpatheticDialogues archive: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+            frame = pd.DataFrame(rows)
+
+            if frame.empty:
+                raise DatasetSourceError(
+                    "EmpatheticDialogues archive produced zero rows."
+                )
+
+            frame.to_csv(
+                local_path,
+                index=False,
+            )
+
+        else:
+            raise DatasetSourceError(
+                f"Known dataset '{key}' has unsupported "
+                f"source_type '{kind}'."
+            )
+
+        if frame.empty:
+            raise DatasetSourceError(
+                f"Known dataset '{key}' contains zero rows."
+            )
+        self.renderer.table(
+            "DATASET CACHE",
+            ["Dataset", "Source mode", "Local path", "Status"],
+            [[
+                spec["name"],
+                "LOCAL" if was_local else "DOWNLOADED",
+                str(local_path),
+                "READY",
+            ]],)
+        self.renderer.panel(
+            "CACHE LOCATION",
+            f"{spec['name']}\n{local_path}",
+        )
+        
+
+        return frame, local_path
+
+    def load(
+    self,
+    source: str,
+    *,
+    hf_config: Optional[str] = None,
+    offline: bool = False,
+) -> tuple[pd.DataFrame, Optional[Path]]:
         source = str(source).strip()
+
+        if source.startswith("known://"):
+            key = source[len("known://"):]
+            return self.load_known(
+                key,
+                offline=offline,
+            )
         if not source:
             raise DatasetSourceError("Dataset source is empty.")
 
@@ -978,9 +1341,30 @@ class SchemaDetector:
                 raise ColumnDetectionError(f"Requested text column '{text_column}' not found. Available: {columns}")
             result.text_column = text_column
         if label_column is not None:
-            if label_column not in df.columns:
-                raise ColumnDetectionError(f"Requested label column '{label_column}' not found. Available: {columns}")
-            result.label_column = label_column
+
+            if label_column == "__VAD__":
+
+                required_vad = {"V", "A", "D"}
+
+                if not required_vad.issubset(
+                    set(df.columns)
+                ):
+                    raise ColumnDetectionError(
+                        "VAD target requires columns V, A, D. "
+                        f"Available: {columns}"
+                    )
+
+                result.label_column = "__VAD__"
+
+            else:
+
+                if label_column not in df.columns:
+                    raise ColumnDetectionError(
+                        f"Requested label column '{label_column}' "
+                        f"not found. Available: {columns}"
+                    )
+
+                result.label_column = label_column
 
         n = max(len(df), 1)
         candidates_text: list[tuple[str, float]] = []
@@ -1480,7 +1864,13 @@ class MasterDatasetProcessor:
     def load(self, *, force: bool = False) -> pd.DataFrame:
         if self.raw_df is not None and not force:
             return self.raw_df.copy()
-        frame, source_path = self.loader.load(self.dataset_link, hf_config=self.hf_config)
+        self.dataset_link = str(dataset_link)
+        self.offline = bool(offline)
+        frame, source_path = self.loader.load(
+            self.dataset_link,
+            hf_config=self.hf_config,
+            offline=self.offline,
+        )
         self.raw_df = frame.copy()
         self.source_path = source_path
         self.report.rows_input = len(frame)
@@ -1498,32 +1888,52 @@ class MasterDatasetProcessor:
         return frame.copy()
 
     def detect_schema(self) -> DetectionResult:
-        if self.raw_df is None:
-            self.load()
-        assert self.raw_df is not None
+
+        if (
+            self.dataset_link.startswith("known://")
+        ):
+            key = self.dataset_link[len("known://"):]
+
+            if key not in KNOWN_DATASETS:
+                raise DatasetSchemaError(
+                    f"Unknown managed dataset: {key}"
+                )
+
+            spec = KNOWN_DATASETS[key]
+
+            if spec.get("label_column") == "__VAD__":
+                self.detection = DetectionResult(
+                    text_column=spec["text_column"],
+                    label_column="__VAD__",
+                    confidence="high",
+                )
+
+                self.report.text_column = spec["text_column"]
+                self.report.label_column = "__VAD__"
+
+                return self.detection
+
+            self.detection = DetectionResult(
+                text_column=spec["text_column"],
+                label_column=spec["label_column"],
+                confidence="high",
+            )
+
+            self.report.text_column = spec["text_column"]
+            self.report.label_column = spec["label_column"]
+
+            return self.detection
+
+        # Existing generic detector remains unchanged
         self.detection = self.detector.detect(
             self.raw_df,
             text_column=self.text_column_override,
             label_column=self.label_column_override,
         )
+
         self.report.text_column = self.detection.text_column
         self.report.label_column = self.detection.label_column
 
-        rows = [
-            ["TEXT", self.detection.text_column or "—", self.detection.confidence],
-            ["LABEL", self.detection.label_column or "—", self.detection.confidence],
-            ["ONE-HOT", f"{len(self.detection.one_hot_label_columns)}", "detected"],
-            ["ROWS", f"{len(self.raw_df):,}", "loaded"],
-            ["COLUMNS", f"{len(self.raw_df.columns):,}", "loaded"],
-        ]
-        self.renderer.table("SCHEMA INTELLIGENCE", ["Role", "Resolved", "Confidence"], rows)
-
-        if self.detection.warnings:
-            self.renderer.table(
-                "SCHEMA WARNINGS",
-                ["#", "Message"],
-                [[i, warning] for i, warning in enumerate(self.detection.warnings, 1)],
-            )
         return self.detection
 
     # -------------------------------------------------------------------------
@@ -1535,13 +1945,55 @@ class MasterDatasetProcessor:
             return False
         return set(OUTPUT_COLUMNS).issubset(set(self.raw_df.columns))
 
-    def _label_series(self, frame: pd.DataFrame) -> pd.Series:
-        assert self.detection is not None and self.detection.text_column is not None
+    def _label_series(
+    self,
+    frame: pd.DataFrame,
+) -> pd.Series:
+
+        assert (
+            self.detection is not None
+            and self.detection.text_column is not None
+        )
+
+        if self.detection.label_column == "__VAD__":
+
+            missing = [
+                column
+                for column in ("V", "A", "D")
+                if column not in frame.columns
+            ]
+
+            if missing:
+                raise DatasetSchemaError(
+                    "EmoBank VAD target is missing: "
+                    f"{missing}"
+                )
+
+            return frame.apply(
+                lambda row: [
+                    float(row["V"]),
+                    float(row["A"]),
+                    float(row["D"]),
+                ],
+                axis=1,
+            )
+
         if self.detection.label_column:
-            series = frame[self.detection.label_column].map(LabelNormalizer.parse)
-            return series
+
+            return frame[
+                self.detection.label_column
+            ].map(LabelNormalizer.parse)
+
         assert self.detection.one_hot_label_columns
-        return frame.apply(lambda row: LabelNormalizer.one_hot_row(row, self.detection.one_hot_label_columns), axis=1)
+
+        return frame.apply(
+            lambda row:
+                LabelNormalizer.one_hot_row(
+                    row,
+                    self.detection.one_hot_label_columns,
+                ),
+            axis=1,
+        )
 
     # -------------------------------------------------------------------------
     # CLEANING
@@ -1915,11 +2367,37 @@ class MasterDatasetProcessor:
         self._profile_cache = report
         return report
 
-    def _label_series_for_profile(self, frame: pd.DataFrame, detection: DetectionResult) -> pd.Series:
+    def _label_series_for_profile(
+    self,
+    frame: pd.DataFrame,
+    detection: DetectionResult,
+) -> pd.Series:
+
+        if detection.label_column == "__VAD__":
+            return frame.apply(
+                lambda row: [
+                    float(row["V"]),
+                    float(row["A"]),
+                    float(row["D"]),
+                ],
+                axis=1,
+            )
+
         if detection.label_column:
-            return frame[detection.label_column].map(LabelNormalizer.parse)
+            return frame[
+                detection.label_column
+            ].map(LabelNormalizer.parse)
+
         assert detection.one_hot_label_columns
-        return frame.apply(lambda row: LabelNormalizer.one_hot_row(row, detection.one_hot_label_columns), axis=1)
+
+        return frame.apply(
+            lambda row:
+                LabelNormalizer.one_hot_row(
+                    row,
+                    detection.one_hot_label_columns,
+                ),
+            axis=1,
+        )
 
     # -------------------------------------------------------------------------
     # VALIDATION
@@ -2281,11 +2759,16 @@ COMMAND_INFO: dict[str, dict[str, Any]] = {
     },
     "prepare": {
         "purpose": "Download, preprocess, and save a known dataset in one command.",
-        "usage": "python master_dataset.py prepare --dataset {goemo,isear,empathetic,emobank} -o OUTPUT",
+        "usage": (
+                "python master_dataset.py prepare "
+                "--dataset {goemo,isear,empathetic,emobank} "
+                "[-o OUTPUT] [--offline]"
+            ),
         "options": [
             ("--dataset", "Dataset name: goemo, isear, empathetic, emobank"),
             ("-o, --output", "Output file path (required)"),
             ("--source", "Optional override source (local file or hf://...)"),
+            ("--offline", "Use only the project-local dataset copy"),
             ("--text-column", "Override text column"),
             ("--label-column", "Override label column"),
             ("--overwrite", "Overwrite existing output"),
@@ -2433,27 +2916,74 @@ def render_command_help(renderer: Renderer, command: str) -> None:
         renderer.table("COMMAND OPTIONS", ["Option", "Purpose"], [["—", "No command-specific options"]])
 
 
-def render_known_datasets(renderer: Renderer) -> None:
-    """Display a table of all known datasets with their sources and column hints."""
+def render_known_datasets(
+    renderer: Renderer,
+) -> None:
+    """Display managed datasets and local availability."""
+
     rows = []
+
     for key, spec in KNOWN_DATASETS.items():
+
+        local_path = (
+            known_dataset_raw_dir(key)
+            / spec["local_raw"]
+        )
+
+        local_status = (
+            "READY"
+            if local_path.exists() and local_path.stat().st_size > 0
+            else "MISSING"
+        )
+        
+        print(loacl_status)
+
         rows.append([
             key,
             spec["name"],
+            "READY" if local_path.exists() else "MISSING",
             spec.get("url", "—"),
             spec.get("text_column", "?"),
             spec.get("label_column", "?"),
             spec.get("task_type", "?"),
-            spec.get("class_count", "?"),
+            spec.get("class_count", "—"),
             spec.get("notes", ""),
         ])
+
     renderer.table(
         "KNOWN DATASETS",
-        ["Key", "Name", "URL", "Text col", "Label col", "Task", "# classes", "Notes"],
+        [
+            "Key",
+            "Name",
+            "Local",
+            "Source",
+            "Text",
+            "Target",
+            "Task",
+            "# classes",
+            "Notes",
+        ],
         rows,
-        caption="Use 'prepare --dataset KEY' to process one.",
+        caption=(
+            "Known datasets are acquired into ./datasets/ on first "
+            "online use; --offline requires the local copy."
+        ),
     )
 
+def known_dataset_root(key: str) -> Path:
+    return PROJECT_DATASETS_DIR / key
+
+
+def known_dataset_raw_dir(key: str) -> Path:
+    path = known_dataset_root(key) / "raw"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def known_dataset_processed_dir(key: str) -> Path:
+    path = known_dataset_root(key) / "processed"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 # =============================================================================
 # INTERACTIVE LABORATORY
@@ -2700,7 +3230,8 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--dataset", choices=list(KNOWN_DATASETS.keys()), required=True,
                          help="Key of the known dataset (goemo, isear, empathetic, emobank)")
     prepare.add_argument("--source", help="Override source (local path or hf://...)")
-    prepare.add_argument("-o", "--output", required=True, help="Output file path")
+    prepare.add_argument("-o", "--output", default=None, help="Output path; defaults to datasets/<key>/processed/<key>_clean.csv")
+    prepare.add_argument("--offline", action="store_true", help="Use only the project-local known dataset copy")
     prepare.add_argument("--text-column", help="Override text column")
     prepare.add_argument("--label-column", help="Override label column")
     prepare.add_argument("--overwrite", action="store_true", help="Overwrite existing output")
@@ -2850,6 +3381,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             drop_short_text=getattr(args, "drop_short", None) is not None,
             min_text_chars=getattr(args, "drop_short", None) or 1,
             drop_duplicates=not getattr(args, "no_deduplicate", False),
+            offline=getattr(args, "offline", False),
             quiet=args.quiet,
             no_visuals=args.no_visuals,
             # We don't need sentiment scoring here; we can skip it
@@ -2858,8 +3390,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Process and save
         df = processor.process(force=True)
         # Override output format if not specified
-        fmt = getattr(args, "format", "csv")
-        processor.save(args.output, fmt=fmt, overwrite=args.overwrite, manifest=not args.no_manifest)
+        fmt = getattr(args, "format", None) or "csv"
+
+        output_path = (
+            Path(args.output).expanduser().resolve()
+            if args.output
+            else (
+                PROJECT_DATASETS_DIR
+                / args.dataset
+                / "processed"
+                / f"{args.dataset}_clean.csv"
+            )
+        )
+
+        processor.save(
+            output_path,
+            fmt=fmt,
+            overwrite=args.overwrite,
+            manifest=not args.no_manifest,
+        )
         return 0
 
     try:
@@ -2920,40 +3469,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 """
-# See all known datasets
-python master_dataset.py --list-datasets
+# ---------------------------------------------------------------------------
+# MANAGED DATASETS
+# ---------------------------------------------------------------------------
 
-# Prepare GoEmotions from Hugging Face (or local CSV)
-python master_dataset.py prepare --dataset goemo -o goemo_clean.csv
+# First run: acquire online, cache locally, preprocess, validate, and save.
+python master_dataset.py prepare --dataset goemo
+python master_dataset.py prepare --dataset isear
+python master_dataset.py prepare --dataset empathetic
+python master_dataset.py prepare --dataset emobank
 
-# Prepare ISEAR (adjust source path if needed)
-python master_dataset.py prepare --dataset isear --source isear_dataset-master/isear.csv -o isear_clean.csv
+# Later runs can be completely offline.
+python master_dataset.py prepare --dataset goemo --offline
+python master_dataset.py prepare --dataset isear --offline
+python master_dataset.py prepare --dataset empathetic --offline
+python master_dataset.py prepare --dataset emobank --offline
 
-# Prepare EmpatheticDialogues
-python master_dataset.py prepare --dataset empathetic -o emp_clean.csv
-
-# Prepare EmoBank
-python master_dataset.py prepare --dataset emobank -o emobank_clean.csv
-
-# Inspect any dataset
-python master_dataset.py inspect hf://emobank
-
-# Launch interactive lab
-python master_dataset.py interactive
-
-
-
-##############################################
+# Managed datasets live under:
+# ./datasets/<dataset>/raw/
+# ./datasets/<dataset>/processed/
 
 
 
-Official Dataset Links
 
-Dataset	Link
-GoEmotions  	https://github.com/google-research/google-research/tree/master/goemotions
-ISEAR   	https://www.unige.ch/cisa/research/materials-and-online-research/research-material/
-EmpatheticDialogues 	https://github.com/facebookresearch/EmpatheticDialogues
-EmoBank	    https://github.com/JULIELab/EmoBank
+# ---------------------------------------------------------------------------
+# DATASET SOURCES
+# ---------------------------------------------------------------------------
+
+# GoEmotions:
+# https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/train.tsv
+# https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/dev.tsv
+# https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/test.tsv
+
+# ISEAR:
+# Official documentation:
+# https://www.unige.ch/cisa/research/materials-and-online-research/research-material/
+# Downloadable dataset mirror:
+# https://raw.githubusercontent.com/sinmaniphel/py_isear_dataset/master/isear.csv
+
+# EmpatheticDialogues:
+# https://dl.fbaipublicfiles.com/parlai/empatheticdialogues/empatheticdialogues.tar.gz
+
+# EmoBank:
+# https://github.com/JULIELab/EmoBank/raw/master/corpus/emobank.csv
 """
 
 
