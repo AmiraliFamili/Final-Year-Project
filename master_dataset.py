@@ -809,6 +809,171 @@ def default_processed_output_for_source(source: str) -> Path:
 # RICH PRESENTATION LAYER
 # =============================================================================
 
+# =============================================================================
+# ROBUST DELIMITER-SEPARATED INGESTION
+# =============================================================================
+
+# =============================================================================
+# ROBUST DELIMITER-SEPARATED INGESTION
+# =============================================================================
+
+@dataclass
+class DelimitedIngestPolicy:
+    """How a delimiter-separated file should be read and repaired."""
+    delimiter: str = ","
+    text_column: Optional[str] = None
+    on_field_mismatch: str = "skip"     # merge_into_text | skip | strict
+    header: bool = True
+    encoding: str = "utf-8"
+    quotechar: str = '"'
+    merge_delta_limit: int = 64          # safety cap on how much merge we allow
+
+
+def sniff_delimited_policy(
+    path: Path,
+    sample_bytes: int = 65536,
+) -> DelimitedIngestPolicy:
+    """
+    Sniff the delimiter and header presence from a small sample.
+
+    Falls back to comma-delimited with a header on any sniffing failure, which
+    is the safest default for the kinds of files this loader accepts.
+    """
+    try:
+        raw = path.read_bytes()[:sample_bytes]
+    except OSError:
+        return DelimitedIngestPolicy()
+
+    try:
+        sample = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return DelimitedIngestPolicy()
+
+    if not sample.strip():
+        return DelimitedIngestPolicy()
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        delimiter = ","
+
+    try:
+        has_header = csv.Sniffer().has_header(sample)
+    except csv.Error:
+        has_header = True
+
+    return DelimitedIngestPolicy(
+        delimiter=delimiter,
+        text_column=None,
+        on_field_mismatch="skip",
+        header=has_header,
+    )
+
+
+def read_delimited_robust(
+    path: Path,
+    policy: DelimitedIngestPolicy,
+) -> pd.DataFrame:
+    """
+    Quote-aware, row-shape-validating reader for delimiter-separated files.
+    """
+    path = Path(path).expanduser().resolve()
+
+    rows: list[list[str]] = []
+    header: Optional[list[str]] = None
+    expected: Optional[int] = None
+    skipped: int = 0
+    merged: int = 0
+
+    def _raise(line_no: int, got: int) -> None:
+        raise DatasetSourceError(
+            f"{path.name}:{line_no}: expected {expected} fields, got {got}."
+        )
+
+    with path.open("r", encoding=policy.encoding, newline="") as handle:
+        reader = csv.reader(
+            handle,
+            delimiter=policy.delimiter,
+            quotechar=policy.quotechar,
+        )
+
+        for line_no, parts in enumerate(reader, start=1):
+
+            if header is None and policy.header:
+                header = parts
+                expected = len(header)
+                continue
+
+            if expected is None:
+                expected = len(parts)
+                header = [f"col_{i}" for i in range(expected)]
+
+            if len(parts) == expected:
+                rows.append(parts)
+                continue
+
+            delta = len(parts) - expected
+
+            if policy.on_field_mismatch == "strict":
+                _raise(line_no, len(parts))
+
+            if policy.on_field_mismatch == "skip":
+                skipped += 1
+                continue
+
+            if policy.on_field_mismatch == "merge_into_text":
+                if (
+                    policy.text_column is None
+                    or header is None
+                    or policy.text_column not in header
+                ):
+                    raise DatasetSourceError(
+                        f"{path.name}:{line_no}: cannot merge stray "
+                        f"delimiters — text_column={policy.text_column!r} "
+                        f"is not in header {header!r}."
+                    )
+
+                if abs(delta) > policy.merge_delta_limit:
+                    raise DatasetSourceError(
+                        f"{path.name}:{line_no}: field-count deviation "
+                        f"{delta} exceeds merge_delta_limit="
+                        f"{policy.merge_delta_limit}."
+                    )
+
+                idx = header.index(policy.text_column)
+
+                if delta > 0:
+                    merged_row = (
+                        parts[:idx]
+                        + [policy.delimiter.join(parts[idx : idx + delta + 1])]
+                        + parts[idx + delta + 1 :]
+                    )
+                else:
+                    merged_row = parts + [""] * (-delta)
+
+                rows.append(merged_row)
+                merged += 1
+                continue
+
+            raise DatasetSourceError(
+                f"{path.name}:{line_no}: unknown on_field_mismatch policy "
+                f"{policy.on_field_mismatch!r}."
+            )
+
+    if header is None:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(rows, columns=header)
+
+    if skipped or merged:
+        print(
+            f"[ingest] {path.name}: parsed {len(frame):,} rows "
+            f"({merged} merged, {skipped} skipped)."
+        )
+
+    return frame
+
 class Renderer:
     """Centralized presentation layer.
 
@@ -1163,33 +1328,133 @@ class DatasetLoader:
         return destination_path
 
     @staticmethod
-    def _read_path(path: Path) -> pd.DataFrame:
+    def _read_path(
+        path: Path,
+        policy: Optional["DelimitedIngestPolicy"] = None,
+    ) -> pd.DataFrame:
+        """
+        Parse any supported dataset file into a DataFrame.
+
+        Delimiter-separated files (.csv/.tsv/.txt) are read through
+        ``read_delimited_robust``, which is quote-aware and tolerant of rows whose
+        field count diverges from the header. For managed datasets the caller
+        supplies an explicit ``DelimitedIngestPolicy``; otherwise the delimiter and
+        header presence are sniffed from the first few kilobytes.
+
+        All other formats (JSON, JSONL, Parquet, Excel) go through their native
+        pandas readers. Every failure is re-raised as a ``DatasetSourceError``
+        with a precise message, so no raw pandas traceback ever escapes the
+        loader.
+        """
+        path = Path(path).expanduser().resolve()
+
+        if not path.exists():
+            raise DatasetSourceError(f"Dataset file does not exist: {path}")
+
+        if not path.is_file():
+            raise DatasetSourceError(f"Dataset source is not a file: {path}")
+
+        if path.stat().st_size == 0:
+            raise DatasetSourceError(f"Dataset file is empty: {path}")
+
         suffix = path.suffix.lower()
+
         try:
-            if suffix == ".csv":
-                return pd.read_csv(path)
-            if suffix == ".tsv":
-                return pd.read_csv(path, sep="\t")
-            if suffix == ".txt":
-                try:
-                    return pd.read_csv(path, sep="\t")
-                except Exception:
-                    return pd.read_csv(path)
+            # ------------------------------------------------------------------
+            # DELIMITER-SEPARATED (robust path)
+            # ------------------------------------------------------------------
+            if suffix in {".csv", ".tsv", ".txt"}:
+                effective_policy = policy or sniff_delimited_policy(path)
+                return read_delimited_robust(path, effective_policy)
+            # ------------------------------------------------------------------
+            # JSONL / NDJSON
+            # ------------------------------------------------------------------
             if suffix in {".jsonl", ".ndjson"}:
                 return pd.read_json(path, lines=True)
+
+            # ------------------------------------------------------------------
+            # JSON (array-of-records or line-delimited fallback)
+            # ------------------------------------------------------------------
             if suffix == ".json":
                 try:
                     return pd.read_json(path)
                 except ValueError:
                     return pd.read_json(path, lines=True)
+
+            # ------------------------------------------------------------------
+            # PARQUET
+            # ------------------------------------------------------------------
             if suffix in {".parquet", ".pq"}:
                 return pd.read_parquet(path)
+
+            # ------------------------------------------------------------------
+            # EXCEL
+            # ------------------------------------------------------------------
             if suffix in {".xlsx", ".xls"}:
                 return pd.read_excel(path)
-        except Exception as exc:
-            raise DatasetSourceError(f"Failed parsing '{path}': {type(exc).__name__}: {exc}") from exc
-        raise DatasetSourceError(f"Unsupported format '{suffix}'. Supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}")
 
+        except DatasetSourceError:
+            raise
+
+        except Exception as exc:
+            raise DatasetSourceError(
+                f"Failed parsing '{path}': {type(exc).__name__}: {exc}"
+            ) from exc
+
+        raise DatasetSourceError(
+            f"Unsupported format '{suffix}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}"
+        )
+
+    @staticmethod
+    def _ingest_delimited(key: str, path: Path) -> pd.DataFrame:
+        """
+        Read a managed dataset's canonical raw snapshot.
+
+        The snapshot is always written by ``atomic_write_dataframe_csv`` using
+        pandas' default comma delimiter, so the reader must use a comma policy
+        regardless of the original source delimiter (which was already consumed
+        during acquisition). An explicit ``ingest_policy`` on the spec, if present,
+        still wins — that is the extension point for future non-comma snapshots.
+        """
+        spec = KNOWN_DATASETS.get(key, {})
+
+        policy_dict = spec.get("ingest_policy")
+        if policy_dict:
+            policy = DelimitedIngestPolicy(**policy_dict)
+        else:
+            policy = DelimitedIngestPolicy(
+                delimiter=",",
+                text_column=spec.get("text_column"),
+                on_field_mismatch="merge_into_text",
+                header=True,
+            )
+
+        return read_delimited_robust(path, policy)
+    @staticmethod
+    def _read_pipe_delimited_with_text_pipes(path: Path, text_column: str) -> pd.DataFrame:
+        import csv
+        rows = []
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle, delimiter="|", quotechar='"')
+            header = next(reader)
+            if text_column not in header:
+                raise DatasetSourceError(
+                    f"Text column '{text_column}' not found in pipe-delimited file."
+                )
+            text_idx = header.index(text_column)
+            for parts in reader:
+                extra = len(parts) - len(header)
+                if extra > 0:
+                    parts = (
+                        parts[:text_idx]
+                        + ["|".join(parts[text_idx : text_idx + extra + 1])]
+                        + parts[text_idx + extra + 1 :]
+                    )
+                elif extra < 0:
+                    parts = parts + [""] * (-extra)
+                rows.append(parts)
+        return pd.DataFrame(rows, columns=header)
     @staticmethod
     def _read_known_local(
         key: str,
@@ -1206,10 +1471,7 @@ class DatasetLoader:
             source_type = spec.get("source_type")
 
             if source_type == "delimited":
-                frame = pd.read_csv(
-                    path,
-                    sep=spec["delimiter"],
-                )
+                frame = DatasetLoader._ingest_delimited(key, path)
 
             elif source_type == "goemotions_tsv":
                 frame = pd.read_csv(
@@ -1346,22 +1608,18 @@ class DatasetLoader:
         # -------------------------------------------------------------------------
 
         elif kind == "delimited":
-
             downloaded_path = self._download(
                 spec["online_urls"]["raw"],
                 raw_root / "_source_isear.csv",
             )
-
-            acquired = pd.read_csv(
-                downloaded_path,
-                sep=spec["delimiter"],
+            policy = DelimitedIngestPolicy(
+                delimiter=spec.get("delimiter", ","),
+                text_column=spec["text_column"],       # "SIT"
+                on_field_mismatch="merge_into_text",
+                header=True,
             )
-
-            atomic_write_dataframe_csv(
-                acquired,
-                local_path,
-            )
-
+            acquired = self._read_path(downloaded_path, policy=policy)
+            atomic_write_dataframe_csv(acquired, local_path)
         # -------------------------------------------------------------------------
         # EMOBANK
         # -------------------------------------------------------------------------
@@ -1582,7 +1840,6 @@ class DatasetLoader:
                 repo_spec, config = repo_spec.split(":", 1)
 
             repo = repo_spec.strip()
-
             try:
                 loaded = hf_load_dataset(
                     repo,
@@ -1593,11 +1850,11 @@ class DatasetLoader:
                 raise DatasetSourceError(
                     f"Could not load Hugging Face dataset '{repo}'. "
                     f"Error: {type(exc).__name__}: {exc}\n"
-                    "Possible reasons:\n"
-                    "  - The dataset name/config is incorrect.\n"
-                    "  - The dataset requires authentication or is gated.\n"
-                    "  - You are offline.\n"
-                    "  - The 'datasets' package is outdated."
+                    "If this is a canonical dataset that has been reorganized upstream, "
+                    "pass its fully qualified ID instead:\n"
+                    "  hf://<namespace>/<name>\n"
+                    "For GLUE-family datasets, the canonical source is nyu-mll/glue:\n"
+                    "  hf://nyu-mll/glue --hf-config <config>"
                 ) from exc
 
             if hasattr(loaded, "items"):
@@ -2114,6 +2371,7 @@ class SentimentScorer:
         self._device = None
         self._label_signs: dict[int, float] = {}
         self._vader = None
+        self._backend_locked: Optional[str] = None
 
     @staticmethod
     def _torch_version() -> tuple[int, int, int]:
@@ -2199,10 +2457,11 @@ class SentimentScorer:
 
         # Current Transformers documents PyTorch 2.5+ as its tested baseline.
         # This preflight prevents the previous misleading NameError path.
-        if self._torch_version() < (2, 5, 0):
+        if self._torch_version() < (2, 0, 0):
             raise SentimentBackendError(
-                f"Installed PyTorch is {torch.__version__}. Current Transformers requires/tests against PyTorch 2.5+. "
-                "Upgrade PyTorch before using transformer sentiment scoring."
+                f"Installed PyTorch is {torch.__version__}. "
+                "Transformer sentiment scoring requires PyTorch 2.0+. "
+                "Upgrade with: pip install -U torch"
             )
 
         AutoModelForSequenceClassification, AutoTokenizer = self._import_transformers_quietly()
@@ -2297,11 +2556,28 @@ class SentimentScorer:
         if self.backend_request in {"transformer", "vader", "lexicon"}:
             return self.backend_request
         if self.backend_request != "auto":
-            raise SentimentBackendError("Backend must be auto, transformer, vader, or lexicon.")
-        if torch is not None and self._torch_version() >= (2, 5, 0):
+            raise SentimentBackendError(
+                "Backend must be auto, transformer, vader, or lexicon."
+            )
+
+        # AUTO: prefer transformer whenever PyTorch is importable at a
+        # realistic baseline. transformers itself works on torch >= 2.0.
+        if torch is not None and self._torch_version() >= (2, 0, 0):
             return "transformer"
+
         if SentimentIntensityAnalyzer is not None:
+            torch_state = "not installed" if torch is None else f"torch {torch.__version__} (<2.0)"
+            self.renderer.warning(
+                f"Transformer backend unavailable ({torch_state}). "
+                "Falling back to VADER. For transformer sentiment run:\n"
+                "    pip install -U torch transformers"
+            )
             return "vader"
+
+        self.renderer.warning(
+            "Neither PyTorch nor VADER is available. "
+            "Falling back to the built-in lexicon scorer."
+        )
         return "lexicon"
 
     def _transformer_score_batch(self, texts: Sequence[str]) -> list[float]:
@@ -2342,21 +2618,44 @@ class SentimentScorer:
             raise SentimentBackendError(f"Transformer inference failed: {type(exc).__name__}: {exc}") from exc
 
     def score_batch(self, texts: Sequence[str]) -> list[float]:
-        backend = self._choose_backend()
+        # Once a fallback has been committed for this scorer instance, never
+        # re-attempt the failed path — otherwise "auto" would try and fail the
+        # transformer once per batch.
+        if self._backend_locked is not None:
+            backend = self._backend_locked
+        else:
+            backend = self._choose_backend()
+
         if backend == "transformer":
-            if self.resolved_backend != "transformer":
-                self._ensure_transformer()
-            return self._transformer_score_batch(texts)
+            try:
+                if self.resolved_backend != "transformer":
+                    self._ensure_transformer()
+                return self._transformer_score_batch(texts)
+            except SentimentBackendError as exc:
+                if self.backend_request != "auto":
+                    # Explicit --sentiment-backend transformer is a contract.
+                    raise
+                self.renderer.warning(
+                    f"Transformer backend failed ({exc}). "
+                    "Falling back to VADER for the remainder of this run. "
+                    "No further retries will be attempted."
+                )
+                self._backend_locked = "vader"
+                backend = "vader"
+
         if backend == "vader":
             if self.resolved_backend != "vader":
                 self._ensure_vader()
-            return [float(np.clip(self._vader.polarity_scores(str(text))["compound"], -1.0, 1.0)) for text in texts]
+            return [
+                float(np.clip(self._vader.polarity_scores(str(t))["compound"], -1.0, 1.0))
+                for t in texts
+            ]
 
         self.resolved_backend = "lexicon"
         self.resolved_model = "built-in-lexicon"
         self.resolved_device = "cpu"
         self.resolved_dtype = "float64"
-        return [self._lexicon_score(str(text)) for text in texts]
+        return [self._lexicon_score(str(t)) for t in texts]
 
 
 # =============================================================================
