@@ -63,6 +63,7 @@ from typing import Any, Iterable, Mapping, Sequence, Dict
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import numpy as np
 import pandas as pd
@@ -114,11 +115,11 @@ LEDGER_PATH = EXTERNAL_ROOT / "ledger.jsonl"
 LEGACY_HIDDEN_STATES = EXTERNAL_MOUNT / "hidden_states"
 
 # Processed dataset source (master_dataset.py contract).
-PROCESSED_DATASETS_ROOT = Path(
-    "/Users/amirali/Desktop/Final Year Project/Final-Year-Project/datasets"
-)
+PROCESSED_DATASETS_ROOT = Path("/Volumes/Amirali/datasets")
+
 PROCESSED_CSV_TEMPLATE = "{name}/processed/{name}_clean.csv"
 PROCESSED_COLUMNS = ("clean_text", "label", "sentiment_score")
+RUNS_ROOT = Path("/Volumes/Amirali/hidden_states/runs")
 
 DEFAULT_POOLING = "mean"
 DEFAULT_MAX_LENGTH = 512
@@ -274,6 +275,23 @@ def _print_info(message: str, enabled: bool) -> None:
 def _print_critical(message: str, enabled: bool) -> None:
     if enabled:
         print(message)
+
+
+def _check_hf_endpoint() -> None:
+    """Fail fast if the configured HF endpoint is unreachable."""
+    import requests
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    try:
+        r = requests.head(endpoint, timeout=10, allow_redirects=True)
+        if r.status_code >= 500:
+            raise RuntimeError(f"HF endpoint returned {r.status_code}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Hugging Face endpoint is unreachable: {endpoint}\n"
+            f"Error: {type(exc).__name__}: {exc}\n"
+            f"Set HF_ENDPOINT to a reachable mirror (see docs), or run with "
+            f"--offline if all models are already cached."
+        ) from exc
 
 
 def _verbosity_name(show_verbose: bool, show_info: bool, show_critical: bool, show_debug: bool = False) -> str:
@@ -764,14 +782,62 @@ def load_processed_csv(csv_path: str | Path) -> tuple[pd.DataFrame, str]:
     return frame, _sha256_file(path)
 
 
+def _find_processed_csv(dataset_dir: Path, dataset_name: str) -> Path | None:
+    """Locate <root>/<name>/processed/<something>.csv.
+
+    Preference order:
+      1. <name>_clean.csv          (master_dataset.py 'prepare' default)
+      2. <name>.csv                (master_dataset.py 'process' default)
+      3. case-insensitive match on either
+      4. the only *.csv present
+      5. first *.csv whose header already contains the canonical columns
+    """
+    processed = dataset_dir / "processed"
+    if not processed.is_dir():
+        return None
+
+    def ok(p: Path) -> bool:
+        return p.is_file() and p.stat().st_size > 0
+
+    for stem in (f"{dataset_name}_clean", dataset_name):
+        p = processed / f"{stem}.csv"
+        if ok(p):
+            return p
+
+    lname = dataset_name.lower()
+    wanted = {f"{lname}_clean", lname}
+    for p in processed.glob("*.csv"):
+        if ok(p) and p.stem.lower() in wanted:
+            return p
+
+    csvs = [p for p in processed.glob("*.csv") if ok(p)]
+    if len(csvs) == 1:
+        return csvs[0]
+
+    for p in csvs:
+        try:
+            header = pd.read_csv(p, nrows=0).columns.tolist()
+        except Exception:
+            continue
+        if all(c in header for c in PROCESSED_COLUMNS):
+            return p
+    return None
+
+
 def discover_processed_datasets(
-    datasets_root: str | Path = PROCESSED_DATASETS_ROOT,
+    datasets_root: str | Path | None = None,
     *,
     include: Iterable[str] | None = None,
     exclude: Iterable[str] | None = None,
     show_info: bool = True,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
-    root = Path(datasets_root).expanduser().resolve()
+    """Scan <root>/<name>/processed/ for CSVs and return (frames, hashes).
+
+    The dataset key is the directory name.  This is exactly what
+    master_dataset.py produces with sanitize_dataset_name(), so the two
+    scripts are keyed consistently without any extra registry.
+    """
+    root = Path(datasets_root or PROCESSED_DATASETS_ROOT).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Processed datasets root not found: {root}")
 
@@ -780,30 +846,45 @@ def discover_processed_datasets(
 
     datasets: dict[str, pd.DataFrame] = {}
     hashes: dict[str, str] = {}
+    skipped: list[tuple[str, str]] = []
 
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name.startswith("."):
             continue
         name = entry.name
         if include_set is not None and name not in include_set:
             continue
         if name in exclude_set:
             continue
-        csv_path = entry / "processed" / f"{name}_clean.csv"
-        if not csv_path.is_file():
-            if show_info:
-                print(f"  · {name:<24} skipped (no processed CSV)")
+
+        csv_path = _find_processed_csv(entry, name)
+        if csv_path is None:
+            skipped.append((name, "no processed CSV"))
             continue
-        frame, sha = load_processed_csv(csv_path)
+        try:
+            frame, sha = load_processed_csv(csv_path)
+        except Exception as exc:
+            skipped.append((name, f"{type(exc).__name__}: {exc}"))
+            continue
+
         datasets[name] = frame
         hashes[name] = sha
         if show_info:
-            print(f"  ✓ {name:<24} {len(frame):>8,} rows  sha256={sha[:12]}")
+            rel = csv_path.relative_to(root)
+            print(f"  ✓ {name:<26} {len(frame):>8,} rows  sha256={sha[:12]}  ({rel})")
+
+    if show_info and skipped:
+        print()
+        for name, reason in skipped:
+            print(f"  · {name:<26} skipped — {reason}")
 
     if not datasets:
         raise RuntimeError(
-            f"No processed datasets found under {root}. "
-            f"Expected {PROCESSED_CSV_TEMPLATE!r} in each subdirectory."
+            f"No usable processed datasets under {root}.\n"
+            f"Expected one of:\n"
+            f"  {root}/<name>/processed/<name>_clean.csv\n"
+            f"  {root}/<name>/processed/<name>.csv\n"
+            f"with columns {PROCESSED_COLUMNS}."
         )
     return datasets, hashes
 
@@ -883,17 +964,67 @@ def _repository_files(model_name: str, revision: str | None = None) -> list[str]
 
 
 def _download_patterns(model_name: str, revision: str | None = None) -> tuple[list[str], list[str]]:
+    """Return (allow_patterns, ignore_patterns) for a minimal PyTorch snapshot.
+
+    We deliberately allow only the files needed to load a model and run
+    hidden-state extraction. Framework-specific weights (TF, Flax, Rust,
+    ONNX, CoreML, GGUF) are excluded by name, not by wildcard, so that the
+    allow list cannot accidentally re-include them.
+    """
     files = _repository_files(model_name, revision)
     has_safe = any(x.endswith(".safetensors") for x in files)
     has_bin = any(x.endswith(".bin") for x in files)
     if not has_safe and not has_bin:
-        raise RuntimeError(f"No supported PyTorch checkpoint found for {model_name} at {revision}")
-    allow = list(COMMON_MODEL_FILES) + (["*.safetensors"] if has_safe else ["*.bin"])
+        raise RuntimeError(
+            f"No supported PyTorch checkpoint found for {model_name} at {revision}"
+        )
+
+    # Explicit allow-list. Every entry is a file we actually need.
+    allow: list[str] = [
+        "config.json",
+        "generation_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "vocab.txt",
+        "spiece.model",
+        "spm.model",
+        "sentencepiece.bpe.model",
+        "tokenizer.model",
+    ]
+
+    # Weights only. Metadata files are handled separately by the fallback path
+    # because Cloudflare Worker proxies strip Content-Length from HEAD responses
+    # for text-ish files >1KB. See huggingface/huggingface_hub#4741.
+    allow: list[str] = []
+    if has_safe:
+        allow.append("*.safetensors")
+    else:
+        allow.append("*.bin")
+    allow.append("*.index.json")
     if get_model_spec(model_name).trust_remote_code:
         allow.append("*.py")
-    ignore = list(UNNECESSARY_FRAMEWORK_PATTERNS)
+
+    # Explicit ignore-list. This is belt-and-braces: even if a future
+    # `snapshot_download` changes the precedence, these are excluded.
+    ignore: list[str] = [
+        "*.h5", "*.msgpack", "*.ot", "rust_model.ot",
+        "tf_model.*", "flax_model.*",
+        "*.onnx", "*.gguf", "*.ggml",
+        "*.mlmodel", "*.mlpackage", "*.mlmodelc",
+        "coreml/**",
+        "*.tflite", "*.pb",
+        "*.pt", "*.pth", "*.ckpt",   # common non-HF checkpoints
+        "*.msgpack", "*.safetensors.index.json.lock",
+    ]
+
+    # If safetensors exists, exclude the duplicate .bin checkpoint.
     if has_safe:
         ignore.append("*.bin")
+
     return allow, ignore
 
 
@@ -973,42 +1104,249 @@ def _validate_snapshot(snapshot: Path) -> None:
     except ValueError as exc:
         raise RuntimeError(f"Snapshot escaped external root: {snapshot}") from exc
     if not (snapshot / "config.json").exists():
-        raise RuntimeError(f"Snapshot incomplete: missing {snapshot / 'config.json'}")
+        raise RuntimeError(
+            f"Snapshot incomplete: missing {snapshot / 'config.json'}. "
+            f"Run the download_via_proxy.sh script or manually fetch "
+            f"config.json via curl GET."
+        )
     inv = checkpoint_inventory(snapshot)
     if not inv["safetensors"] and not inv["pytorch_bin"] and not inv["index_files"]:
         raise RuntimeError(f"Snapshot contains no supported PyTorch checkpoint files: {snapshot}")
     if inv["index_files"] and not (inv["safetensors"] or inv["pytorch_bin"]):
         raise RuntimeError(f"Checkpoint index exists but no shards are present: {snapshot}")
 
+def _download_single_file_with_fallback(
+    model_name: str,
+    revision: str,
+    filename: str,
+    *,
+    cache_dir: Path,
+    max_attempts: int = 3,
+) -> Path | None:
+    """Download one file from the Hub, with a ranged-GET fallback for the
+    Cloudflare Content-Length stripping bug.
+
+    Strategy:
+      1. Try `hf_hub_download` normally.
+      2. On `FileMetadataError` (missing Content-Length), issue a plain
+         ranged GET to obtain the size, then retry.
+      3. On repeated failure, return None so the caller can decide.
+    """
+    import requests
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import FileMetadataError
+
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return Path(hf_hub_download(
+                repo_id=model_name,
+                filename=filename,
+                revision=revision,
+                cache_dir=str(cache_dir),
+                local_files_only=False,
+            ))
+        except FileMetadataError:
+            # Cloudflare stripped Content-Length. Probe the file with a
+            # ranged GET to recover the size, then retry.
+            url = f"{endpoint}/{model_name}/resolve/{revision}/{filename}"
+            try:
+                r = requests.get(
+                    url,
+                    headers={"Range": "bytes=0-0", "Accept-Encoding": "identity"},
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                content_range = r.headers.get("Content-Range")
+                if content_range:
+                    total = content_range.split("/")[-1]
+                    print(f"  [fallback] {filename}: recovered size={total} via ranged GET")
+                else:
+                    print(f"  [fallback] {filename}: ranged GET returned no Content-Range")
+            except Exception as exc:
+                print(f"  [fallback] {filename}: ranged GET failed: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            print(f"  [download] {filename} attempt {attempt}/{max_attempts}: "
+                  f"{type(exc).__name__}: {exc}")
+            if attempt < max_attempts:
+                time.sleep(5.0 * attempt)
+    return None
+
+import subprocess
+
+def _curl_fetch_metadata(
+    model_name: str,
+    revision: str,
+    snapshot_dir: Path,
+    *,
+    max_retries: int = 3,
+) -> list[str]:
+    """Fetch metadata files via plain curl GET.
+
+    Cloudflare Worker proxies strip Content-Length from HEAD responses for
+    text-ish files >1KB, which makes huggingface_hub's snapshot_download fail.
+    GET requests are unaffected. This function uses curl to fetch each
+    metadata file directly.
+
+    Returns the list of files successfully written.
+    """
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    base = f"{endpoint}/{model_name}/resolve/{revision}"
+
+    # Files that any model may need. Missing ones are silently skipped.
+    METADATA_FILES = [
+        "config.json",
+        "generation_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "vocab.txt",
+        "spiece.model",
+        "spm.model",
+        "sentencepiece.bpe.model",
+        "tokenizer.model",
+    ]
+
+    fetched: list[str] = []
+    for filename in METADATA_FILES:
+        dest = snapshot_dir / filename
+        if dest.exists() and dest.stat().st_size > 0:
+            fetched.append(filename)
+            continue
+
+        url = f"{base}/{filename}"
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = subprocess.run(
+                    [
+                        "curl", "-fsSL",
+                        "--retry", "2",
+                        "--retry-delay", "2",
+                        "--connect-timeout", "60",
+                        "--max-time", "300",
+                        "-o", str(dest),
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=360,
+                )
+                if result.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                    fetched.append(filename)
+                    break
+                # 404 is fine — the model does not have this file.
+                if "404" in result.stderr:
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+            time.sleep(2.0 * attempt)
+        else:
+            # All retries exhausted for this file. Non-fatal.
+            _print_verbose(f"  [curl] skipped {filename} (unreachable or 404)", True)
+
+    return fetched
 
 def prepare_model(model_name: str, hyperparameters: HyperParameters,
                    show_verbose: bool = True, show_info: bool = True,
                    show_critical: bool = True) -> tuple[Path, str, float]:
-    # NOTE: configure_external_storage() must already have been called.
     verify_huggingface_storage(show_verbose)
+    _check_hf_endpoint()
     _print_info(f"\n→ Preparing Hugging Face model: {model_name}", show_info)
+
     started = time.perf_counter()
     revision = get_or_pin_model_revision(model_name, show_verbose)
     last_exc: BaseException | None = None
+
     for attempt in range(1, hyperparameters.download_retries + 1):
         attempt_started = time.perf_counter()
+
         try:
-            _print_info(f"  Preparation attempt {attempt}/{hyperparameters.download_retries}", show_info)
+            _print_info(
+                f"  Preparation attempt {attempt}/{hyperparameters.download_retries}",
+                show_info,
+            )
             allow, ignore = _download_patterns(model_name, revision)
+
             _print_verbose(
                 "  DOWNLOAD DIAGNOSTICS\n"
                 f"    Revision             : {revision}\n"
                 f"    Cache                : {HF_HUB_CACHE}\n"
                 f"    Workers              : {hyperparameters.download_max_workers}\n"
-                f"    ETag timeout         : {DOWNLOAD_ETAG_TIMEOUT_SECONDS}s\n"
                 f"    Allow patterns       : {allow}\n"
                 f"    Ignore patterns      : {ignore}",
                 show_verbose,
             )
-            snapshot = _snapshot_download_compat(
-                model_name, revision, allow, ignore, hyperparameters.download_max_workers,
+
+            # -----------------------------------------------------------------
+            # Step 1: snapshot_download for weights only. The allow-list
+            # from _download_patterns contains "*.safetensors" and
+            # "*.index.json" — no metadata files, so the Cloudflare
+            # Content-Length stripping never triggers on this step.
+            # -----------------------------------------------------------------
+            snapshot: Path | None = None
+            try:
+                snapshot = _snapshot_download_compat(
+                    model_name, revision, allow, ignore,
+                    hyperparameters.download_max_workers,
+                )
+            except Exception as snap_exc:
+                _print_critical(
+                    f"  Snapshot download reported failure "
+                    f"({type(snap_exc).__name__}). Checking for partial snapshot…",
+                    show_critical,
+                )
+                slug = model_name.replace("/", "--")
+                model_dir = HF_HUB_CACHE / f"models--{slug}"
+                snapshots_root = model_dir / "snapshots"
+                candidates = (
+                    sorted(
+                        (p for p in snapshots_root.glob("*") if p.is_dir()),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if snapshots_root.is_dir()
+                    else []
+                )
+                if not candidates:
+                    # Nothing landed. Re-raise so the outer retry loop
+                    # handles it.
+                    raise
+                snapshot = candidates[0]
+                _print_critical(
+                    f"  Recovered partial snapshot: {snapshot}",
+                    show_critical,
+                )
+
+            if snapshot is None:
+                raise RuntimeError(
+                    f"Snapshot download produced no directory for {model_name}"
+                )
+
+            # -----------------------------------------------------------------
+            # Step 2: curl GET for metadata files. GETs are never touched
+            # by Cloudflare's Content-Length stripping, so this always
+            # succeeds for files that exist in the repository.
+            # -----------------------------------------------------------------
+            _print_info(
+                "  Fetching metadata via curl (bypasses HEAD stripping)…",
+                show_info,
             )
+            fetched = _curl_fetch_metadata(
+                model_name, revision, Path(snapshot),
+            )
+            _print_info(
+                f"  Metadata files fetched: {len(fetched)}",
+                show_info,
+            )
+
             _validate_snapshot(snapshot)
+
             total_elapsed = time.perf_counter() - started
             attempt_elapsed = time.perf_counter() - attempt_started
             _print_info(
@@ -1020,12 +1358,14 @@ def prepare_model(model_name: str, hyperparameters: HyperParameters,
                 show_info,
             )
             return snapshot, revision, total_elapsed
+
         except Exception as exc:
             last_exc = exc
             transient = _is_transient_download_error(exc)
             _print_critical(
                 "\n" + _separator("!") +
-                f"\nMODEL PREPARATION FAILURE — attempt {attempt}/{hyperparameters.download_retries}\n"
+                f"\nMODEL PREPARATION FAILURE — attempt "
+                f"{attempt}/{hyperparameters.download_retries}\n"
                 f"  Model                : {model_name}\n"
                 f"  Revision             : {revision}\n"
                 f"  Error type           : {type(exc).__name__}\n"
@@ -1034,17 +1374,68 @@ def prepare_model(model_name: str, hyperparameters: HyperParameters,
                 _separator("!"),
                 show_critical,
             )
-            _print_verbose(f"  Traceback:\n{_truncate_traceback(traceback.format_exc())}", show_verbose)
+            _print_verbose(
+                f"  Traceback:\n{_truncate_traceback(traceback.format_exc())}",
+                show_verbose,
+            )
             if not transient or attempt >= hyperparameters.download_retries:
                 break
             sleep_for = hyperparameters.download_backoff_seconds * (2 ** (attempt - 1))
             _print_info(f"  ↻ Retrying in {sleep_for:.1f}s...", show_info)
             time.sleep(sleep_for)
+
     raise RuntimeError(
-        f"MODEL PREPARATION FAILED\nModel: {model_name}\nRevision: {revision}\n"
+        f"MODEL PREPARATION FAILED\n"
+        f"Model: {model_name}\n"
+        f"Revision: {revision}\n"
         f"Cache: {HF_HUB_CACHE}\n"
         f"{type(last_exc).__name__ if last_exc else 'UnknownError'}: {last_exc}"
     ) from last_exc
+
+
+def _per_file_snapshot_download(
+    model_name: str,
+    revision: str,
+    allow_patterns: list[str],
+    *,
+    cache_dir: Path,
+) -> Path:
+    """Download a model one file at a time, using the ranged-GET fallback
+    for any file whose HEAD metadata is stripped by Cloudflare.
+
+    Returns the snapshot directory path, resolved from the first successfully
+    downloaded file.
+    """
+    import fnmatch
+    from huggingface_hub import hf_hub_download
+
+    files = _repository_files(model_name, revision)
+    wanted: list[str] = []
+    for f in files:
+        if any(fnmatch.fnmatch(f, pat) for pat in allow_patterns):
+            wanted.append(f)
+
+    if not wanted:
+        raise RuntimeError(f"No files matched allow_patterns for {model_name}")
+
+    _print_info(f"  Per-file download: {len(wanted)} files", True)
+
+    snapshot_dir: Path | None = None
+    for i, filename in enumerate(wanted, 1):
+        _print_info(f"    [{i}/{len(wanted)}] {filename}", True)
+        path = _download_single_file_with_fallback(
+            model_name, revision, filename,
+            cache_dir=cache_dir,
+        )
+        if path is None:
+            raise RuntimeError(f"Per-file download failed for {model_name}:{filename}")
+        if snapshot_dir is None:
+            # hf_hub_download returns <cache>/models--<slug>/snapshots/<sha>/<file>
+            # Walk up to the snapshots/<sha> directory.
+            snapshot_dir = path.parent
+    if snapshot_dir is None:
+        raise RuntimeError(f"Per-file download produced no files for {model_name}")
+    return snapshot_dir
 
 
 def get_model_num_layers(config: Any) -> int:
@@ -1207,6 +1598,141 @@ def classify_model_loading_issues(model: torch.nn.Module,
         "core_meta_tensors": core_meta, "has_meta_tensors": bool(meta_names),
         "fatal": bool(core_missing or mismatched or core_meta),
     }
+
+
+def _load_master_dataset_module():
+    """Import the sibling master_dataset.py lazily.
+
+    The module lives in EXTERNAL_ROOT next to this file.  Adding
+    EXTERNAL_ROOT to sys.path once is enough for subsequent imports.
+    """
+    root_str = str(EXTERNAL_ROOT)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    import importlib
+    import master_dataset as MD
+    return importlib.reload(MD)   # pick up edits without restarting the kernel
+
+
+def acquire_dataset(
+    key: str,
+    source: str | None = None,
+    *,
+    text_column: str | None = None,
+    label_column: str | None = None,
+    overwrite: bool = False,
+    offline: bool = False,
+    sentiment_backend: str = "auto",
+    sentiment_model: str | None = None,
+    sentiment_batch_size: int = 32,
+    sentiment_max_length: int = 256,
+    device: str = "auto",
+    dtype: str = "auto",
+    **master_dataset_kwargs: Any,
+) -> Path:
+    """Acquire a dataset, routing through the HF_ENDPOINT proxy if set.
+
+    This is a proxy-aware wrapper around master_dataset.MasterDatasetProcessor.
+
+    On first call, it:
+      1. Sets HF_ENDPOINT and HF_HUB_DISABLE_XET for the child process.
+      2. Invokes the processor, which may call hf_load_dataset.
+      3. Verifies the produced CSV.
+
+    On subsequent calls, if the processed CSV exists and `overwrite=False`,
+    the network is never touched.
+    """
+    MD = _load_master_dataset_module()
+
+    name = MD.sanitize_dataset_name(key)
+    resolved_source = source or key
+
+    out_dir = PROCESSED_DATASETS_ROOT / name / "processed"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{name}_clean.csv"
+
+    if out_path.exists() and not overwrite:
+        _print_info(f"  ↺ {name}: processed CSV already present at {out_path}", True)
+        return out_path
+
+    # Propagate the proxy settings to the master_dataset module. The
+    # datasets library reads these at import time, so we set them before
+    # the first `load_dataset` call. If master_dataset was already
+    # imported, we set them anyway — the library reads the environment
+    # variable on each download.
+    endpoint = os.environ.get("HF_ENDPOINT")
+    if endpoint:
+        os.environ.setdefault("HF_ENDPOINT", endpoint)
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        # Datasets has its own offline flag. Set it only if the caller
+        # explicitly requested offline mode.
+        if offline:
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+    # Build the processor exactly as before.
+    processor = MD.MasterDatasetProcessor(
+        resolved_source,
+        text_column=text_column,
+        label_column=label_column,
+        sentiment_backend=sentiment_backend,
+        sentiment_model=sentiment_model,
+        sentiment_batch_size=sentiment_batch_size,
+        sentiment_max_length=sentiment_max_length,
+        device=device,
+        dtype=dtype,
+        offline=offline,
+        quiet=True,
+        no_visuals=True,
+        **master_dataset_kwargs,
+    )
+
+    processor.process(force=True)
+    processor.save(out_path, overwrite=overwrite, manifest=True)
+
+    # Verify the contract before handing the path back.
+    frame, _ = load_processed_csv(out_path)
+    if frame.empty:
+        raise RuntimeError(f"acquire_dataset produced an empty CSV: {out_path}")
+    _print_info(f"  ✓ {name}: wrote {len(frame):,} rows → {out_path}", True)
+    return out_path
+
+
+def acquire_all_datasets(
+    dataset_specs: Sequence[dict[str, Any]],
+    *,
+    overwrite: bool = False,
+    offline: bool = False,
+) -> dict[str, Path]:
+    """Acquire a list of datasets through the proxy, one at a time.
+
+    Each spec is a dict with keys:
+        key              (required) — managed key or HF identifier
+        source           (optional) — explicit source URL or hf://
+        text_column      (optional) — override
+        label_column     (optional) — override
+        hf_config        (optional) — for datasets that need a config
+
+    Returns a mapping {key: processed_csv_path}.
+    """
+    results: dict[str, Path] = {}
+    for i, spec in enumerate(dataset_specs, 1):
+        key = spec["key"]
+        print(f"\n[{i}/{len(dataset_specs)}] Acquiring dataset: {key}")
+        try:
+            path = acquire_dataset(
+                key,
+                source=spec.get("source"),
+                text_column=spec.get("text_column"),
+                label_column=spec.get("label_column"),
+                overwrite=overwrite,
+                offline=offline,
+                hf_config=spec.get("hf_config"),
+            )
+            results[key] = path
+        except Exception as exc:
+            print(f"  ✗ FAILED: {type(exc).__name__}: {exc}")
+            results[key] = None  # type: ignore[assignment]
+    return results
 
 
 def classify_loading_info(model: torch.nn.Module,
@@ -3591,5 +4117,5 @@ __all__ = [
     "get_model_specs", "detect_text_column", "load_model", "load_tokenizer",
     "model_device", "classify_model_loading_issues", "classify_loading_info",
     "save_json", "summarize_measurement", "record_hyperparameter_measurement",
-    "build_dataset_directory", "build_model_directory", "model_slug",
+    "build_dataset_directory", "build_model_directory", "model_slug", "acquire_dataset", "discover_processed_datasets",
 ]

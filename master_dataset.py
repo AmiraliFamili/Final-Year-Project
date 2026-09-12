@@ -187,7 +187,18 @@ DEFAULT_CACHE_DIR = Path(tempfile.gettempdir()) / "master_dataset_cache"
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PROJECT_DATASETS_DIR = PROJECT_ROOT / "datasets"
+
+# Datasets root on the external drive. Sibling of hidden_states/, never a
+# child, so the extraction pipeline never walks into it. Falls back to a
+# project-local folder if the external drive is not mounted.
+_EXTERNAL_DATASETS_ROOT = Path("/Volumes/Amirali/datasets")
+_LOCAL_DATASETS_ROOT    = PROJECT_ROOT / "datasets"
+
+PROJECT_DATASETS_DIR = (
+    _EXTERNAL_DATASETS_ROOT
+    if Path("/Volumes/Amirali").is_dir()
+    else _LOCAL_DATASETS_ROOT
+)
 
 
 def known_dataset_root(key: str) -> Path:
@@ -196,13 +207,11 @@ def known_dataset_root(key: str) -> Path:
 
 def known_dataset_raw_dir(key: str) -> Path:
     path = known_dataset_root(key) / "raw"
-    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def known_dataset_processed_dir(key: str) -> Path:
     path = known_dataset_root(key) / "processed"
-    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -567,6 +576,19 @@ def save_raw_dataset(
 
     return raw_path
 
+def _resolve_hf_url(url: str) -> str:
+    """Rewrite huggingface.co URLs to the configured HF_ENDPOINT.
+
+    Cloudflare Worker proxies strip Content-Length from HEAD responses for
+    text files >1KB, but GET requests are unaffected. Since `requests.get`
+    is a GET, dataset downloads are immune to the stripping bug.
+    """
+    endpoint = os.environ.get("HF_ENDPOINT")
+    if endpoint and "huggingface.co" in url:
+        return url.replace("https://huggingface.co", endpoint.rstrip("/"))
+    return url
+
+
 # =============================================================================
 # DATASET STORAGE / SOURCE IDENTITY
 # =============================================================================
@@ -670,13 +692,11 @@ def dataset_root_dir(dataset_name: str) -> Path:
 
 def dataset_raw_dir(dataset_name: str) -> Path:
     path = dataset_root_dir(dataset_name) / "raw"
-    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def dataset_processed_dir(dataset_name: str) -> Path:
     path = dataset_root_dir(dataset_name) / "processed"
-    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -1241,7 +1261,7 @@ class TextCleaner:
 # =============================================================================
 
 class DatasetLoader:
-    def __init__(self, renderer: Renderer, cache_dir: Optional[str | Path] = None, timeout: tuple[int, int] = (15, 180)):
+    def __init__(self, renderer: Renderer, cache_dir: Optional[str | Path] = None, timeout: tuple[int, int] = (60, 600)):
         self.renderer = renderer
         self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR).expanduser().resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1250,7 +1270,8 @@ class DatasetLoader:
     def _download(
     self,
     url: str,
-    destination: Optional[str | Path] = None,) -> Path:
+    destination: Optional[str | Path] = None,
+    max_attempts: int = 3,) -> Path:
         if requests is None:
             raise DatasetSourceError(
                 "URL input requires requests. Install: pip install requests"
@@ -1276,54 +1297,68 @@ class DatasetLoader:
             destination_path.suffix + ".part"
         )
 
-        try:
-            with requests.get(
-                url,
-                stream=True,
-                timeout=self.timeout,
-                headers={
-                    "User-Agent": f"MasterDatasetProcessor/{VERSION}"
-                },
-            ) as response:
-                response.raise_for_status()
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resolved_url = _resolve_hf_url(url)
+                with requests.get(
+                    resolved_url,
+                    stream=True,
+                    timeout=self.timeout,
+                    headers={
+                        "User-Agent": f"MasterDatasetProcessor/{VERSION}"
+                    },
+                ) as response:
+                    response.raise_for_status()
 
-                content_type = response.headers.get(
-                    "Content-Type", ""
-                ).lower()
+                    content_type = response.headers.get(
+                        "Content-Type", ""
+                    ).lower()
 
-                if "text/html" in content_type:
+                    if "text/html" in content_type:
+                        raise DatasetSourceError(
+                            f"Remote source returned HTML instead of a dataset "
+                            f"file: {url}. Use a direct/raw dataset URL."
+                        )
+
+                    with tmp.open("wb") as handle:
+                        for chunk in response.iter_content(
+                            chunk_size=1024 * 1024
+                        ):
+                            if chunk:
+                                handle.write(chunk)
+
+                head = tmp.read_bytes()[:512].lower()
+
+                if b"<!doctype html" in head or b"<html" in head:
                     raise DatasetSourceError(
-                        f"Remote source returned HTML instead of a dataset "
-                        f"file: {url}. Use a direct/raw dataset URL."
+                        f"Remote source returned an HTML page instead of a "
+                        f"dataset file: {url}"
                     )
 
-                with tmp.open("wb") as handle:
-                    for chunk in response.iter_content(
-                        chunk_size=1024 * 1024
-                    ):
-                        if chunk:
-                            handle.write(chunk)
+                tmp.replace(destination_path)
+                return destination_path
 
-            head = tmp.read_bytes()[:512].lower()
+            except DatasetSourceError:
+                tmp.unlink(missing_ok=True)
+                raise
 
-            if b"<!doctype html" in head or b"<html" in head:
-                raise DatasetSourceError(
-                    f"Remote source returned an HTML page instead of a "
-                    f"dataset file: {url}"
-                )
+            except Exception as exc:
+                last_exc = exc
+                tmp.unlink(missing_ok=True)
+                if attempt < max_attempts:
+                    backoff = 5.0 * (2 ** (attempt - 1))
+                    print(
+                        f"[download] {url} failed ({type(exc).__name__}: {exc}); "
+                        f"retrying in {backoff:.1f}s "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+                    time.sleep(backoff)
 
-            tmp.replace(destination_path)
-
-        except DatasetSourceError:
-            tmp.unlink(missing_ok=True)
-            raise
-
-        except Exception as exc:
-            tmp.unlink(missing_ok=True)
-            raise DatasetSourceError(
-                f"Could not download dataset: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+        raise DatasetSourceError(
+            f"Could not download dataset after {max_attempts} attempts: "
+            f"{type(last_exc).__name__ if last_exc else 'UnknownError'}: {last_exc}"
+        ) from last_exc
 
         return destination_path
 

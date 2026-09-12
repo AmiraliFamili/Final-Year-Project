@@ -115,7 +115,7 @@ def get_environment_info() -> dict:
 # Constants
 # -----------------------------------------------------------------------------
 
-EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/hidden_states")
+EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/Probed_Redults")
 DEFAULT_SEED = 42
 SCRIPT_VERSION = "4.5.0"
 DEBUG_MODE = False
@@ -144,6 +144,38 @@ COMMON_ID_COLUMNS = {"id", "idx", "index", "user_id", "conv_id", "utterance_idx"
 # -----------------------------------------------------------------------------
 # General utilities
 # -----------------------------------------------------------------------------
+def probe_output_dir(experiment_id: str, model_name: str, dataset_name: str) -> Path:
+    """
+    Canonical probing output directory, co-located with the hidden states
+    the probes were trained on.
+
+    Returns a path of the form:
+        /Volumes/Amirali/hidden_states/runs/<experiment_id>/
+            models/<owner>__<model>/datasets/<dataset>/probing/
+
+    The directory is created on demand; callers may write into it freely.
+    """
+    slug = model_name.replace("/", "__")
+    out = (
+        HIDDEN_STATES_ROOT
+        / "runs" / experiment_id
+        / "models" / slug
+        / "datasets" / dataset_name
+        / "probing"
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "plots").mkdir(exist_ok=True)
+    (out / "probe_results").mkdir(exist_ok=True)
+    return out
+
+def hidden_states_dir(experiment_id: str, model_name: str, dataset_name: str) -> Path:
+    slug = model_name.replace("/", "__")
+    return (
+        HIDDEN_STATES_ROOT
+        / "runs" / experiment_id
+        / "models" / slug
+        / "datasets" / dataset_name
+    )
 
 def stable_hash(value: Any, length: int = 16) -> str:
     payload = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str).encode()
@@ -561,12 +593,14 @@ class ExtractionArtifact:
         self.dataset_dir = dataset_dir.resolve()
         self.data_dir = self.dataset_dir / "data"
         self.metadata_dir = self.dataset_dir / "metadata"
-        self.states_path = self.data_dir / "hidden_states.npy"
-        self.completed_path = self.data_dir / "completed.npy"
-        self.metadata_path = self.metadata_dir / "extraction.json"
-        self.sample_ids_path = self.metadata_dir / "sample_ids.npy"
-        self.text_hashes_path = self.metadata_dir / "text_hashes.npy"
-        self.checksum_path = self.metadata_dir / "checksum.sha256"
+        self.states_path = self.dataset_dir / "hidden_states.npy"
+        self.completed_path = self.dataset_dir / "completed.npy"
+        self.metadata_path = self.dataset_dir / "extraction.json"
+
+        # Also update the other paths that use data_dir and metadata_dir:
+        self.sample_ids_path = self.dataset_dir / "sample_ids.npy"
+        self.text_hashes_path = self.dataset_dir / "text_hashes.npy"
+        self.checksum_path = self.dataset_dir / "checksum.sha256"
 
         missing = [str(p) for p in (
             self.states_path, self.completed_path, self.metadata_path
@@ -838,10 +872,16 @@ def _maybe_literal(value: Any) -> Any:
     if isinstance(value, str):
         s = value.strip()
         if s.startswith(("[", "(", "{")) and s.endswith(("]", ")", "}")):
+            # First, try json.loads for valid JSON strings
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError:
+                pass
+            # Then, fall back to ast.literal_eval for other Python-like literals
             try:
                 return ast.literal_eval(s)
             except Exception:
-                return value
+                pass
     return value
 
 
@@ -3214,6 +3254,116 @@ def main():
     cols = [c for c in ["probe", "layer_index", "probe_score_mean", "test_macro_f1_mean", "test_balanced_accuracy_mean", "test_mcc_mean", "selectivity_mean"] if c in best.columns]
     print(best[cols].to_string(index=False))
     print("\nOutputs:", analyzer.output_dir)
+
+
+
+
+
+"""
+Model Availability on DevNeeds.ir
+
+Cross-referenced against your 25-model MODEL_REGISTRY. All models ≤ 1.5B fit your Mac's memory envelope; the Qwen2-7B failure confirms a roughly 3B ceiling in fp16.
+
+✅ Directly Available — 6 of 25
+
+Exact name matches. No changes to MODEL_REGISTRY required.
+
+Model	Params
+google-bert/bert-base-uncased	110M
+distilbert/distilbert-base-uncased	66M
+microsoft/deberta-v3-small	140M
+Qwen/Qwen2.5-0.5B	500M
+Qwen/Qwen2.5-1.5B	1.5B
+meta-llama/Llama-3.2-1B	1B
+⚠️ Available as Close Variants — 5 of 25
+
+Functionally equivalent, different training regime. MODEL_REGISTRY names would need editing.
+
+Your name	DevNeeds substitute	Difference
+Qwen/Qwen3-0.6B-Base	Qwen/Qwen3-0.6B	post-trained
+meta-llama/Llama-3.2-3B	meta-llama/Llama-3.2-3B-Instruct	instruction-tuned
+google/gemma-3-1b-pt	google/gemma-3-1b-it	instruction-tuned
+google/gemma-3-4b-pt	google/gemma-3-4b-it	instruction-tuned
+google/gemma-3-270m	google/gemma-3-270m-it	instruction-tuned
+❌ Not Available on DevNeeds — 14 of 25
+
+Absent entirely. Requires Cloudflare Worker, foreign download, or manual transfer.
+
+Model	Missing family
+FacebookAI/roberta-base	RoBERTa
+google/electra-small-discriminator	ELECTRA
+gpt2	GPT-2
+EleutherAI/gpt-neo-125m	GPT-Neo
+facebook/opt-125m	OPT
+HuggingFaceTB/SmolLM2-135M	SmolLM2
+HuggingFaceTB/SmolLM2-360M	SmolLM2
+HuggingFaceTB/SmolLM2-1.7B	SmolLM2
+Qwen/Qwen2-0.5B	Qwen2 (superseded)
+Qwen/Qwen2-1.5B	Qwen2 (superseded)
+Qwen/Qwen2.5-3B	Qwen2.5
+Qwen/Qwen3-1.7B-Base	Qwen3
+Qwen/Qwen3-4B-Base	Qwen3
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T	TinyLlama
+Impact: Three entire families — RoBERTa, ELECTRA, and the GPT-2/GPT-Neo/OPT trio — are the canonical baselines in emotion-probing literature. Their absence materially weakens the model matrix unless resolved through a different route.
+
+✨ Recommended Additions From DevNeeds
+
+All fit your machine. Ranked by value for hidden-state probing.
+
+Encoders — every layer meaningfully distinct
+
+Model	Params
+albert/albert-base-v2	12M
+albert/albert-large-v2	18M
+google-bert/bert-base-cased	110M
+google-bert/bert-base-multilingual-cased	177M
+google-bert/bert-large-uncased	335M
+google-bert/bert-large-cased	335M
+huggingface/distilbert-base-uncased-finetuned-mnli	66M
+Encoder–decoder — different architectural family
+
+Model	Params
+google/flan-t5-small	60M
+google/flan-t5-base	220M
+Small modern decoders
+
+Model	Params
+Qwen/Qwen2.5-0.5B-Instruct	500M
+Qwen/Qwen2.5-Coder-0.5B	500M
+Qwen/Qwen1.5-0.5B-Chat	500M
+Qwen/Qwen3-0.6B	600M
+meta-llama/Llama-3.2-1B-Instruct	1B
+meta-llama/Llama-Guard-3-1B	1B
+meta-llama/Prompt-Guard-86M	86M
+google/embeddinggemma-300m	300M
+Sentence-transformers — embedding-specialised
+
+Model	Params
+sentence-transformers/all-MiniLM-L6-v2	22M
+sentence-transformers/paraphrase-MiniLM-L6-v2	22M
+sentence-transformers/all-mpnet-base-v2	110M
+sentence-transformers/all-distilroberta-v1	82M
+sentence-transformers/LaBSE	471M
+Multilingual seq2seq
+
+Model	Params
+facebook/m2m100_418M	418M
+facebook/nllb-200-distilled-600M	600M
+Multimodal (optional)
+
+Model	Params
+openai/clip-vit-base-patch32	150M
+openai/whisper-tiny	39M
+openai/whisper-base	74M
+Notes
+
+DevNeeds is not a uniform API. Entries carry inconsistent suffixes (/main, /revision, commit SHAs). Downloads arrive as folders; you must manually reconstruct the cache layout under .hf_cache/hub/models--<owner>--<name>/snapshots/main/.
+The Cloudflare Worker remains the stronger solution. One deployment unlocks the entire Group 3 list in a single endpoint; DevNeeds structurally cannot deliver those families.
+Trim MODEL_REGISTRY before running. A focused 12-model matrix drawn from Groups 1 and 2 is scientifically stronger than 25 entries where 14 fail at download.
+"""
+
+
+
 
 
 if __name__ == "__main__":
