@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sys
 
 """Deterministic hidden-state extraction pipeline (v8 — flat layout, no hash).
 
@@ -2104,13 +2105,73 @@ def detect_text_column(dataset: Any, requested: str | None = None,
         raise KeyError("Dataset exposes no columns")
     if requested is not None:
         if requested not in columns:
-            raise KeyError(f"Requested text column {requested!r} not found. Available: {columns}")
+            raise KeyError(
+                f"Requested text column {requested!r} not found. Available: {columns}"
+            )
         return requested
+
+    # ---------------------------------------------------------------------
+    # Canonical short-circuit.
+    #
+    # Processed CSVs from master_dataset.py always have `clean_text` as the
+    # text column. If it is present, return it immediately. This is the
+    # 99.99% path and it does not need the scorer at all.
+    # ---------------------------------------------------------------------
     lowered = {c.lower(): c for c in columns}
+    if "clean_text" in lowered:
+        chosen = lowered["clean_text"]
+        _print_verbose(
+            f"  Text-column resolver: canonical {chosen!r}", show_verbose,
+        )
+        return chosen
+
+    # ---------------------------------------------------------------------
+    # Raw CSV path — reuse master_dataset's tiered scorer so the two
+    # detection schemes cannot disagree.
+    #
+    # The scorer is defined in master_dataset.py; we import it lazily so
+    # this module still works when master_dataset.py is not on disk.
+    # ---------------------------------------------------------------------
+    try:
+        MD = _load_master_dataset_module()
+        score = MD.score_text_column_name
+    except Exception as exc:
+        _print_verbose(
+            f"  master_dataset.scorer unavailable ({type(exc).__name__}); "
+            f"falling back to local TEXT_COLUMN_CANDIDATES",
+            show_verbose,
+        )
+        score = None
+
+    if score is not None:
+        scored = []
+        for column in columns:
+            if column.lower() in TEXT_COLUMN_EXCLUDE:
+                continue
+            s = score(column)
+            if s > 0.0:
+                scored.append((s, column))
+        if scored:
+            scored.sort(reverse=True)
+            chosen = scored[0][1]
+            _print_verbose(
+                "  Text-column candidates (tiered scorer):\n"
+                + "\n".join(f"    score={s:6.2f} column={c!r}" for s, c in scored)
+                + f"\n  Selected text column: {chosen!r}",
+                show_verbose,
+            )
+            return chosen
+    # ---------------------------------------------------------------------
+    # Last-resort priority list. Reached only when master_dataset.py is
+    # missing AND the tiered scorer found nothing.
+    # ---------------------------------------------------------------------
     for candidate in TEXT_COLUMN_CANDIDATES:
         if candidate in lowered and lowered[candidate].lower() not in TEXT_COLUMN_EXCLUDE:
             chosen = lowered[candidate]
-            _print_verbose(f"  Text-column resolver: exact candidate {chosen!r}", show_verbose)
+            _print_verbose(
+                f"  Text-column resolver: fallback candidate {chosen!r}",
+                show_verbose,
+            )
             return chosen
     scored = []
     for column in columns:
@@ -2933,7 +2994,10 @@ def extract_dataset(
 
     if label_column:
         labels_raw = np.asarray(dataset[label_column], dtype=object)
-        is_multi = any(isinstance(x, (list, tuple, set, np.ndarray)) for x in labels_raw[:100])
+        is_multi = any(
+            isinstance(x, (list, tuple, set, np.ndarray)) and len(x) > 1
+            for x in labels_raw[:100]
+        )
 
         if is_multi:
             all_labels: list = []

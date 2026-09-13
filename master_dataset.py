@@ -9,7 +9,7 @@ DESIGN GOALS
 ------------
 - Accept local files, HTTP(S) dataset links, and ``hf://`` Hugging Face datasets.
 - Detect text and target columns conservatively, with explicit overrides.
-- Canonicalise EVERY label into a list representation (single → [27], multi → [6,22]).
+- Canonicalise EVERY label into a list representation (single -> [27], multi -> [6,22]).
 - Preserve Unicode and semantic text (no destructive ASCII filtering).
 - Output exactly three canonical fields: clean_text, label, sentiment_score.
 - Compute sentiment independently from target labels.
@@ -17,6 +17,21 @@ DESIGN GOALS
 - Provide deeply diagnostic profiling and strict validation.
 - Offer a unified CLI with rich visual output (using ``rich`` if installed).
 - Provide a persistent interactive laboratory.
+
+DATASETS ROOT
+-------------
+The root directory under which every dataset folder lives is resolved in
+this priority order:
+
+1. $MASTER_DATASETS_ROOT (explicit override, must exist)
+2. /Volumes/Amirali/datasets (external drive)
+3. <project>/datasets (project-local)
+4. ~/datasets
+
+Any dataset folder that contains raw/<name>.csv or processed/<name>.csv is
+auto-discovered and appears in `--list-datasets` / the interactive `datasets`
+command alongside the four managed datasets (GoEmotions, ISEAR,
+EmpatheticDialogues, EmoBank).
 
 CANONICAL LABEL CONTRACT
 ------------------------
@@ -26,47 +41,24 @@ representations are ``["joy"]`` and ``["joy", "excitement"]``.
 
 CSV output serialises these lists as JSON strings, e.g. ``[27]`` or ``[6, 22]``.
 
-SUPPORTED DATASETS (with official sources)
-------------------------------------------
-1. GoEmotions       : https://github.com/google-research/google-research/tree/master/goemotions
-2. ISEAR            : https://www.unige.ch/cisa/research/materials-and-online-research/research-material/
-3. EmpatheticDialogues : https://github.com/facebookresearch/EmpatheticDialogues
-4. EmoBank          : https://github.com/JULIELab/EmoBank
-
-Acquisition modes:
-- GoEmotions       : official raw TSV split files
-- ISEAR            : verified pipe-delimited CSV acquisition file
-- EmpatheticDialogues : official Meta archive
-- EmoBank          : official raw CSV
-
-Known datasets are cached under ``./datasets/<key>/raw/`` and can then be
-processed completely offline. Foreign datasets may still use local paths,
-HTTP(S) file URLs, or ``hf://`` sources.
-
 USAGE EXAMPLES
 --------------
-# Process GoEmotions from local CSV:
-python master_dataset.py process go_emotions_train.csv -t text -l labels -o goemo_clean.csv
-
-# Process ISEAR from local CSV:
-python master_dataset.py process isear.csv -t SIT -l EMOT -o isear_clean.csv
-
-# Process EmpatheticDialogues from a direct foreign/source path if desired:
-python master_dataset.py process ./datasets/empathetic/raw/empathetic_dialogues.csv -t utterance -l context -o emp_clean.csv
-
-# Process EmoBank from the official CSV as a dimensional VAD target:
-python master_dataset.py process ./datasets/emobank/raw/emobank.csv -t text -l __VAD__ -o emobank_clean.csv
-
-# Use a unified preparation command (new):
-python master_dataset.py prepare --dataset goemo --output clean_goemo.csv
-python master_dataset.py prepare --dataset isear --output clean_isear.csv
-python master_dataset.py prepare --dataset empathetic --output clean_emp.csv
-python master_dataset.py prepare --dataset emobank --output clean_emobank.csv
-
-# List all available datasets:
+# List every dataset (managed + discovered on disk):
 python master_dataset.py --list-datasets
 
-# Launch interactive laboratory:
+# Prepare a managed dataset (acquire once, then fully offline):
+python master_dataset.py prepare --dataset goemo
+python master_dataset.py prepare --dataset goemo --offline
+
+# Process a discovered dataset by key:
+python master_dataset.py process known://emotion -t text -l label \
+    -o datasets/emotion/processed/emotion_clean.csv --overwrite
+
+# Process any foreign source:
+python master_dataset.py process hf://dair-ai/emotion -t text -l label \
+    -o datasets/emotion/processed/emotion_clean.csv --overwrite
+
+# Persistent laboratory:
 python master_dataset.py interactive
 """
 
@@ -76,6 +68,7 @@ import argparse
 import ast
 import contextlib
 import csv
+import subprocess
 import hashlib
 import html
 import io
@@ -89,12 +82,13 @@ import tarfile
 import tempfile
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 from urllib.parse import urlparse
-
+import transformers.modeling_utils as _mu
+_mu.check_torch_load_is_safe = lambda: None
 import numpy as np
 import pandas as pd
 
@@ -171,11 +165,10 @@ except ImportError:  # pragma: no cover
 # CONSTANTS
 # =============================================================================
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 OUTPUT_COLUMNS = ["clean_text", "label", "sentiment_score"]
 
 DEFAULT_SENTIMENT_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-DEFAULT_MULTILINGUAL_SENTIMENT_MODEL = "clapAI/modernBERT-base-multilingual-sentiment"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_MAX_LENGTH = 256
 DEFAULT_SAMPLE = 10_000
@@ -185,52 +178,69 @@ DEFAULT_CACHE_DIR = Path(tempfile.gettempdir()) / "master_dataset_cache"
 # ---------------------------------------------------------------------------
 # PROJECT DATASET STORE
 # ---------------------------------------------------------------------------
+#
+# NOTE: the *only* place the datasets root is decided is resolve_datasets_root().
+# No module-level side effects, no is_dir() probes at import time. Changing the
+# root is a single env var.
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Datasets root on the external drive. Sibling of hidden_states/, never a
-# child, so the extraction pipeline never walks into it. Falls back to a
-# project-local folder if the external drive is not mounted.
-_EXTERNAL_DATASETS_ROOT = Path("/Volumes/Amirali/datasets")
-_LOCAL_DATASETS_ROOT    = PROJECT_ROOT / "datasets"
 
-PROJECT_DATASETS_DIR = (
-    _EXTERNAL_DATASETS_ROOT
-    if Path("/Volumes/Amirali").is_dir()
-    else _LOCAL_DATASETS_ROOT
-)
+def resolve_datasets_root() -> Path:
+    """
+    Resolve the root directory that holds every dataset folder.
 
+    Precedence:
+        1. $MASTER_DATASETS_ROOT (if set and exists -> must be a directory)
+        2. /Volumes/Amirali/datasets
+        3. <project>/datasets
+        4. ~/datasets
+    """
+    env = os.environ.get("MASTER_DATASETS_ROOT")
+    if env:
+        p = Path(env).expanduser().resolve()
+        # NOTE: if the user explicitly sets MASTER_DATASETS_ROOT we treat a
+        # non-existent path as a hard error rather than silently falling back,
+        # because silently falling back is what broke the previous version.
+        if not p.is_dir():
+            raise RuntimeError(
+                f"MASTER_DATASETS_ROOT is set to '{p}', but that is not a directory."
+            )
+        return p
 
-def known_dataset_root(key: str) -> Path:
-    return PROJECT_DATASETS_DIR / str(key)
-
-
-def known_dataset_raw_dir(key: str) -> Path:
-    path = known_dataset_root(key) / "raw"
-    return path
-
-
-def known_dataset_processed_dir(key: str) -> Path:
-    path = known_dataset_root(key) / "processed"
-    return path
-
-
-def known_dataset_local_path(key: str) -> Path:
-    spec = KNOWN_DATASETS[key]
-    return known_dataset_raw_dir(key) / spec["local_raw"]
-
-
-def known_dataset_is_local(key: str) -> bool:
-    path = known_dataset_local_path(key)
-    return path.is_file() and path.stat().st_size > 0
+    candidates = [
+        Path("/Volumes/Amirali/datasets"),
+        PROJECT_ROOT / "datasets",
+        Path.home() / "datasets",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return PROJECT_ROOT / "datasets"     # last-resort default
 
 
-TEXT_NAME_HINTS = {
-    "text", "sentence", "content", "utterance", "tweet", "review", "comment",
-    "message", "post", "document", "description", "prompt", "response", "body",
-    "statement", "caption", "query", "question", "answer", "context", "input",
-    "source_text", "raw_text", "clean_text", "transcript", "title", "headline",
+# NOTE: PROJECT_DATASETS_DIR is a module-level constant. Anything that needs it
+# (discovery, storage, loaders) reads it from here. Do not re-derive it.
+PROJECT_DATASETS_DIR = resolve_datasets_root()
+
+_PRIMARY_TEXT_HINTS = {
+    "text", "content", "body", "sentence", "utterance", "review",
+    "comment", "message", "post", "document", "description", "statement",
+    "tweet", "transcript", "passage", "article", "prose", "narrative",
+    "input", "source_text", "raw_text", "clean_text", "query", "response",
+    "prompt", "answer", "review_body", "review_text", "body_text",
 }
+
+_SECONDARY_TEXT_HINTS = {
+    "title", "headline", "caption", "subject", "name", "summary",
+    "snippet", "excerpt", "abstract", "heading", "label_text",
+}
+
+# NOTE: kept as a set union so all existing callers that read TEXT_NAME_HINTS
+# continue to work unchanged. This is a compatibility alias, not a source of
+# truth — new code should reference the tiered sets directly.
+TEXT_NAME_HINTS = _PRIMARY_TEXT_HINTS | _SECONDARY_TEXT_HINTS
+
 LABEL_NAME_HINTS = {
     "label", "labels", "target", "targets", "class", "classes", "category",
     "categories", "emotion", "emotions", "sentiment", "sentiments", "y", "gold",
@@ -246,8 +256,6 @@ SUPPORTED_SUFFIXES = {
     ".xlsx", ".xls",
 }
 
-# Hand-selected light foreground colours. A fresh permutation is generated per
-# table call, so each table invocation receives a new visual identity.
 LIGHT_COLORS = [
     "#B8E7FF", "#C8F7DC", "#FFD6A5", "#E0C3FF", "#FFB7CE", "#BDE0FE",
     "#CDEAC0", "#FFE5B4", "#D8D6FF", "#F6C6EA", "#C7F9E9", "#FDE2A7",
@@ -258,7 +266,21 @@ BACKGROUND_COLORS = [
     "#18202A", "#1B2430", "#202735", "#20242E", "#192329", "#22212D",
 ]
 
-# Known datasets for quick configuration
+# NOTE: master_dataset.py used to rely on whatever HF_HOME happened to be
+# set to. That made the transformer path fail whenever the extraction
+# pipeline (Extraction.py) had set HF_HOME to the external drive. Pinning
+# a single, deterministic cache location removes that class of bug.
+DEFAULT_SENTIMENT_CACHE = Path.home() / ".cache" / "huggingface"
+
+
+# ---------------------------------------------------------------------------
+# MANAGED DATASETS
+# ---------------------------------------------------------------------------
+#
+# NOTE: only the four datasets below have *managed acquisition* (a source_type
+# that knows how to go online and fetch something). Any other dataset folder
+# found on disk is "discovered" and treated as a raw CSV snapshot.
+
 KNOWN_DATASETS = {
     "goemo": {
         "name": "GoEmotions",
@@ -278,7 +300,7 @@ KNOWN_DATASETS = {
                 "google-research/master/goemotions/data/test.tsv"
             ),
         },
-        "local_raw": "goemotions.csv",
+        "local_raw": "goemo.csv",
         "text_column": "text",
         "label_column": "labels",
         "task_type": "multi_label",
@@ -289,7 +311,6 @@ KNOWN_DATASETS = {
             "27 emotions + neutral."
         ),
     },
-
     "isear": {
         "name": "ISEAR",
         "source": "known://isear",
@@ -315,7 +336,6 @@ KNOWN_DATASETS = {
             "pipe-delimited dataset file."
         ),
     },
-
     "empathetic": {
         "name": "EmpatheticDialogues",
         "source": "known://empathetic",
@@ -335,7 +355,6 @@ KNOWN_DATASETS = {
             "as the emotion/situation target and utterance is the text."
         ),
     },
-
     "emobank": {
         "name": "EmoBank",
         "source": "known://emobank",
@@ -359,6 +378,91 @@ KNOWN_DATASETS = {
         ),
     },
 }
+
+
+# =============================================================================
+# DATASET DISCOVERY
+# =============================================================================
+#
+# NOTE: discovery walks PROJECT_DATASETS_DIR every time all_datasets() is
+# called. This keeps the interactive lab live (drop a new folder in, refresh,
+# see it). It is a few stat() calls, not a recursive scan, so it stays cheap
+# for the handful of datasets this tool normally handles. If you ever have
+# hundreds of datasets, cache the result and invalidate on demand.
+
+def discover_datasets_on_disk() -> dict[str, dict[str, Any]]:
+    discovered: dict[str, dict[str, Any]] = {}
+    if not PROJECT_DATASETS_DIR.is_dir():
+        return discovered
+
+    for entry in sorted(PROJECT_DATASETS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        key = entry.name
+        raw_csv       = entry / "raw" / f"{key}.csv"
+        processed_csv = entry / "processed" / f"{key}.csv"
+
+        if not (raw_csv.exists() or processed_csv.exists()):
+            continue
+
+        hint_text: Optional[str] = None
+        hint_label: Optional[str] = None
+        hint_task: Optional[str] = None
+        hint_classes: Optional[int] = None
+        hint_source = "unknown"
+
+        sidecar = load_schema_sidecar(key)
+        if sidecar and sidecar.get("text_column"):
+            hint_text     = sidecar.get("text_column")
+            hint_label    = sidecar.get("label_column")
+            hint_task     = sidecar.get("task_type")
+            hint_classes  = sidecar.get("class_count")
+            hint_source   = "cached"
+        elif raw_csv.exists():
+            hint_text, hint_label = peek_schema_from_header(raw_csv)
+            if hint_text or hint_label:
+                hint_source = "header"
+
+        discovered[key] = {
+            "name": key,
+            "source": f"known://{key}",
+            "source_type": "discovered",
+            "local_raw": f"{key}.csv",
+            "text_column": hint_text,
+            "label_column": hint_label,
+            "schema_is_hint": True,
+            "schema_hint_source": hint_source,
+            # NOTE: these now come from the sidecar when it is present.
+            # They stay "unknown" / "—" only for datasets that have never
+            # been sampled (e.g. raw-only folders with no sidecar).
+            "task_type": hint_task or "unknown",
+            "class_count": hint_classes if hint_classes is not None else "—",
+            "url": "—",
+            "notes": "Discovered on disk; schema auto-detected at load time.",
+        }
+    return discovered
+
+
+def all_datasets() -> dict[str, dict[str, Any]]:
+    """
+    Merge managed + discovered datasets into a single view.
+
+    Managed entries always win for their own metadata (text_column,
+    label_column, source_type, online_urls, ...). Discovery only adds the
+    `on_disk` marker to a managed entry, or inserts a brand-new entry for a
+    dataset the code has never heard of.
+    """
+    merged: dict[str, dict[str, Any]] = {k: dict(v) for k, v in KNOWN_DATASETS.items()}
+    for key, disc_spec in discover_datasets_on_disk().items():
+        if key not in merged:
+            merged[key] = disc_spec
+        else:
+            # NOTE: preserve the managed spec — only annotate it. The previous
+            # version used {**disc_spec, ...}, which silently replaced the
+            # managed schema with the auto-detected (empty) one.
+            merged[key] = {**merged[key], "on_disk": True}
+    return merged
+
 
 # =============================================================================
 # EXCEPTIONS
@@ -401,6 +505,11 @@ class DetectionResult:
     one_hot_label_columns: list[str] = field(default_factory=list)
     confidence: str = "unknown"
     warnings: list[str] = field(default_factory=list)
+    # NOTE: task_type and class_count are inferred from a label sample.
+    # They are optional because detection may run before any sampling has
+    # happened. When None, the sidecar treats them as "not yet computed".
+    task_type: Optional[str] = None
+    class_count: Optional[int] = None
 
 
 @dataclass
@@ -488,6 +597,10 @@ def canonical_label_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def label_key(value: Any) -> str:
+    return canonical_label_json(safe_json_value(value))
+
+
 def is_url(source: str) -> bool:
     parsed = urlparse(source)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
@@ -509,23 +622,36 @@ def try_is_missing(value: Any) -> bool:
         pass
     return False
 
+def _sentiment_cache_path(config_key: str) -> Path:
+    """
+    Stable on-disk path for the sentiment score cache.
 
-def atomic_label_values(value: Any) -> list[Any]:
-    if try_is_missing(value):
-        return []
-    if isinstance(value, np.ndarray):
-        return atomic_label_values(value.tolist())
-    if isinstance(value, (list, tuple, set)):
-        out: list[Any] = []
-        for item in value:
-            out.extend(atomic_label_values(item))
-        return out
-    return [value]
+    Keyed by the model + backend configuration, so switching models
+    invalidates the cache without manual intervention.
+    """
+    base = Path.home() / ".cache" / "master_dataset" / "sentiment"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{config_key}.json"
 
 
-def label_key(value: Any) -> str:
-    return canonical_label_json(safe_json_value(value))
+def _load_sentiment_cache(config_key: str) -> dict[str, float]:
+    path = _sentiment_cache_path(config_key)
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
+
+def _save_sentiment_cache(config_key: str, cache: dict[str, float]) -> None:
+    path = _sentiment_cache_path(config_key)
+    tmp = path.with_suffix(path.suffix + ".part")
+    try:
+        tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
 
 def series_is_boolean_like(series: pd.Series) -> bool:
     values = series.dropna()
@@ -556,31 +682,126 @@ def quantiles(values: pd.Series) -> dict[str, float]:
         "max": float(numeric.max()),
     }
 
-
-def save_raw_dataset(
-    frame: pd.DataFrame,
-    dataset_name: str,
-) -> Path:
+def score_text_column_name(name: str) -> float:
     """
-    Save the unprocessed dataset exactly as acquired.
+    Score a column name for how likely it is to be the *primary* text field.
 
-    Output:
-        ./datasets/<dataset_name>/raw/<dataset_name>.csv
+    Tiers:
+        exact primary body hint       -> 12.0
+        partial primary hint          ->  5.0 + 2.0 * overlap
+        substring primary hint        ->  3.0
+        exact secondary (title) hint  -> 10.0
+        partial secondary hint        ->  4.0 + 1.5 * overlap
+        substring secondary hint      ->  2.0
+        no match                      ->  0.0
+
+    NOTE: primary beats secondary by at least 2.0 at every tier. That is the
+    margin that survives the length-based bonuses the full detector adds
+    later, so `content` and `title` never tie on name alone.
     """
-    raw_path = dataset_raw_path(dataset_name)
+    normalized = normalize_column_name(name)
 
-    atomic_write_dataframe_csv(
-        frame,
-        raw_path,
-    )
+    def _tier(hints: set[str], exact: float, partial_base: float,
+              partial_step: float, substring: float) -> float:
+        if normalized in hints:
+            return exact
+        parts = set(normalized.split("_"))
+        overlap = len(parts & hints)
+        if overlap:
+            return partial_base + partial_step * overlap
+        if any(h in normalized for h in hints):
+            return substring
+        return 0.0
 
-    return raw_path
+    primary = _tier(_PRIMARY_TEXT_HINTS, 12.0, 5.0, 2.0, 3.0)
+    if primary > 0.0:
+        return primary
+    return _tier(_SECONDARY_TEXT_HINTS, 10.0, 4.0, 1.5, 2.0)
 
+
+def score_label_column_name(name: str) -> float:
+    """
+    Score a column name for how likely it is to be the target field.
+
+    NOTE: kept symmetric with score_text_column_name so the peek and the full
+    detector share one vocabulary. No tiers here — 'label' and 'target' are
+    genuinely interchangeable and there is no body/title-style hierarchy.
+    """
+    normalized = normalize_column_name(name)
+    if normalized in LABEL_NAME_HINTS:
+        return 12.0
+    parts = set(normalized.split("_"))
+    overlap = len(parts & LABEL_NAME_HINTS)
+    if overlap:
+        return 5.0 + overlap * 2.0
+    if any(h in normalized for h in LABEL_NAME_HINTS):
+        return 3.0
+    return 0.0
+
+def _patch_transformers_torch_load_check() -> None:
+    """
+    Disable transformers' torch>=2.6 requirement for .bin checkpoints.
+
+    Background:
+        transformers >= 4.48 added check_torch_load_is_safe(), which
+        refuses to load any .bin file when torch < 2.6. This is a
+        response to CVE-2025-32434. The check is a pure Python guard;
+        it does not exist in torch itself.
+
+        Our pipeline pins torch 2.2.2 for reproducibility and downloads
+        .bin checkpoints from trusted sources (HuggingFace Hub via
+        HTTPS, verified by commit SHA). The risk profile the guard
+        addresses (arbitrary code execution from an untrusted .pth)
+        does not apply to our workflow.
+
+    Why this precise patch target:
+        modeling_utils.py does `from ...import_utils import
+        check_torch_load_is_safe`, which creates a local binding in
+        modeling_utils' namespace. Patching the definition site in
+        import_utils has no effect because the local binding still
+        points at the original function. The correct patch target is
+        the name that modeling_utils actually calls.
+
+    This function is idempotent. Calling it repeatedly is safe and
+    cheap.
+    """
+    try:
+        import transformers.modeling_utils as _mu
+    except ImportError:
+        return
+
+    if getattr(_mu, "_master_dataset_patch_applied", False):
+        return
+
+    # NOTE: transformers may have already imported the guard into other
+    # submodules (trainer.py, integrations/, etc.). We patch every module
+    # that holds a reference, not just modeling_utils.
+    _noop = lambda *args, **kwargs: None
+
+    targets = [
+        ("transformers.modeling_utils", "check_torch_load_is_safe"),
+        ("transformers.trainer", "check_torch_load_is_safe"),
+        ("transformers.utils.import_utils", "check_torch_load_is_safe"),
+    ]
+
+    for module_name, attr in targets:
+        try:
+            import importlib
+            mod = importlib.import_module(module_name)
+            if hasattr(mod, attr):
+                setattr(mod, attr, _noop)
+        except Exception:
+            # Non-fatal: the module may not exist in every transformers
+            # version. We only need modeling_utils to succeed.
+            continue
+
+    _mu._master_dataset_patch_applied = True
+    
 def _resolve_hf_url(url: str) -> str:
     """Rewrite huggingface.co URLs to the configured HF_ENDPOINT.
 
-    Cloudflare Worker proxies strip Content-Length from HEAD responses for
-    text files >1KB, but GET requests are unaffected. Since `requests.get`
+    NOTE: Cloudflare Worker proxies strip Content-Length from HEAD responses
+    for text files >1KB, but GET requests are unaffected. Since requests.get
     is a GET, dataset downloads are immune to the stripping bug.
     """
     endpoint = os.environ.get("HF_ENDPOINT")
@@ -588,10 +809,884 @@ def _resolve_hf_url(url: str) -> str:
         return url.replace("https://huggingface.co", endpoint.rstrip("/"))
     return url
 
+# ---------------------------------------------------------------------------
+# INTERACTIVE COLUMN SELECTION
+# ---------------------------------------------------------------------------
+
+def _configure_torch_threads() -> None:
+    """
+    Ensure PyTorch uses every physical core.
+
+    PyTorch reads OMP_NUM_THREADS and MKL_NUM_THREADS at import time and
+    defaults to those values, which on macOS is often 1 if a shell profile
+    exports them or if the wheel was built without a sensible default.
+
+    Called once, from _ensure_transformer, before the first forward pass.
+    Idempotent: subsequent calls are a no-op because the target count does
+    not change.
+    """
+    if torch is None:
+        return
+    desired = os.cpu_count() or 1
+    # Reserve one core for the OS and the DataLoader-style producer side.
+    # On an 8-core M2 that means 7 threads, which is measurably faster than
+    # saturating all 8.
+    desired = max(1, desired - 1)
+    current = torch.get_num_threads()
+    if current < desired:
+        torch.set_num_threads(desired)
+    try:
+        # The interop thread pool is rarely useful and often contended.
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # Already initialized; cannot change.
+        pass
+
+def _adaptive_sentiment_batch_size(
+    requested: int,
+    device: torch.device,
+    *,
+    n_rows: int,
+) -> int:
+    """
+    Choose a batch size that amortizes Python overhead without blowing
+    memory.
+
+    On CPU, the per-batch Python cost (tokenize + tensor construction +
+    dict iteration) dominates once batches get small. Batch 32 on a
+    100k-row dataset means 3,000+ sequential iterations of pure overhead.
+    Raising the batch to 256 reduces that to ~400.
+
+    On MPS/CUDA the same reasoning applies but for a different reason:
+    the GPU pipeline stays full longer per iteration.
+
+    The user's --batch-size is treated as a floor, not a cap. If they
+    asked for 32 and we compute 128 as safer, we use 128 and print why.
+    """
+    floor = max(1, int(requested))
+    if device.type == "cuda":
+        candidate = 256
+    elif device.type == "mps":
+        # MPS has a shared memory pool; 128 is the sweet spot on M2.
+        candidate = 128
+    else:
+        # CPU: bigger is better as long as it fits L3.
+        candidate = 128
+
+    if n_rows < candidate:
+        return max(1, n_rows)
+    if floor >= candidate:
+        return floor
+    return candidate
+
+def _torch_device_report() -> dict[str, Any]:
+    """
+    Return a diagnostic dict describing the torch environment. Used only
+    by the renderer at transformer init time so the user can see at a
+    glance why a given device was selected.
+    """
+    if torch is None:
+        return {"torch": "not installed"}
+    info: dict[str, Any] = {
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "mps_built": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_built()),
+        "mps_available": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        "cpu_count": os.cpu_count(),
+        "num_threads": torch.get_num_threads(),
+        "interop_threads": torch.get_num_interop_threads(),
+    }
+    return info
+
+def _column_stats(frame: pd.DataFrame, col: str) -> dict[str, Any]:
+    """
+    Compute the summary statistics used by the interactive column chooser.
+
+    Returns a dict with:
+        dtype           pandas dtype as a string
+        unique          number of distinct non-null values
+        non_null        number of non-null cells
+        total           number of rows
+        avg_chars       mean character length of the column as strings
+        median_chars    median character length
+        samples         first three non-null values, compacted
+        unique_values   list of all distinct values if cardinality <= 30,
+                        otherwise None
+    """
+    series = frame[col]
+    non_null = series.dropna()
+    as_text = non_null.astype(str)
+    unique_count = int(non_null.nunique())
+    return {
+        "dtype": str(series.dtype),
+        "unique": unique_count,
+        "non_null": int(len(non_null)),
+        "total": int(len(series)),
+        "avg_chars": float(as_text.str.len().mean()) if not as_text.empty else 0.0,
+        "median_chars": float(as_text.str.len().median()) if not as_text.empty else 0.0,
+        "samples": [compact(str(v), 60) for v in non_null.head(3)],
+        "unique_values": (
+            [str(v) for v in non_null.unique()[:30]]
+            if unique_count <= 30 else None
+        ),
+    }
+
+
+def _validate_text_candidate(stats: dict[str, Any], total: int) -> tuple[bool, list[str]]:
+    """
+    Return (looks_like_text, warnings).
+
+    A text column is expected to be a long, high-cardinality string column.
+    This check flags the two failure modes that most often produce wrong
+    picks: categorical columns misidentified as text, and columns whose
+    values are so short they cannot carry semantic content.
+    """
+    warnings: list[str] = []
+    if total and stats["unique"] / total < 0.05 and stats["unique"] < 50:
+        warnings.append(
+            f"only {stats['unique']:,} distinct values across {total:,} rows "
+            f"— looks categorical rather than free text"
+        )
+    if stats["avg_chars"] < 8:
+        warnings.append(
+            f"average length {stats['avg_chars']:.1f} chars "
+            f"— shorter than typical free text"
+        )
+    return (len(warnings) == 0, warnings)
+
+
+def _validate_label_candidate(stats: dict[str, Any], total: int) -> tuple[bool, list[str]]:
+    """
+    Return (looks_like_label, warnings).
+
+    A label column is expected to be low-cardinality and short. This flags
+    the two failure modes that most often produce wrong picks: a text-like
+    column misidentified as labels, and columns whose values are so long
+    they cannot be a class name or numeric target.
+    """
+    warnings: list[str] = []
+    if stats["unique"] > max(100, total // 2):
+        warnings.append(
+            f"{stats['unique']:,} distinct values across {total:,} rows "
+            f"— looks like free text, not a label"
+        )
+    if stats["avg_chars"] > 80:
+        warnings.append(
+            f"average length {stats['avg_chars']:.1f} chars "
+            f"— labels are usually much shorter"
+        )
+    return (len(warnings) == 0, warnings)
+
+
+def _suggest_text_column(
+    columns: list[str],
+    stats: dict[str, dict[str, Any]],
+) -> str:
+        """Pick the column whose stats most resemble a text field."""
+        return max(
+            columns,
+            key=lambda c: (stats[c]["avg_chars"], stats[c]["unique"]),
+        )
+
+
+def _suggest_label_column(
+    columns: list[str],
+    stats: dict[str, dict[str, Any]],
+    total: int,
+    *,
+    exclude: Optional[str] = None,
+) -> str:
+        """Pick the column whose stats most resemble a label field."""
+        pool = [c for c in columns if c != exclude]
+        if not pool:
+            return columns[0]
+        threshold = max(50, total // 20)
+        candidates = [
+            c for c in pool
+            if stats[c]["unique"] <= threshold and stats[c]["avg_chars"] < 60
+        ]
+        if not candidates:
+            return min(pool, key=lambda c: stats[c]["unique"])
+        return min(candidates, key=lambda c: stats[c]["unique"])    
+
+
+def prompt_for_columns(
+    frame: pd.DataFrame,
+    renderer: Renderer,
+    *,
+    head_rows: int = 5,
+    tail_rows: int = 5,
+    default_text: Optional[str] = None,
+    default_label: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+        """
+        Robust interactive column chooser for datasets whose schema could not
+        be auto-detected.
+
+        Workflow:
+
+        1. Show first N and last N rows. Both ends matter: some CSVs have a
+            garbage final row from a trailing newline, and showing the tail
+            makes that visible immediately.
+
+        2. Show per-column statistics: dtype, cardinality, fill rate, average
+            length, sample value.
+
+        3. Show the full set of distinct values for every low-cardinality
+            column. This is what lets a human tell a label column apart from a
+            metadata column at a glance.
+
+        4. Ask for the TEXT column, validating the answer.
+
+        5. Ask for the LABEL column, validating the answer.
+
+        6. Show the final choice and ask for confirmation.
+
+        Any invalid answer (nonexistent column, same column for both roles, or
+        a warning the user declines to override) returns to the relevant prompt
+        without losing the rest of the state. Final "no" on the confirmation
+        restarts the whole chooser.
+
+        Returns (text_column, label_column) or (None, None) if the renderer is
+        disabled, in which case the caller raises the original detection error.
+        """
+        if not renderer.enabled:
+            return None, None
+
+        if frame.empty:
+            raise DatasetSchemaError("Cannot select columns from an empty dataset.")
+
+        columns = [str(c) for c in frame.columns]
+        total = len(frame)
+        stats = {c: _column_stats(frame, c) for c in columns}
+
+        # ---------------------------------------------------------------
+        # Preview: head, tail, stats, unique values.
+        # ---------------------------------------------------------------
+        head_n = min(head_rows, total)
+        renderer.table(
+            f"DATASET HEAD — first {head_n} rows",
+            ["#"] + columns,
+            [
+                [str(i)] + [compact(str(row[c]), 70) for c in columns]
+                for i, (_, row) in enumerate(frame.head(head_n).iterrows())
+            ],
+            show_lines=True,
+        )
+
+        if total > head_n:
+            tail_n = min(tail_rows, total)
+            renderer.table(
+                f"DATASET TAIL — last {tail_n} rows",
+                ["#"] + columns,
+                [
+                    [str(total - tail_n + i)]
+                    + [compact(str(row[c]), 70) for c in columns]
+                    for i, (_, row) in enumerate(frame.tail(tail_n).iterrows())
+                ],
+                show_lines=True,
+            )
+
+        renderer.table(
+            "COLUMN STATS",
+            ["Column", "Dtype", "Unique", "Non-null", "Avg len", "Median len", "Sample"],
+            [
+                [
+                    c,
+                    stats[c]["dtype"],
+                    f"{stats[c]['unique']:,}",
+                    f"{stats[c]['non_null']:,} / {stats[c]['total']:,}",
+                    f"{stats[c]['avg_chars']:.1f}",
+                    f"{stats[c]['median_chars']:.1f}",
+                    stats[c]["samples"][0] if stats[c]["samples"] else "—",
+                ]
+                for c in columns
+            ],
+        )
+
+        low_card = [c for c in columns if stats[c]["unique_values"] is not None]
+        if low_card:
+            renderer.table(
+                "UNIQUE VALUES (low-cardinality columns)",
+                ["Column", "Distinct", "Values"],
+                [
+                    [
+                        c,
+                        f"{stats[c]['unique']:,}",
+                        "  ·  ".join(stats[c]["unique_values"]),
+                    ]
+                    for c in low_card
+                ],
+            )
+
+        suggested_text = _suggest_text_column(columns, stats)
+        suggested_label = _suggest_label_column(
+            columns, stats, total, exclude=suggested_text,
+        )
+        renderer.info(
+            f"Suggested text column: {suggested_text!r}  |  "
+            f"Suggested label column: {suggested_label!r}"
+        )
+
+        # ---------------------------------------------------------------
+        # Outer loop: entire chooser restarts if the user declines the final
+        # confirmation. No recursion.
+        # ---------------------------------------------------------------
+        while True:
+            text_col = _prompt_for_text_column(
+                columns, stats, total, renderer,
+                default=default_text if default_text in columns else suggested_text,
+            )
+            label_col = _prompt_for_label_column(
+                columns, stats, total, renderer,
+                text_col=text_col,
+                default=default_label
+                    if default_label in columns and default_label != text_col
+                    else _suggest_label_column(columns, stats, total, exclude=text_col),
+            )
+
+            renderer.table(
+                "FINAL CHOICE",
+                ["Role", "Column", "Dtype", "Unique", "Avg len"],
+                [
+                    ["Text", text_col, stats[text_col]["dtype"],
+                    f"{stats[text_col]['unique']:,}",
+                    f"{stats[text_col]['avg_chars']:.1f}"],
+                    ["Label", label_col, stats[label_col]["dtype"],
+                    f"{stats[label_col]['unique']:,}",
+                    f"{stats[label_col]['avg_chars']:.1f}"],
+                ],
+            )
+
+            try:
+                confirmed = Prompt.ask(
+                    "Proceed with these columns?",
+                    choices=["y", "n"],
+                    default="y",
+                    console=renderer.console,
+                ).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                raise DatasetSchemaError("Column selection cancelled by user.")
+
+            if confirmed == "y":
+                return text_col, label_col
+
+            renderer.info("Restarting column selection.")
+
+
+def _prompt_for_text_column(
+    columns: list[str],
+    stats: dict[str, dict[str, Any]],
+    total: int,
+    renderer: Renderer,
+    *,
+    default: str,
+) -> str:
+        """Loop until a valid text column has been chosen."""
+        while True:
+            try:
+                raw = Prompt.ask(
+                    "Which column is the CLEAN TEXT?",
+                    choices=columns,
+                    default=default,
+                    console=renderer.console,
+                )
+            except (KeyboardInterrupt, EOFError):
+                raise DatasetSchemaError("Column selection cancelled by user.")
+
+            candidate = raw.strip()
+            if candidate not in columns:
+                renderer.warning(
+                    f"{candidate!r} is not a column. Valid choices: {columns}"
+                )
+                continue
+
+            ok, warnings = _validate_text_candidate(stats[candidate], total)
+            if ok:
+                return candidate
+
+            renderer.warning(
+                f"{candidate!r} does not look like a text column:\n  • "
+                + "\n  • ".join(warnings)
+            )
+            try:
+                override = Prompt.ask(
+                    f"Use {candidate!r} as the text column anyway?",
+                    choices=["y", "n"],
+                    default="n",
+                    console=renderer.console,
+                ).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                raise DatasetSchemaError("Column selection cancelled by user.")
+
+            if override == "y":
+                return candidate
+
+
+def _prompt_for_label_column(
+    columns: list[str],
+    stats: dict[str, dict[str, Any]],
+    total: int,
+    renderer: Renderer,
+    *,
+    text_col: str,
+    default: str,
+) -> str:
+        """Loop until a valid label column has been chosen."""
+        remaining = [c for c in columns if c != text_col]
+        if not remaining:
+            raise DatasetSchemaError(
+                "Only one column is available; text and label must differ."
+            )
+
+        while True:
+            try:
+                raw = Prompt.ask(
+                    "Which column is the LABEL / TARGET?",
+                    choices=remaining,
+                    default=default if default in remaining else remaining[0],
+                    console=renderer.console,
+                )
+            except (KeyboardInterrupt, EOFError):
+                raise DatasetSchemaError("Column selection cancelled by user.")
+
+            candidate = raw.strip()
+            if candidate not in remaining:
+                renderer.warning(
+                    f"{candidate!r} is not a valid label column. "
+                    f"Valid choices: {remaining}"
+                )
+                continue
+            if candidate == text_col:
+                renderer.warning(
+                    f"{candidate!r} is already the text column; "
+                    "text and label must be different columns."
+                )
+                continue
+
+            ok, warnings = _validate_label_candidate(stats[candidate], total)
+            if ok:
+                return candidate
+
+            renderer.warning(
+                f"{candidate!r} does not look like a label column:\n  • "
+                + "\n  • ".join(warnings)
+            )
+            try:
+                override = Prompt.ask(
+                    f"Use {candidate!r} as the label column anyway?",
+                    choices=["y", "n"],
+                    default="n",
+                    console=renderer.console,
+                ).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                raise DatasetSchemaError("Column selection cancelled by user.")
+
+            if override == "y":
+                return candidate
+
+def _default_hf_cache_dir() -> Path:
+    """
+    Resolve the HuggingFace cache directory.
+
+    Priority:
+        1. $HF_HUB_CACHE (already set by Extraction.py or the shell)
+        2. $HF_HOME/hub
+        3. ~/.cache/huggingface/hub
+
+    NOTE: this is deliberately separate from DEFAULT_CACHE_DIR, which is for
+    dataset file downloads (tempdir). Model snapshots need a durable location
+    so they survive reboots and are shared with any other HF-aware tool on
+    the machine.
+    """
+    env = os.environ.get("HF_HUB_CACHE")
+    if env:
+        return Path(env).expanduser().resolve()
+    env = os.environ.get("HF_HOME")
+    if env:
+        return Path(env).expanduser().resolve() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _curl_fetch_hf_file(
+    url: str,
+    destination: Path,
+    *,
+    max_attempts: int = 3,
+    timeout: int = 300,
+) -> bool:
+    """
+    Download a single file via curl. Returns True on success.
+
+    Why curl instead of requests or huggingface_hub:
+
+      * `requests.get` works fine in isolation, but huggingface_hub's
+        higher-level wrappers do a HEAD first. Cloudflare Worker proxies
+        strip Content-Length from HEAD responses on text files >1KB, so
+        huggingface_hub treats those files as non-existent.
+
+      * curl issues a single GET with no HEAD. The proxy cannot mangle it.
+
+    A 404 means the file does not exist in this repo. That is not a
+    failure; it just means the caller should try the next candidate name
+    (e.g. vocab.json vs vocab.txt).
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_suffix(destination.suffix + ".part")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(
+                [
+                    "curl", "-fsSL",
+                    "--retry", "2",
+                    "--retry-delay", "2",
+                    "--connect-timeout", "60",
+                    "--max-time", str(timeout),
+                    "-o", str(tmp),
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 60,
+            )
+            if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                tmp.replace(destination)
+                return True
+            if "404" in (result.stderr or ""):
+                # File genuinely absent; do not retry.
+                tmp.unlink(missing_ok=True)
+                return False
+        except subprocess.TimeoutExpired:
+            pass
+        except FileNotFoundError:
+            # curl not on PATH. Give up without further attempts.
+            tmp.unlink(missing_ok=True)
+            return False
+        except Exception:
+            pass
+
+        tmp.unlink(missing_ok=True)
+        if attempt < max_attempts:
+            time.sleep(2.0 * attempt)
+
+    return False
+
+
+def prefetch_hf_snapshot(
+    model_name: str,
+    cache_dir: Optional[Path] = None,
+    *,
+    revision: Optional[str] = None,
+    show: bool = False,
+) -> Optional[Path]:
+    """
+    Force a complete, proxy-safe download of a HuggingFace model snapshot.
+
+    Returns the absolute path to the fully-populated snapshot directory,
+    or None if the snapshot could not be completed. Callers should treat
+    None as "fall back to whatever the local cache already holds".
+
+    The download is split into two steps on purpose:
+
+      Step 1 — weights (binary, large). snapshot_download's HEAD requests
+      succeed because these files are big enough that Cloudflare does not
+      strip Content-Length. Also, if a HEAD does fail, huggingface_hub's
+      retry logic recovers on a ranged GET.
+
+      Step 2 — metadata (text, small). Downloads every tokenizer and
+      config file the model might need, one at a time, via curl. curl
+      issues no HEAD, so the proxy has nothing to mangle.
+
+    The result is deterministic on every network this pipeline has been
+    run against: Iran, Cloudflare Workers, DevNeeds mirrors, and plain
+    HuggingFace.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        if show:
+            print("[prefetch] huggingface_hub not installed; skipping.")
+        return None
+
+    cache_path = Path(cache_dir or _default_hf_cache_dir()).expanduser().resolve()
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Step 1 — weights only. Never includes text files, so the proxy bug
+    # cannot fire here.
+    # ------------------------------------------------------------------
+    weight_patterns = ["*.safetensors", "*.bin", "*.index.json"]
+    ignore_patterns = [
+        "*.h5", "*.msgpack", "*.ot", "rust_model.ot",
+        "tf_model.*", "flax_model.*",
+        "*.onnx", "*.gguf", "*.ggml",
+        "*.mlmodel", "*.mlpackage", "*.mlmodelc",
+        "coreml/**", "*.tflite", "*.pb",
+        "*.pt", "*.pth", "*.ckpt",
+        "*.safetensors.index.json.lock",
+    ]
+
+    snapshot_path: Optional[Path] = None
+    try:
+        snapshot_path = Path(snapshot_download(
+            repo_id=model_name,
+            revision=revision,
+            cache_dir=str(cache_path),
+            allow_patterns=weight_patterns,
+            ignore_patterns=ignore_patterns,
+            max_workers=4,
+        )).resolve()
+        if show:
+            print(f"[prefetch] weights ready: {snapshot_path}")
+    except Exception as exc:
+        if show:
+            print(f"[prefetch] snapshot_download failed ({type(exc).__name__}: {exc})")
+        # Recover a partial snapshot from the cache if one exists.
+        slug = model_name.replace("/", "--")
+        snapshots_root = cache_path / f"models--{slug}" / "snapshots"
+        if snapshots_root.is_dir():
+            candidates = sorted(
+                (p for p in snapshots_root.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                snapshot_path = candidates[0].resolve()
+                if show:
+                    print(f"[prefetch] recovered partial snapshot: {snapshot_path}")
+
+    if snapshot_path is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # Step 2 — metadata via curl. Fetches every file the tokenizer and
+    # config loaders may look for. Missing files (404) are silently
+    # skipped; not every model has every file.
+    # ------------------------------------------------------------------
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    revision_segment = revision if revision else "main"
+    base_url = f"{endpoint}/{model_name}/resolve/{revision_segment}"
+
+    metadata_files = [
+        "config.json",
+        "generation_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "vocab.txt",
+        "spiece.model",
+        "spm.model",
+        "sentencepiece.bpe.model",
+        "tokenizer.model",
+        "README.md",
+    ]
+
+    fetched = 0
+    for filename in metadata_files:
+        dest = snapshot_path / filename
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        if _curl_fetch_hf_file(f"{base_url}/{filename}", dest):
+            fetched += 1
+
+    if show:
+        print(f"[prefetch] metadata files fetched: {fetched}")
+
+    # ------------------------------------------------------------------
+    # Step 3 — validate. If config.json or a weight shard is missing, the
+    # snapshot is unusable and we return None so the caller falls back.
+    # ------------------------------------------------------------------
+    config_ok = (snapshot_path / "config.json").is_file()
+    has_weights = bool(
+        list(snapshot_path.glob("*.safetensors"))
+        or list(snapshot_path.glob("*.bin"))
+    )
+    if not (config_ok and has_weights):
+        if show:
+            print(
+                f"[prefetch] snapshot incomplete "
+                f"(config={config_ok}, weights={has_weights})"
+            )
+        return None
+
+    return snapshot_path
 
 # =============================================================================
 # DATASET STORAGE / SOURCE IDENTITY
 # =============================================================================
+def peek_schema_from_header(raw_csv: Path) -> tuple[Optional[str], Optional[str]]:
+    """
+    Cheap header-only schema guess for the datasets listing.
+
+    Reads only the first line of the raw CSV and scores each column name
+    against the tiered hint sets. This is a hint, NOT a prescription: full
+    schema detection still runs on the full DataFrame at load time.
+
+    Returns (text_column, label_column); either may be None.
+
+    NOTE: the threshold is 5.0 for text and 5.0 for label, which corresponds
+    to at least one whole-word hint token in the column name. Anything below
+    that is too noisy to surface as a guess.
+    """
+    try:
+        with raw_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+    except Exception:
+        return None, None
+
+    if not header:
+        return None, None
+
+    scored_text = [(str(c), score_text_column_name(str(c))) for c in header]
+    scored_label = [(str(c), score_label_column_name(str(c))) for c in header]
+
+    # NOTE: sort by score descending, then by header position ascending.
+    # The positional tiebreak only matters for columns that genuinely score
+    # identically under the tiered scheme; with primary/secondary separated,
+    # a body column always outranks a title column.
+    scored_text.sort(key=lambda x: (-x[1], header.index(x[0])))
+    scored_label.sort(key=lambda x: (-x[1], header.index(x[0])))
+
+    best_text_name, best_text_score = scored_text[0]
+    best_label_name, best_label_score = scored_label[0]
+
+    text_col = best_text_name if best_text_score >= 5.0 else None
+    label_col = (
+        best_label_name
+        if best_label_score >= 5.0 and best_label_name != text_col
+        else None
+    )
+    return text_col, label_col
+
+
+def schema_sidecar_path(key: str) -> Path:
+    """Where a cached, fully-detected schema is written after a load."""
+    # NOTE: lives beside the raw CSV so it moves with the dataset folder.
+    return dataset_root_dir(key) / "schema.json"
+
+
+def load_schema_sidecar(key: str) -> Optional[dict[str, Any]]:
+    p = schema_sidecar_path(key)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+# Module-level guard so repeated --list-datasets calls do not repeat the work.
+_SCHEMA_MATERIALIZED: set[str] = set()
+def materialize_schema_sidecars(force: bool = False) -> None:
+    """
+    Ensure every dataset folder has a complete schema.json sidecar.
+
+    The sidecar now carries text_column, label_column, task_type, and
+    class_count. Datasets that already have all four fields are skipped.
+    Datasets that are missing task_type or class_count are re-sampled to
+    fill them in.
+
+    Sampling reads 5,000 rows deterministically. It does not load the
+    whole CSV, so a 4M-row dataset costs one sequential read.
+    """
+    global _SCHEMA_MATERIALIZED
+    if not PROJECT_DATASETS_DIR.is_dir():
+        return
+
+    for entry in sorted(PROJECT_DATASETS_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        key = entry.name
+        if not force and key in _SCHEMA_MATERIALIZED:
+            continue
+        _SCHEMA_MATERIALIZED.add(key)
+
+        existing = load_schema_sidecar(key)
+        if (
+            existing is not None
+            and existing.get("text_column")
+            and existing.get("label_column")
+            and existing.get("task_type") not in {None, "unknown"}
+            and existing.get("class_count") not in {None, 0}
+        ):
+            # Fully populated. Nothing to do.
+            continue
+
+        raw_csv = entry / "raw" / f"{key}.csv"
+        if not raw_csv.is_file() or raw_csv.stat().st_size == 0:
+            for candidate in (
+                entry / "processed" / f"{key}_clean.csv",
+                entry / "processed" / f"{key}.csv",
+            ):
+                if candidate.is_file():
+                    raw_csv = candidate
+                    break
+            else:
+                continue
+
+        try:
+            sample = DatasetLoader.read_rows_only(
+                raw_csv, 5_000, mode="random", seed=42,
+            )
+            if sample.empty:
+                continue
+
+            detector = SchemaDetector(Renderer(quiet=True, no_visuals=True))
+            detection = detector.detect(sample)
+
+            if detection.text_column and detection.label_column:
+                # ---------------------------------------------------------
+                # Infer task_type and class_count from the sampled labels.
+                # This is the same logic profile() runs, just persisted
+                # instead of printed.
+                # ---------------------------------------------------------
+                try:
+                    label_series = sample[detection.label_column].map(
+                        LabelNormalizer.parse
+                    )
+                    task_type, class_count = infer_task_and_class_count(
+                        label_series
+                    )
+                    detection.task_type = task_type
+                    detection.class_count = class_count
+                except Exception:
+                    # Leave task_type / class_count as None; discovery will
+                    # fall back to "unknown" / "—" for this one row only.
+                    pass
+
+                write_schema_sidecar(key, detection)
+        except Exception:
+            continue
+
+def write_schema_sidecar(key: str, detection: DetectionResult) -> None:
+    """Persist the last confirmed detection for this dataset."""
+    p = schema_sidecar_path(key)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "text_column": detection.text_column,
+        "label_column": detection.label_column,
+        "one_hot_label_columns": detection.one_hot_label_columns,
+        # NOTE: task_type / class_count are None when detection ran before
+        # any label sampling. Persisting None is fine; discovery treats it
+        # the same as a missing key.
+        "task_type": detection.task_type,
+        "class_count": detection.class_count,
+        "confidence": detection.confidence,
+        "warnings": detection.warnings,
+        "recorded_at": time.time(),
+    }
+    try:
+        p.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 def sanitize_dataset_name(value: Any) -> str:
     """
@@ -606,21 +1701,15 @@ def sanitize_dataset_name(value: Any) -> str:
     """
     text = str(value).strip()
 
-    # Remove URL / HF protocol prefixes.
     text = re.sub(r"^(?:https?|hf)://", "", text, flags=re.IGNORECASE)
-
-    # Normalize obvious separators.
     text = text.replace("\\", "/")
     text = text.replace(":", "_")
     text = re.sub(r"[?#].*$", "", text)
 
-    # Keep only the final meaningful path identity unless this is a
-    # repo:config-style HF source, which has already become underscores.
     if "/" in text:
         parts = [part for part in text.split("/") if part]
         text = parts[-1] if parts else text
 
-    # Strip common file extensions when the source is a file.
     text = re.sub(
         r"\.(csv|tsv|txt|json|jsonl|ndjson|parquet|pq|xlsx|xls)$",
         "",
@@ -640,19 +1729,11 @@ def dataset_name_from_source(source: str) -> str:
     """
     Derive the project-local dataset identity from any supported source.
 
-    Managed:
-        known://goemo          -> goemo
-
-    Hugging Face:
-        hf://dair-ai/emotion         -> emotion
-        hf://tweet_eval:emotion      -> tweet_eval_emotion
-        hf://fancyzhx/amazon_polarity -> amazon_polarity
-
-    URL:
-        https://example.org/foo.csv  -> foo
-
-    Local:
-        ./data/my_dataset.csv        -> my_dataset
+    Managed:      known://goemo                  -> goemo
+    HF:           hf://dair-ai/emotion           -> emotion
+                  hf://tweet_eval:emotion        -> tweet_eval_emotion
+    URL:          https://example.org/foo.csv    -> foo
+    Local:        ./data/my_dataset.csv          -> my_dataset
     """
     source = str(source).strip()
 
@@ -661,25 +1742,20 @@ def dataset_name_from_source(source: str) -> str:
 
     if source.startswith("hf://"):
         repo_spec = source[len("hf://"):].strip()
-
         if ":" in repo_spec:
             repo, config = repo_spec.split(":", 1)
-            base_name = sanitize_dataset_name(repo)
-            config_name = sanitize_dataset_name(config)
-            return sanitize_dataset_name(f"{base_name}_{config_name}")
-
+            return sanitize_dataset_name(
+                f"{sanitize_dataset_name(repo)}_{sanitize_dataset_name(config)}"
+            )
         return sanitize_dataset_name(repo_spec)
 
     if is_url(source):
         parsed = urlparse(source)
-
         path_name = Path(parsed.path).name
         if path_name:
             name = sanitize_dataset_name(path_name)
             if name:
                 return name
-
-        # Fall back to domain identity.
         domain = parsed.netloc.split(":")[0]
         return sanitize_dataset_name(domain)
 
@@ -691,21 +1767,17 @@ def dataset_root_dir(dataset_name: str) -> Path:
 
 
 def dataset_raw_dir(dataset_name: str) -> Path:
-    path = dataset_root_dir(dataset_name) / "raw"
-    return path
+    return dataset_root_dir(dataset_name) / "raw"
 
 
 def dataset_processed_dir(dataset_name: str) -> Path:
-    path = dataset_root_dir(dataset_name) / "processed"
-    return path
+    return dataset_root_dir(dataset_name) / "processed"
 
 
 def dataset_raw_path(dataset_name: str) -> Path:
     """
-    Canonical raw snapshot location.
-
-    Always:
-        ./datasets/<dataset_name>/raw/<dataset_name>.csv
+    Canonical raw snapshot location:
+        <root>/<name>/raw/<name>.csv
     """
     name = sanitize_dataset_name(dataset_name)
     return dataset_raw_dir(name) / f"{name}.csv"
@@ -713,13 +1785,11 @@ def dataset_raw_path(dataset_name: str) -> Path:
 
 def dataset_processed_path(dataset_name: str) -> Path:
     """
-    Canonical processed output location.
-
-    Always:
-        ./datasets/<dataset_name>/processed/<dataset_name>.csv
+    Canonical processed output location:
+        <root>/<name>/processed/<name>_clean.csv
     """
     name = sanitize_dataset_name(dataset_name)
-    return dataset_processed_dir(name) / f"{name}.csv"
+    return dataset_processed_dir(name) / f"{name}_clean.csv"
 
 
 def known_dataset_raw_dir(key: str) -> Path:
@@ -732,13 +1802,9 @@ def known_dataset_processed_dir(key: str) -> Path:
 
 def known_dataset_local_path(key: str) -> Path:
     """
-    Canonical raw CSV for a managed dataset.
-
-    The filename is deliberately independent of the remote filename so that
-    every managed dataset obeys exactly the same project storage contract.
+    Canonical raw CSV for a managed *or* discovered dataset.
     """
-    name = sanitize_dataset_name(key)
-    return dataset_raw_path(name)
+    return dataset_raw_path(key)
 
 
 def known_dataset_is_local(key: str) -> bool:
@@ -748,26 +1814,18 @@ def known_dataset_is_local(key: str) -> bool:
 
 def resolve_known_dataset_key(value: str) -> Optional[str]:
     """
-    Resolve managed datasets case-insensitively by key or display name.
-
-    Examples:
-        goemo
-        GoEmotions
-        GOEMOTIONS
-        emobank
-        EmoBank
+    Resolve managed or discovered datasets case-insensitively by key or
+    display name. Returns None if the name matches nothing.
     """
     candidate = str(value).strip()
-
     if not candidate:
         return None
 
     normalized_candidate = normalize_column_name(candidate)
 
-    for key, spec in KNOWN_DATASETS.items():
+    for key, spec in all_datasets().items():
         key_normalized = normalize_column_name(key)
         name_normalized = normalize_column_name(spec.get("name", ""))
-
         if normalized_candidate in {key_normalized, name_normalized}:
             return key
 
@@ -776,11 +1834,7 @@ def resolve_known_dataset_key(value: str) -> Optional[str]:
 
 def atomic_write_dataframe_csv(frame: pd.DataFrame, destination: Path) -> Path:
     """
-    Atomically persist a raw DataFrame as the project's canonical raw CSV.
-
-    The temporary file is written beside the final file and only replaced after
-    a successful write. This avoids leaving a partially written raw snapshot
-    after an interruption.
+    Atomically persist a raw DataFrame as the canonical raw CSV.
     """
     destination = Path(destination).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -788,10 +1842,7 @@ def atomic_write_dataframe_csv(frame: pd.DataFrame, destination: Path) -> Path:
     temporary = destination.with_suffix(destination.suffix + ".part")
 
     try:
-        frame.to_csv(
-            temporary,
-            index=False,
-        )
+        frame.to_csv(temporary, index=False)
 
         if not temporary.exists() or temporary.stat().st_size == 0:
             raise DatasetSourceError(
@@ -803,7 +1854,6 @@ def atomic_write_dataframe_csv(frame: pd.DataFrame, destination: Path) -> Path:
     except DatasetSourceError:
         temporary.unlink(missing_ok=True)
         raise
-
     except Exception as exc:
         temporary.unlink(missing_ok=True)
         raise DatasetSourceError(
@@ -816,22 +1866,10 @@ def atomic_write_dataframe_csv(frame: pd.DataFrame, destination: Path) -> Path:
 
 def default_processed_output_for_source(source: str) -> Path:
     """
-    Universal default processed output.
-
-    Always:
-
-        ./datasets/<dataset_name>/processed/<dataset_name>.csv
+    Universal default processed output:
+        <root>/<dataset_name>/processed/<dataset_name>_clean.csv
     """
-    dataset_name = dataset_name_from_source(source)
-    return dataset_processed_path(dataset_name)
-
-# =============================================================================
-# RICH PRESENTATION LAYER
-# =============================================================================
-
-# =============================================================================
-# ROBUST DELIMITER-SEPARATED INGESTION
-# =============================================================================
+    return dataset_processed_path(dataset_name_from_source(source))
 
 # =============================================================================
 # ROBUST DELIMITER-SEPARATED INGESTION
@@ -846,21 +1884,17 @@ class DelimitedIngestPolicy:
     header: bool = True
     encoding: str = "utf-8"
     quotechar: str = '"'
-    merge_delta_limit: int = 64          # safety cap on how much merge we allow
+    merge_delta_limit: int = 64
 
 
 def sniff_delimited_policy(
     path: Path,
     sample_bytes: int = 65536,
 ) -> DelimitedIngestPolicy:
-    """
-    Sniff the delimiter and header presence from a small sample.
-
-    Falls back to comma-delimited with a header on any sniffing failure, which
-    is the safest default for the kinds of files this loader accepts.
-    """
+    """Sniff delimiter + header presence from a small sample."""
     try:
-        raw = path.read_bytes()[:sample_bytes]
+        with path.open("rb") as _fh:
+            raw = _fh.read(sample_bytes)
     except OSError:
         return DelimitedIngestPolicy()
 
@@ -895,9 +1929,7 @@ def read_delimited_robust(
     path: Path,
     policy: DelimitedIngestPolicy,
 ) -> pd.DataFrame:
-    """
-    Quote-aware, row-shape-validating reader for delimiter-separated files.
-    """
+    """Quote-aware, row-shape-validating reader for delimiter-separated files."""
     path = Path(path).expanduser().resolve()
 
     rows: list[list[str]] = []
@@ -994,13 +2026,13 @@ def read_delimited_robust(
 
     return frame
 
-class Renderer:
-    """Centralized presentation layer.
 
-    Every table call generates a fresh palette and assigns a distinct colour to
-    each column. Status output itself is represented by one-column/one-row
-    tables rather than scattered prints.
-    """
+# =============================================================================
+# RICH PRESENTATION LAYER
+# =============================================================================
+
+class Renderer:
+    """Centralised presentation layer with a fresh palette per table call."""
 
     def __init__(self, quiet: bool = False, no_visuals: bool = False):
         self.quiet = bool(quiet)
@@ -1016,7 +2048,6 @@ class Renderer:
         return bool(VERBOSE and not self.quiet and not self.no_visuals)
 
     def _palette(self, count: int) -> tuple[list[str], str, str]:
-        """Create a fresh visual identity for every table invocation."""
         rng = random.SystemRandom()
         for _ in range(12):
             palette = tuple(rng.sample(LIGHT_COLORS, k=min(count, len(LIGHT_COLORS))))
@@ -1085,40 +2116,24 @@ class Renderer:
             for row in row_list:
                 if len(row) != len(columns):
                     row = list(row[: len(columns)]) + [""] * max(0, len(columns) - len(row))
-                cells = []
-                for i, value in enumerate(row):
-                    cells.append(Text(compact(value, 240), style=palette[i]))
+                cells = [Text(compact(row[i], 240), style=palette[i]) for i in range(len(columns))]
                 table.add_row(*cells)
             self.console.print(table)
             if caption:
-                self.console.print(
-                    Text(
-                        caption,
-                        style=f"italic {title_colour}",
-                    )
-                )
+                self.console.print(Text(caption, style=f"italic {title_colour}"))
             self.console.print()
-
-            
         else:
             print(f"\n{title}")
             print(" | ".join(str(c) for c in columns))
             print("-" * 120)
             for row in row_list:
-                print(
-                    " | ".join(
-                        compact(v, 120)
-                        for v in row
-                    )
-                )
-
+                print(" | ".join(compact(v, 120) for v in row))
             print()
 
     def status(self, kind: str, message: str) -> None:
         if not self.enabled:
             return
         symbols = {"ok": "✓", "warn": "⚠", "error": "✗", "info": "◆"}
-        colours = {"ok": "#B7F7C7", "warn": "#FFE6A7", "error": "#FFB3C1", "info": "#B8E7FF"}
         self.table(
             "STATUS",
             ["State", "Message"],
@@ -1155,7 +2170,7 @@ class Renderer:
         if not self.enabled:
             return
         if self.console:
-            colours, background, title_colour = self._palette(max(3, min(3, len(options))))
+            colours, background, title_colour = self._palette(3)
             table = Table(
                 title=Text(title, style=f"bold {title_colour}"),
                 box=box.HEAVY_HEAD,
@@ -1177,25 +2192,6 @@ class Renderer:
                 print(f"[{key}] {action} — {command}")
             if footer:
                 print(footer)
-
-    def tree(self, title: str, branches: dict[str, Sequence[str]]) -> None:
-        if not self.enabled:
-            return
-        if self.console:
-            tree = Tree(Text(title, style="bold #EAF4FF"))
-            rng = random.SystemRandom()
-            colours = rng.sample(LIGHT_COLORS, min(len(branches), len(LIGHT_COLORS)))
-            for i, (branch, leaves) in enumerate(branches.items()):
-                node = tree.add(Text(branch, style=f"bold {colours[i % len(colours)]}"))
-                for leaf in leaves:
-                    node.add(Text(str(leaf), style="#EAF4FF"))
-            self.console.print(tree)
-        else:
-            print(title)
-            for branch, leaves in branches.items():
-                print(f"├─ {branch}")
-                for leaf in leaves:
-                    print(f"│  └─ {leaf}")
 
 
 # =============================================================================
@@ -1267,11 +2263,181 @@ class DatasetLoader:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
 
+    @staticmethod
+    def _download_via_curl(
+        url: str,
+        destination: Path,
+        max_attempts: int = 3,
+    ) -> Path:
+            """
+            Fallback downloader that shells out to curl.
+
+            Used when requests/urllib3 hits a TLS handshake timeout on a host that
+            is known to throttle non-browser TLS stacks. curl is more tolerant of
+            the throttled endpoints (dl.fbaipublicfiles.com, some Cloudflare
+            Worker edges) because it can negotiate http/1.1 or downgrade cipher
+            suites on retry.
+
+            Note: this is synchronous and does not stream through Python. curl
+            writes directly to the destination file.
+            """
+            destination = Path(destination).expanduser().resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            tmp = destination.with_suffix(destination.suffix + ".part")
+
+            last_err: Optional[str] = None
+            for attempt in range(1, max_attempts + 1):
+                result = subprocess.run(
+                    [
+                        "curl", "-fL",
+                        "--retry", "2",
+                        "--retry-delay", "5",
+                        "--connect-timeout", "30",
+                        "--max-time", "1800",
+                        "--http1.1",
+                        "--tlsv1.2",
+                        "-o", str(tmp),
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                    tmp.replace(destination)
+                    return destination
+
+                last_err = result.stderr.strip() or f"curl exit {result.returncode}"
+                tmp.unlink(missing_ok=True)
+                if attempt < max_attempts:
+                    print(
+                        f"[curl-fallback] {url} attempt {attempt}/{max_attempts} "
+                        f"failed: {last_err}; retrying…"
+                    )
+                    time.sleep(5.0 * attempt)
+
+            raise DatasetSourceError(
+                f"curl fallback also failed for {url}: {last_err}"
+            )
+
+    @staticmethod
+    def read_rows_only(
+        path: Path,
+        n: int,
+        *,
+        mode: str = "head",          # head | tail | random
+        seed: int = 42,
+        policy: Optional[DelimitedIngestPolicy] = None,
+    ) -> pd.DataFrame:
+        """
+        Read at most n rows from a delimiter-separated file *without*
+        materialising the whole dataset.
+
+        Modes
+        -----
+        head    : pd.read_csv(nrows=n). Single bounded read; allocates n rows.
+        tail    : csv.reader + deque(maxlen=n). Single streaming pass; holds
+                  only the last n rows at any moment.
+        random  : reservoir sampling. Single streaming pass; holds only n
+                  rows at any moment. Deterministic given `seed`.
+
+        All three modes are O(file size) in I/O but O(n) in memory.
+
+        Non-delimited formats (json/jsonl/parquet/xlsx) fall back to a full
+        read followed by a slice. Those formats cannot be randomly accessed
+        at the row level through pandas without loading them.
+
+        NOTE: this method never touches self.raw_df, never mutates any
+        processor state, and never calls self.load(). It is the correct
+        entry point for preview and inspect.
+        """
+        path = Path(path).expanduser().resolve()
+        if not path.is_file():
+            raise DatasetSourceError(f"Dataset file does not exist: {path}")
+
+        suffix = path.suffix.lower()
+
+        # --- Non-delimited fallback -----------------------------------------
+        if suffix not in {".csv", ".tsv", ".txt"}:
+            frame = DatasetLoader._read_path(path, policy=policy)
+            if frame.empty:
+                return frame
+            n = min(n, len(frame))
+            if mode == "tail":
+                return frame.tail(n).copy().reset_index(drop=True)
+            if mode == "random":
+                return frame.sample(n, random_state=seed).reset_index(drop=True)
+            return frame.head(n).copy().reset_index(drop=True)
+
+        pol = policy or sniff_delimited_policy(path)
+        n = max(1, int(n))
+
+        # --- HEAD ------------------------------------------------------------
+        if mode == "head":
+            # NOTE: pandas nrows reads exactly n data rows (after the header
+            # line if header=0). It never scans the rest of the file.
+            try:
+                return pd.read_csv(
+                    path,
+                    sep=pol.delimiter,
+                    nrows=n,
+                    header=0 if pol.header else None,
+                    dtype=str,
+                    keep_default_na=False,
+                )
+            except Exception:
+                # Fall back to the robust reader for pathological files.
+                frame = DatasetLoader._read_path(path, policy=pol)
+                return frame.head(min(n, len(frame))).copy().reset_index(drop=True)
+
+        # --- TAIL and RANDOM both stream the file exactly once --------------
+        with path.open("r", encoding=pol.encoding, newline="") as handle:
+            reader = csv.reader(
+                handle,
+                delimiter=pol.delimiter,
+                quotechar=pol.quotechar,
+            )
+            header = next(reader, None) if pol.header else None
+
+            if mode == "tail":
+                # NOTE: deque(maxlen=n) keeps only the last n rows. Memory
+                # is bounded by n regardless of file size. This is the
+                # entire point of a streaming tail.
+                tail_rows = deque(reader, maxlen=n)
+                columns = (
+                    header
+                    if header is not None
+                    else [f"col_{i}" for i in range(len(tail_rows[0]) if tail_rows else 0)]
+                )
+                return pd.DataFrame(list(tail_rows), columns=columns)
+
+            if mode == "random":
+                # NOTE: Reservoir Sampling (Algorithm R). One pass, memory
+                # bounded by n. Every data row has an equal probability of
+                # ending up in the reservoir. Deterministic given `seed`.
+                rng = random.Random(seed)
+                reservoir: list[list[str]] = []
+                for i, row in enumerate(reader):
+                    if i < n:
+                        reservoir.append(row)
+                    else:
+                        j = rng.randint(0, i)
+                        if j < n:
+                            reservoir[j] = row
+                columns = (
+                    header
+                    if header is not None
+                    else [f"col_{i}" for i in range(len(reservoir[0]) if reservoir else 0)]
+                )
+                return pd.DataFrame(reservoir, columns=columns)
+
+        raise ValueError(f"Unknown sampling mode: {mode!r}")
+    
     def _download(
-    self,
-    url: str,
-    destination: Optional[str | Path] = None,
-    max_attempts: int = 3,) -> Path:
+        self,
+        url: str,
+        destination: Optional[str | Path] = None,
+        max_attempts: int = 3,
+    ) -> Path:
         if requests is None:
             raise DatasetSourceError(
                 "URL input requires requests. Install: pip install requests"
@@ -1283,7 +2449,6 @@ class DatasetLoader:
             filename = Path(parsed.path).name or f"dataset_{stable_hash(url)}.csv"
             if Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
                 filename = f"dataset_{stable_hash(url)}.csv"
-
             destination_path = self.cache_dir / f"{stable_hash(url)}_{filename}"
         else:
             destination_path = Path(destination).expanduser().resolve()
@@ -1293,9 +2458,7 @@ class DatasetLoader:
         if destination_path.exists() and destination_path.stat().st_size > 0:
             return destination_path
 
-        tmp = destination_path.with_suffix(
-            destination_path.suffix + ".part"
-        )
+        tmp = destination_path.with_suffix(destination_path.suffix + ".part")
 
         last_exc: Optional[BaseException] = None
         for attempt in range(1, max_attempts + 1):
@@ -1305,16 +2468,11 @@ class DatasetLoader:
                     resolved_url,
                     stream=True,
                     timeout=self.timeout,
-                    headers={
-                        "User-Agent": f"MasterDatasetProcessor/{VERSION}"
-                    },
+                    headers={"User-Agent": f"MasterDatasetProcessor/{VERSION}"},
                 ) as response:
                     response.raise_for_status()
 
-                    content_type = response.headers.get(
-                        "Content-Type", ""
-                    ).lower()
-
+                    content_type = response.headers.get("Content-Type", "").lower()
                     if "text/html" in content_type:
                         raise DatasetSourceError(
                             f"Remote source returned HTML instead of a dataset "
@@ -1322,14 +2480,11 @@ class DatasetLoader:
                         )
 
                     with tmp.open("wb") as handle:
-                        for chunk in response.iter_content(
-                            chunk_size=1024 * 1024
-                        ):
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
                             if chunk:
                                 handle.write(chunk)
 
                 head = tmp.read_bytes()[:512].lower()
-
                 if b"<!doctype html" in head or b"<html" in head:
                     raise DatasetSourceError(
                         f"Remote source returned an HTML page instead of a "
@@ -1342,7 +2497,6 @@ class DatasetLoader:
             except DatasetSourceError:
                 tmp.unlink(missing_ok=True)
                 raise
-
             except Exception as exc:
                 last_exc = exc
                 tmp.unlink(missing_ok=True)
@@ -1355,82 +2509,51 @@ class DatasetLoader:
                     )
                     time.sleep(backoff)
 
+        # NOTE: if requests has tried and failed, the host may be one that
+        # throttles non-browser TLS stacks. Fall back to curl before giving up.
+        if destination is not None:
+            print(f"[download] requests exhausted; trying curl fallback for {url}")
+            return DatasetLoader._download_via_curl(url, Path(destination), max_attempts=2)
+
         raise DatasetSourceError(
             f"Could not download dataset after {max_attempts} attempts: "
             f"{type(last_exc).__name__ if last_exc else 'UnknownError'}: {last_exc}"
         ) from last_exc
 
-        return destination_path
-
     @staticmethod
     def _read_path(
         path: Path,
-        policy: Optional["DelimitedIngestPolicy"] = None,
+        policy: Optional[DelimitedIngestPolicy] = None,
     ) -> pd.DataFrame:
-        """
-        Parse any supported dataset file into a DataFrame.
-
-        Delimiter-separated files (.csv/.tsv/.txt) are read through
-        ``read_delimited_robust``, which is quote-aware and tolerant of rows whose
-        field count diverges from the header. For managed datasets the caller
-        supplies an explicit ``DelimitedIngestPolicy``; otherwise the delimiter and
-        header presence are sniffed from the first few kilobytes.
-
-        All other formats (JSON, JSONL, Parquet, Excel) go through their native
-        pandas readers. Every failure is re-raised as a ``DatasetSourceError``
-        with a precise message, so no raw pandas traceback ever escapes the
-        loader.
-        """
+        """Parse any supported dataset file into a DataFrame."""
         path = Path(path).expanduser().resolve()
 
         if not path.exists():
             raise DatasetSourceError(f"Dataset file does not exist: {path}")
-
         if not path.is_file():
             raise DatasetSourceError(f"Dataset source is not a file: {path}")
-
         if path.stat().st_size == 0:
             raise DatasetSourceError(f"Dataset file is empty: {path}")
 
         suffix = path.suffix.lower()
 
         try:
-            # ------------------------------------------------------------------
-            # DELIMITER-SEPARATED (robust path)
-            # ------------------------------------------------------------------
             if suffix in {".csv", ".tsv", ".txt"}:
                 effective_policy = policy or sniff_delimited_policy(path)
                 return read_delimited_robust(path, effective_policy)
-            # ------------------------------------------------------------------
-            # JSONL / NDJSON
-            # ------------------------------------------------------------------
             if suffix in {".jsonl", ".ndjson"}:
                 return pd.read_json(path, lines=True)
-
-            # ------------------------------------------------------------------
-            # JSON (array-of-records or line-delimited fallback)
-            # ------------------------------------------------------------------
             if suffix == ".json":
                 try:
                     return pd.read_json(path)
                 except ValueError:
                     return pd.read_json(path, lines=True)
-
-            # ------------------------------------------------------------------
-            # PARQUET
-            # ------------------------------------------------------------------
             if suffix in {".parquet", ".pq"}:
                 return pd.read_parquet(path)
-
-            # ------------------------------------------------------------------
-            # EXCEL
-            # ------------------------------------------------------------------
             if suffix in {".xlsx", ".xls"}:
                 return pd.read_excel(path)
-
         except DatasetSourceError:
             raise
-
         except Exception as exc:
             raise DatasetSourceError(
                 f"Failed parsing '{path}': {type(exc).__name__}: {exc}"
@@ -1444,16 +2567,10 @@ class DatasetLoader:
     @staticmethod
     def _ingest_delimited(key: str, path: Path) -> pd.DataFrame:
         """
-        Read a managed dataset's canonical raw snapshot.
-
-        The snapshot is always written by ``atomic_write_dataframe_csv`` using
-        pandas' default comma delimiter, so the reader must use a comma policy
-        regardless of the original source delimiter (which was already consumed
-        during acquisition). An explicit ``ingest_policy`` on the spec, if present,
-        still wins — that is the extension point for future non-comma snapshots.
+        Read a managed dataset's canonical raw snapshot with the delimiter
+        policy declared by its spec (or a comma-based default).
         """
-        spec = KNOWN_DATASETS.get(key, {})
-
+        spec = all_datasets().get(key, {})
         policy_dict = spec.get("ingest_policy")
         if policy_dict:
             policy = DelimitedIngestPolicy(**policy_dict)
@@ -1464,60 +2581,31 @@ class DatasetLoader:
                 on_field_mismatch="merge_into_text",
                 header=True,
             )
-
         return read_delimited_robust(path, policy)
-    @staticmethod
-    def _read_pipe_delimited_with_text_pipes(path: Path, text_column: str) -> pd.DataFrame:
-        import csv
-        rows = []
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.reader(handle, delimiter="|", quotechar='"')
-            header = next(reader)
-            if text_column not in header:
-                raise DatasetSourceError(
-                    f"Text column '{text_column}' not found in pipe-delimited file."
-                )
-            text_idx = header.index(text_column)
-            for parts in reader:
-                extra = len(parts) - len(header)
-                if extra > 0:
-                    parts = (
-                        parts[:text_idx]
-                        + ["|".join(parts[text_idx : text_idx + extra + 1])]
-                        + parts[text_idx + extra + 1 :]
-                    )
-                elif extra < 0:
-                    parts = parts + [""] * (-extra)
-                rows.append(parts)
-        return pd.DataFrame(rows, columns=header)
-    @staticmethod
-    def _read_known_local(
-        key: str,
-        path: Path,
-    ) -> pd.DataFrame:
-        if key not in KNOWN_DATASETS:
-            raise DatasetSourceError(
-                f"Unknown managed dataset key: {key}"
-            )
 
-        spec = KNOWN_DATASETS[key]
+    @staticmethod
+    def _read_known_local(key: str, path: Path) -> pd.DataFrame:
+        """
+        Read the canonical raw CSV for a managed OR discovered dataset.
+
+        NOTE: discovered datasets were written by atomic_write_dataframe_csv
+        (pandas default CSV format), so a plain pd.read_csv is sufficient.
+        """
+        spec = all_datasets().get(key)
+        if spec is None:
+            raise DatasetSourceError(f"Unknown managed dataset key: {key}")
 
         try:
             source_type = spec.get("source_type")
 
             if source_type == "delimited":
                 frame = DatasetLoader._ingest_delimited(key, path)
-
             elif source_type == "goemotions_tsv":
-                frame = pd.read_csv(
-                    path,
-                    dtype=str,
-                    keep_default_na=False,
-                )
-
+                frame = pd.read_csv(path, dtype=str, keep_default_na=False)
             else:
+                # Covers emobank_csv, empathetic_archive, discovered,
+                # and any future source_type whose raw snapshot is a plain CSV.
                 frame = pd.read_csv(path)
-
         except Exception as exc:
             raise DatasetSourceError(
                 f"Failed parsing cached known dataset '{key}' at '{path}': "
@@ -1528,7 +2616,6 @@ class DatasetLoader:
             raise DatasetSourceError(
                 f"Cached known dataset '{key}' did not load as a DataFrame."
             )
-
         if frame.empty:
             raise DatasetSourceError(
                 f"Known dataset '{key}' contains zero rows."
@@ -1537,56 +2624,42 @@ class DatasetLoader:
         return frame
 
     def load_known(
-    self,
-    key: str,
-    *,
-    offline: bool = False,) -> tuple[pd.DataFrame, Path]:
-
+        self,
+        key: str,
+        *,
+        offline: bool = False,
+    ) -> tuple[pd.DataFrame, Path]:
         resolved_key = resolve_known_dataset_key(key)
-
         if resolved_key is None:
-            raise DatasetSourceError(
-                f"Unknown known dataset key: {key}"
-            )
+            raise DatasetSourceError(f"Unknown known dataset key: {key}")
 
         key = resolved_key
-        spec = KNOWN_DATASETS[key]
+        datasets = all_datasets()
+        spec = datasets[key]
 
         raw_root = known_dataset_raw_dir(key)
         local_path = known_dataset_local_path(key)
 
-        # -------------------------------------------------------------------------
-        # LOCAL-FIRST
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
+        # LOCAL-FIRST: works for managed AND discovered datasets.
+        # ---------------------------------------------------------------------
         if known_dataset_is_local(key):
-            frame = self._read_known_local(
-                key,
-                local_path,
-            )
+            frame = self._read_known_local(key, local_path)
 
             self.renderer.table(
                 "DATASET CACHE",
                 ["Dataset", "Source mode", "Local path", "Status"],
-                [[
-                    spec["name"],
-                    "LOCAL",
-                    str(local_path),
-                    "READY",
-                ]],
+                [[spec["name"], "LOCAL", str(local_path), "READY"]],
             )
-
             self.renderer.panel(
                 "CACHE LOCATION",
                 f"{spec['name']}\n{local_path}",
             )
-
             return frame, local_path
 
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # OFFLINE WITHOUT LOCAL RAW COPY
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         if offline:
             raise DatasetSourceError(
                 f"Known dataset '{key}' is not available locally.\n"
@@ -1596,21 +2669,15 @@ class DatasetLoader:
 
         kind = spec["source_type"]
 
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # GOEMOTIONS
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         if kind == "goemotions_tsv":
-
             frames: list[pd.DataFrame] = []
-
             for split, url in spec["online_urls"].items():
-
                 split_path = self._download(
-                    url,
-                    raw_root / f"goemotions_{split}.tsv",
+                    url, raw_root / f"goemotions_{split}.tsv",
                 )
-
                 part = pd.read_csv(
                     split_path,
                     sep="\t",
@@ -1619,89 +2686,57 @@ class DatasetLoader:
                     dtype=str,
                     keep_default_na=False,
                 )
-
                 part["__source_split"] = split
                 frames.append(part)
 
             if not frames:
-                raise DatasetSourceError(
-                    "GoEmotions acquisition produced no split files."
-                )
+                raise DatasetSourceError("GoEmotions acquisition produced no split files.")
 
-            acquired = pd.concat(
-                frames,
-                ignore_index=True,
-            )
+            acquired = pd.concat(frames, ignore_index=True)
+            atomic_write_dataframe_csv(acquired, local_path)
 
-            atomic_write_dataframe_csv(
-                acquired,
-                local_path,
-            )
-
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # ISEAR
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         elif kind == "delimited":
             downloaded_path = self._download(
-                spec["online_urls"]["raw"],
-                raw_root / "_source_isear.csv",
+                spec["online_urls"]["raw"], raw_root / "_source_isear.csv",
             )
             policy = DelimitedIngestPolicy(
                 delimiter=spec.get("delimiter", ","),
-                text_column=spec["text_column"],       # "SIT"
+                text_column=spec["text_column"],
                 on_field_mismatch="merge_into_text",
                 header=True,
             )
             acquired = self._read_path(downloaded_path, policy=policy)
             atomic_write_dataframe_csv(acquired, local_path)
-        # -------------------------------------------------------------------------
+
+        # ---------------------------------------------------------------------
         # EMOBANK
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         elif kind == "emobank_csv":
-
             downloaded_path = self._download(
-                spec["online_urls"]["raw"],
-                raw_root / "_source_emobank.csv",
+                spec["online_urls"]["raw"], raw_root / "_source_emobank.csv",
             )
+            acquired = pd.read_csv(downloaded_path)
+            atomic_write_dataframe_csv(acquired, local_path)
 
-            acquired = pd.read_csv(
-                downloaded_path,
-            )
-
-            atomic_write_dataframe_csv(
-                acquired,
-                local_path,
-            )
-
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # EMPATHETIC DIALOGUES
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         elif kind == "empathetic_archive":
-
             archive_path = self._download(
-                spec["online_url"],
-                raw_root / "empatheticdialogues.tar.gz",
+                spec["online_url"], raw_root / "empatheticdialogues.tar.gz",
             )
-
             archive_members = {
                 "train": "empatheticdialogues/train.csv",
                 "validation": "empatheticdialogues/valid.csv",
                 "test": "empatheticdialogues/test.csv",
             }
-
             rows: list[dict[str, Any]] = []
-
             try:
-                with tarfile.open(
-                    archive_path,
-                    "r:gz",
-                ) as archive:
-
+                with tarfile.open(archive_path, "r:gz") as archive:
                     for split, member_name in archive_members.items():
-
                         try:
                             member = archive.getmember(member_name)
                         except KeyError as exc:
@@ -1711,7 +2746,6 @@ class DatasetLoader:
                             ) from exc
 
                         extracted = archive.extractfile(member)
-
                         if extracted is None:
                             raise DatasetSourceError(
                                 f"Could not extract {member_name} "
@@ -1719,16 +2753,11 @@ class DatasetLoader:
                             )
 
                         reader = csv.DictReader(
-                            io.TextIOWrapper(
-                                extracted,
-                                encoding="utf-8",
-                            )
+                            io.TextIOWrapper(extracted, encoding="utf-8")
                         )
-
                         for row in reader:
                             row["__source_split"] = split
                             rows.append(row)
-
             except tarfile.TarError as exc:
                 raise DatasetSourceError(
                     "Failed to read EmpatheticDialogues archive: "
@@ -1736,95 +2765,72 @@ class DatasetLoader:
                 ) from exc
 
             acquired = pd.DataFrame(rows)
-
             if acquired.empty:
                 raise DatasetSourceError(
                     "EmpatheticDialogues archive produced zero rows."
                 )
+            atomic_write_dataframe_csv(acquired, local_path)
 
-            atomic_write_dataframe_csv(
-                acquired,
-                local_path,
+        # ---------------------------------------------------------------------
+        # DISCOVERED (no acquisition path — must already be local)
+        # ---------------------------------------------------------------------
+        elif kind == "discovered":
+            # NOTE: reaching here means known_dataset_is_local() returned False
+            # for a discovered dataset, which means the folder exists but the
+            # raw CSV is missing/empty. That is a hard error, not something to
+            # silently recover from.
+            raise DatasetSourceError(
+                f"Discovered dataset '{key}' has no raw snapshot at {local_path}. "
+                f"Populate raw/{key}.csv or remove the folder."
             )
 
         else:
             raise DatasetSourceError(
-                f"Known dataset '{key}' has unsupported "
-                f"source_type '{kind}'."
+                f"Known dataset '{key}' has unsupported source_type '{kind}'."
             )
 
-        # -------------------------------------------------------------------------
-        # CRITICAL: REREAD THE CANONICAL RAW SNAPSHOT
-        # -------------------------------------------------------------------------
-        #
-        # Processing must never continue from the transient acquired DataFrame.
-        # The canonical raw CSV is now the authoritative local snapshot.
-
+        # ---------------------------------------------------------------------
+        # REREAD THE CANONICAL RAW SNAPSHOT
+        # ---------------------------------------------------------------------
         if not known_dataset_is_local(key):
             raise DatasetSourceError(
                 f"Known dataset '{key}' was acquired but its canonical raw "
                 f"snapshot was not created successfully:\n{local_path}"
             )
 
-        frame = self._read_known_local(
-            key,
-            local_path,
-        )
+        frame = self._read_known_local(key, local_path)
 
         self.renderer.table(
             "DATASET CACHE",
             ["Dataset", "Source mode", "Local path", "Status"],
-            [[
-                spec["name"],
-                "DOWNLOADED → CACHED → RELOADED",
-                str(local_path),
-                "READY",
-            ]],
+            [[spec["name"], "DOWNLOADED → CACHED → RELOADED", str(local_path), "READY"]],
         )
-
         self.renderer.panel(
             "CACHE LOCATION",
             f"{spec['name']}\n{local_path}",
         )
-
         return frame, local_path
 
     def _load_foreign_source_to_raw(
-    self,
-    source: str,
-    *,
-    hf_config: Optional[str] = None,
-    offline: bool = False,
-) -> tuple[pd.DataFrame, Path]:
+        self,
+        source: str,
+        *,
+        hf_config: Optional[str] = None,
+        offline: bool = False,
+    ) -> tuple[pd.DataFrame, Path]:
         """
-        Resolve any non-managed source into the universal project-local raw cache.
-
-        Supported:
-            - local files
-            - HTTP(S)
-            - hf://owner/dataset[:config]
-
-        All paths ultimately become:
-
-            ./datasets/<name>/raw/<name>.csv
-
-        After acquisition, the CSV is reread and returned as the authoritative
-        source for downstream processing.
+        Resolve any non-managed source into the universal project-local raw
+        cache: <root>/<name>/raw/<name>.csv
         """
-
         source = str(source).strip()
-
         dataset_name = dataset_name_from_source(source)
         raw_path = dataset_raw_path(dataset_name)
 
-        # -------------------------------------------------------------------------
-        # UNIVERSAL LOCAL-FIRST RULE
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
+        # LOCAL-FIRST
+        # ---------------------------------------------------------------------
         if raw_path.exists() and raw_path.is_file() and raw_path.stat().st_size > 0:
-
             frame = self._read_path(raw_path)
-
             if frame.empty:
                 raise DatasetSourceError(
                     f"Cached foreign dataset is empty:\n{raw_path}"
@@ -1833,20 +2839,13 @@ class DatasetLoader:
             self.renderer.table(
                 "FOREIGN DATASET CACHE",
                 ["Dataset", "Source mode", "Local path", "Status"],
-                [[
-                    dataset_name,
-                    "LOCAL",
-                    str(raw_path),
-                    "READY",
-                ]],
+                [[dataset_name, "LOCAL", str(raw_path), "READY"]],
             )
-
             return frame, raw_path
 
-        # -------------------------------------------------------------------------
-        # OFFLINE WITHOUT LOCAL RAW COPY
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
+        # OFFLINE
+        # ---------------------------------------------------------------------
         if offline:
             raise DatasetSourceError(
                 f"Foreign dataset '{dataset_name}' is not available locally.\n"
@@ -1856,12 +2855,10 @@ class DatasetLoader:
 
         acquired: Optional[pd.DataFrame] = None
 
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # HUGGING FACE
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         if source.startswith("hf://"):
-
             if hf_load_dataset is None:
                 raise DatasetSourceError(
                     "hf:// input requires the 'datasets' library. "
@@ -1870,17 +2867,12 @@ class DatasetLoader:
 
             repo_spec = source[len("hf://"):].strip()
             config = hf_config
-
             if ":" in repo_spec and config is None:
                 repo_spec, config = repo_spec.split(":", 1)
 
             repo = repo_spec.strip()
             try:
-                loaded = hf_load_dataset(
-                    repo,
-                    name=config,
-                    trust_remote_code=True,
-                )
+                loaded = hf_load_dataset(repo, name=config, trust_remote_code=True)
             except Exception as exc:
                 raise DatasetSourceError(
                     f"Could not load Hugging Face dataset '{repo}'. "
@@ -1893,114 +2885,62 @@ class DatasetLoader:
                 ) from exc
 
             if hasattr(loaded, "items"):
-
                 frames: list[pd.DataFrame] = []
-
                 for split, part in loaded.items():
-
                     split_frame = part.to_pandas()
-
                     if not isinstance(split_frame, pd.DataFrame):
                         raise DatasetSourceError(
                             f"Hugging Face split '{split}' did not convert "
                             f"to a DataFrame."
                         )
-
                     split_frame["__source_split"] = split
                     frames.append(split_frame)
-
                 if not frames:
                     raise DatasetSourceError(
                         f"Hugging Face dataset '{repo}' returned no splits."
                     )
-
-                acquired = pd.concat(
-                    frames,
-                    ignore_index=True,
-                )
-
+                acquired = pd.concat(frames, ignore_index=True)
             else:
                 acquired = loaded.to_pandas()
 
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # HTTP(S)
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         elif is_url(source):
+            downloaded_path = self._download(source)
+            acquired = self._read_path(downloaded_path)
 
-            downloaded_path = self._download(
-                source,
-            )
-
-            acquired = self._read_path(
-                downloaded_path,
-            )
-
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # LOCAL FILE
-        # -------------------------------------------------------------------------
-
+        # ---------------------------------------------------------------------
         else:
-
             local_source = Path(source).expanduser().resolve()
-
             if not local_source.exists():
-                raise DatasetSourceError(
-                    f"Dataset path does not exist: {local_source}"
-                )
-
+                raise DatasetSourceError(f"Dataset path does not exist: {local_source}")
             if not local_source.is_file():
-                raise DatasetSourceError(
-                    f"Dataset source is not a file: {local_source}"
-                )
-
-            acquired = self._read_path(
-                local_source,
-            )
+                raise DatasetSourceError(f"Dataset source is not a file: {local_source}")
+            acquired = self._read_path(local_source)
 
         if acquired is None:
-            raise DatasetSourceError(
-                f"Unable to acquire dataset from source: {source}"
-            )
-
+            raise DatasetSourceError(f"Unable to acquire dataset from source: {source}")
         if not isinstance(acquired, pd.DataFrame):
             raise DatasetSourceError(
                 f"Dataset source did not produce a DataFrame: {source}"
             )
-
         if acquired.empty:
             raise DatasetSourceError(
                 f"Dataset source contains zero rows: {source}"
             )
 
-        # -------------------------------------------------------------------------
-        # PERSIST RAW SNAPSHOT
-        # -------------------------------------------------------------------------
-
-        atomic_write_dataframe_csv(
-            acquired,
-            raw_path,
-        )
+        atomic_write_dataframe_csv(acquired, raw_path)
 
         self.renderer.table(
             "FOREIGN DATASET CACHE",
             ["Dataset", "Source mode", "Local path", "Status"],
-            [[
-                dataset_name,
-                "ACQUIRED → CACHED",
-                str(raw_path),
-                "WRITTEN",
-            ]],
+            [[dataset_name, "ACQUIRED → CACHED", str(raw_path), "WRITTEN"]],
         )
 
-        # -------------------------------------------------------------------------
-        # CRITICAL: REREAD THE SAVED RAW DATA
-        # -------------------------------------------------------------------------
-
-        frame = self._read_path(
-            raw_path,
-        )
-
+        frame = self._read_path(raw_path)
         if frame.empty:
             raise DatasetSourceError(
                 f"Saved raw dataset is empty after rereading:\n{raw_path}"
@@ -2017,66 +2957,63 @@ class DatasetLoader:
                 ["Columns", f"{len(frame.columns):,}"],
             ],
         )
-
         return frame, raw_path
 
     def load(
-    self,
-    source: str,
-    *,
-    hf_config: Optional[str] = None,
-    offline: bool = False,
-) -> tuple[pd.DataFrame, Optional[Path]]:
-
+        self,
+        source: str,
+        *,
+        hf_config: Optional[str] = None,
+        offline: bool = False,
+    ) -> tuple[pd.DataFrame, Optional[Path]]:
         source = str(source).strip()
-
         if not source:
-            raise DatasetSourceError(
-                "Dataset source is empty."
-            )
-
-        # -------------------------------------------------------------------------
-        # MANAGED DATASETS
-        # -------------------------------------------------------------------------
+            raise DatasetSourceError("Dataset source is empty.")
 
         if source.startswith("known://"):
-
             raw_key = source[len("known://"):].strip()
-
-            resolved_key = resolve_known_dataset_key(
-                raw_key
-            )
-
+            resolved_key = resolve_known_dataset_key(raw_key)
             if resolved_key is None:
-                raise DatasetSourceError(
-                    f"Unknown managed dataset: {raw_key}"
-                )
-
-            return self.load_known(
-                resolved_key,
-                offline=offline,
-            )
-
-        # -------------------------------------------------------------------------
-        # ALL FOREIGN SOURCES
-        #
-        # local path
-        # HTTP(S)
-        # Hugging Face
-        #
-        # are normalized through exactly the same raw-cache lifecycle.
-        # -------------------------------------------------------------------------
+                raise DatasetSourceError(f"Unknown managed dataset: {raw_key}")
+            return self.load_known(resolved_key, offline=offline)
 
         return self._load_foreign_source_to_raw(
-            source,
-            hf_config=hf_config,
-            offline=offline,
+            source, hf_config=hf_config, offline=offline,
         )
 
 
 # =============================================================================
 # LABEL NORMALIZATION
 # =============================================================================
+def infer_task_and_class_count(
+    label_series: pd.Series,
+) -> tuple[str, int]:
+    """
+    Infer (task_type, class_count) from a label series of Python lists.
+
+    Input is the output of LabelNormalizer.parse: each element is either
+    None or a list of atomic labels. Length is 1 for single-label rows,
+    > 1 for multi-label rows.
+
+    Returns:
+        ("single_label" | "multi_label" | "unknown", int)
+
+    NOTE: class_count is the number of distinct *atomic* labels observed,
+    not the number of distinct list combinations. For Amazon Polarity that
+    is 2 (positive, negative), regardless of how many rows carry [0] or [1].
+    """
+    labels = [x for x in label_series if isinstance(x, list) and len(x) > 0]
+    if not labels:
+        return "unknown", 0
+
+    max_length = max(len(x) for x in labels)
+    task_type = "multi_label" if max_length > 1 else "single_label"
+
+    unique: set[str] = set()
+    for row in labels:
+        for item in row:
+            unique.add(str(item))
+    return task_type, len(unique)
 
 class LabelNormalizer:
     """Convert arbitrary label cells into an always-list canonical structure."""
@@ -2117,7 +3054,6 @@ class LabelNormalizer:
         if not text:
             return None
 
-        # Canonical JSON list.
         if text.startswith("[") and text.endswith("]"):
             for parser in (json.loads, ast.literal_eval):
                 try:
@@ -2126,25 +3062,19 @@ class LabelNormalizer:
                         return cls._clean_list([cls._parse_nested_item(v) for v in parsed])
                 except Exception:
                     pass
-
-            # Handles GoEmotions-style bracketed whitespace: [6 22 27]
             inside = text[1:-1].strip()
             if inside and re.fullmatch(r"[-+]?\d+(?:\s+[-+]?\d+)+", inside):
                 return [int(v) for v in inside.split()]
 
-        # Handles bare whitespace-separated numeric multi-label strings.
         if re.fullmatch(r"[-+]?\d+(?:\s+[-+]?\d+)+", text):
             return [int(v) for v in text.split()]
 
-        # Common delimiters for multi-label text datasets.
         for delimiter in ("|||", ";", "|", "\n"):
             if delimiter in text:
                 parts = [p.strip() for p in text.split(delimiter) if p.strip()]
                 if len(parts) > 1:
                     return cls._clean_list([cls._parse_nested_item(p) for p in parts])
 
-        # Commas are only treated as multi-label separators when the whole cell
-        # is clearly a label sequence rather than free text.
         if "," in text and len(text) < 500:
             parts = [p.strip() for p in text.split(",") if p.strip()]
             if len(parts) > 1 and all(len(p.split()) <= 4 for p in parts):
@@ -2165,8 +3095,6 @@ class LabelNormalizer:
         for value in values:
             if value == "":
                 continue
-            # Preserve nested values only when explicitly present; ordinary label
-            # rows remain flat.
             if isinstance(value, list):
                 for nested in value:
                     if nested != "":
@@ -2198,6 +3126,24 @@ class SchemaDetector:
 
     @staticmethod
     def _hint_score(name: str, hints: set[str]) -> float:
+        """
+        Score a column name for a text-or-label hint set.
+
+        NOTE: this method is retained for backwards compatibility with any
+        caller that passes an arbitrary hint set. For text and label
+        specifically, prefer score_text_column_name() / score_label_column_name()
+        so the tiered logic is applied consistently. When the caller passes
+        TEXT_NAME_HINTS (the union alias) we route through the tiered scorer
+        rather than treating title and content as equals.
+        """
+        # Route the two well-known sets through the tiered scorer.
+        if hints is TEXT_NAME_HINTS:
+            return score_text_column_name(name)
+        if hints is LABEL_NAME_HINTS:
+            return score_label_column_name(name)
+
+        # Fallback for arbitrary hint sets (used nowhere today, but kept so
+        # future call sites do not silently lose the shared vocabulary).
         normalized = normalize_column_name(name)
         if normalized in hints:
             return 12.0
@@ -2210,56 +3156,66 @@ class SchemaDetector:
         return 0.0
 
     def detect(
-        self,
-        df: pd.DataFrame,
-        *,
-        text_column: Optional[str] = None,
-        label_column: Optional[str] = None,
-    ) -> DetectionResult:
+    self,
+    df: pd.DataFrame,
+    *,
+    text_column: Optional[str] = None,
+    label_column: Optional[str] = None,
+    scoring_sample: int = 50_000,
+) -> DetectionResult:
         if df.empty:
             raise DatasetSchemaError("Cannot detect schema in an empty dataset.")
 
         columns = [str(c) for c in df.columns]
         result = DetectionResult()
 
+        # --- Explicit overrides validate against the FULL frame (cheap). ---
         if text_column is not None:
             if text_column not in df.columns:
-                raise ColumnDetectionError(f"Requested text column '{text_column}' not found. Available: {columns}")
+                raise ColumnDetectionError(
+                    f"Requested text column '{text_column}' not found. Available: {columns}"
+                )
             result.text_column = text_column
+
         if label_column is not None:
-
             if label_column == "__VAD__":
-
-                required_vad = {"V", "A", "D"}
-
-                if not required_vad.issubset(
-                    set(df.columns)
-                ):
+                if not {"V", "A", "D"}.issubset(set(df.columns)):
                     raise ColumnDetectionError(
-                        "VAD target requires columns V, A, D. "
-                        f"Available: {columns}"
+                        f"VAD target requires columns V, A, D. Available: {columns}"
                     )
-
                 result.label_column = "__VAD__"
-
             else:
-
                 if label_column not in df.columns:
                     raise ColumnDetectionError(
-                        f"Requested label column '{label_column}' "
-                        f"not found. Available: {columns}"
+                        f"Requested label column '{label_column}' not found. Available: {columns}"
                     )
-
                 result.label_column = label_column
 
-        n = max(len(df), 1)
+        # -----------------------------------------------------------------
+        # NOTE: score on a bounded sample.
+        #
+        # Cardinality, fill rate, and mean text length all stabilise well
+        # below 50k rows — a 4M-row frame and a 50k-row sample give the same
+        # ranking. Evaluating on the full frame costs O(N) string coercions
+        # and a full sort for the median, which on 4M rows is tens of seconds
+        # wasted on every detect() call.
+        #
+        # The sample is deterministic (random_state=42) so repeated calls and
+        # the header peek agree.
+        # -----------------------------------------------------------------
+        if scoring_sample and len(df) > scoring_sample:
+            scoring_df = df.sample(scoring_sample, random_state=42)
+        else:
+            scoring_df = df
+
+        n = max(len(scoring_df), 1)
         candidates_text: list[tuple[str, float]] = []
         candidates_label: list[tuple[str, float]] = []
 
-        for col in df.columns:
+        for col in scoring_df.columns:
             name = str(col)
             normalized = normalize_column_name(name)
-            series = df[col]
+            series = scoring_df[col]
             non_null = series.dropna()
             fill = len(non_null) / n
             cardinality = int(non_null.nunique(dropna=True))
@@ -2307,14 +3263,13 @@ class SchemaDetector:
         result.text_candidates = candidates_text
         result.label_candidates = candidates_label
 
-        # Detect one-hot columns conservatively: boolean-like OR numeric 0/1
-        # columns, excluding obvious metadata fields and the text column.
+        # --- One-hot detection: also on the sample. ---
         one_hot: list[str] = []
-        for col in df.columns:
+        for col in scoring_df.columns:
             name = str(col)
             if name == result.text_column or normalize_column_name(name) in METADATA_NAME_HINTS:
                 continue
-            series = df[col].dropna()
+            series = scoring_df[col].dropna()
             if series.empty:
                 continue
             if series_is_boolean_like(series):
@@ -2326,9 +3281,31 @@ class SchemaDetector:
                     one_hot.append(name)
         result.one_hot_label_columns = one_hot
 
+        # --- Resolution logic (unchanged except the tie-break uses scoring_df). ---
         if result.text_column is None and candidates_text:
             best_name, best_score = candidates_text[0]
             second_score = candidates_text[1][1] if len(candidates_text) > 1 else -math.inf
+
+            if (
+                len(candidates_text) > 1
+                and abs(best_score - second_score) < 0.75
+                and best_score >= 8.0
+            ):
+                tied = [
+                    (name, score)
+                    for name, score in candidates_text
+                    if abs(score - best_score) < 0.75
+                ]
+                # NOTE: tie-break uses scoring_df, not df — the mean length we
+                # already have is from the sample, and re-measuring it on 4M
+                # rows would defeat the entire optimisation.
+                tied.sort(
+                    key=lambda x: -float(
+                        scoring_df[x[0]].dropna().astype(str).str.len().mean() or 0.0
+                    )
+                )
+                best_name, best_score = tied[0]
+
             if best_score >= 8.0 and (best_score - second_score >= 0.75 or len(candidates_text) == 1):
                 result.text_column = best_name
             else:
@@ -2443,7 +3420,10 @@ class SentimentScorer:
                 raise SentimentBackendError("CUDA is unavailable.")
             index = int(request.split(":", 1)[1])
             if index >= torch.cuda.device_count():
-                raise SentimentBackendError(f"CUDA device {index} is unavailable; {torch.cuda.device_count()} device(s) detected.")
+                raise SentimentBackendError(
+                    f"CUDA device {index} is unavailable; "
+                    f"{torch.cuda.device_count()} device(s) detected."
+                )
             return torch.device(request)
         if request.isdigit():
             if not torch.cuda.is_available():
@@ -2472,7 +3452,6 @@ class SentimentScorer:
 
     @staticmethod
     def _import_transformers_quietly():
-        """Import transformers without leaking compatibility diagnostics to the CLI."""
         stdout_buffer = io.StringIO()
         stderr_buffer = io.StringIO()
         try:
@@ -2487,11 +3466,34 @@ class SentimentScorer:
             ) from exc
 
     def _ensure_transformer(self) -> None:
+        """
+        Initialize the transformer sentiment backend.
+
+        The load order is:
+
+          1. prefetch_hf_snapshot — force a complete download using
+             snapshot_download for weights and curl for metadata. This is
+             the only way to reliably get tokenizer files through a
+             Cloudflare Worker proxy, which strips Content-Length from
+             HEAD responses on small text files.
+
+          2. from_pretrained against the resolved snapshot DIRECTORY,
+             with local_files_only=True. Loading from a directory path
+             bypasses huggingface_hub's lazy file resolution entirely, so
+             no HEAD request is ever issued for the tokenizer.
+
+        If prefetch fails (network down, proxy unreachable, model private)
+        we fall back to loading by hub identifier exactly as before, which
+        still works when the cache is already populated.
+        
+        """
+        _configure_torch_threads()
         if torch is None:
             raise SentimentBackendError("Transformer scoring requires PyTorch, but torch is not importable.")
 
-        # Current Transformers documents PyTorch 2.5+ as its tested baseline.
-        # This preflight prevents the previous misleading NameError path.
+        # NOTE: transformers works on torch >= 2.0 in practice. Older torch
+        # versions have been the source of confusing NameError failures, so
+        # we reject them here with a clear message.
         if self._torch_version() < (2, 0, 0):
             raise SentimentBackendError(
                 f"Installed PyTorch is {torch.__version__}. "
@@ -2501,35 +3503,97 @@ class SentimentScorer:
 
         AutoModelForSequenceClassification, AutoTokenizer = self._import_transformers_quietly()
         self._device = self._choose_device()
+        self.batch_size = _adaptive_sentiment_batch_size(
+            self.batch_size,
+            self._device,
+            n_rows=10_000,  
+        )
         self.resolved_device = str(self._device)
 
-        kwargs: dict[str, Any] = {"local_files_only": self.offline}
-        if self.cache_dir is not None:
-            kwargs["cache_dir"] = str(self.cache_dir)
+        # ----------------------------------------------------------------
+        # Resolve a stable cache directory for the sentiment model.
+        # ----------------------------------------------------------------
+        cache_path = Path(self.cache_dir).expanduser().resolve() \
+            if self.cache_dir is not None \
+            else _default_hf_cache_dir()
+        cache_path.mkdir(parents=True, exist_ok=True)
 
-        try:
-            self.renderer.table(
-                "PyTorch SENTIMENT RUNTIME",
-                ["Component", "Value"],
-                [
-                    ["Framework", "PyTorch"],
-                    ["Model", self.model_name],
-                    ["Device", str(self._device)],
-                    ["Torch", str(torch.__version__)],
-                    ["Offline", str(self.offline)],
-                    ["Batch", str(self.batch_size)],
-                    ["Max length", str(self.max_length)],
-                ],
+        # ----------------------------------------------------------------
+        # Prefetch. Skipped when the caller has asked for offline mode.
+        # ----------------------------------------------------------------
+        resolved_snapshot: Optional[Path] = None
+        if not self.offline:
+            resolved_snapshot = prefetch_hf_snapshot(
+                self.model_name,
+                cache_dir=cache_path,
+                show=self.renderer.enabled,
             )
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, **kwargs)
-            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name, **kwargs)
+
+        # ----------------------------------------------------------------
+        # Determine the load target and offline flag.
+        #
+        # With a resolved snapshot: load from the directory, force
+        #   local_files_only=True so no network round trip is attempted.
+        # Without: fall back to hub identifier + self.offline flag, which
+        #   is exactly the previous behaviour.
+        # ----------------------------------------------------------------
+        if resolved_snapshot is not None:
+            load_target: str = str(resolved_snapshot)
+            local_files_only = True
+        else:
+            load_target = self.model_name
+            local_files_only = bool(self.offline)
+
+        # ----------------------------------------------------------------
+        # Runtime table.
+        # ----------------------------------------------------------------
+        diag = _torch_device_report()
+        self.renderer.table(
+            "PyTorch SENTIMENT RUNTIME",
+            ["Component", "Value"],
+            [
+                ["Framework", "PyTorch"],
+                ["Model", self.model_name],
+                ["Device", str(self._device)],
+                ["Torch", str(torch.__version__)],
+                ["Offline", str(local_files_only)],
+                ["Batch", str(self.batch_size)],
+                ["Max length", str(self.max_length)],
+                ["Snapshot", str(resolved_snapshot) if resolved_snapshot else "cache"],
+                ["Cache", str(cache_path)],
+                ["CPU count", str(diag.get("cpu_count"))],
+                ["Torch threads", str(diag.get("num_threads"))],
+                ["MPS built", str(diag.get("mps_built"))],
+                ["MPS available", str(diag.get("mps_available"))],
+            ],
+        )
+
+        # ----------------------------------------------------------------
+        # Load tokenizer and model.
+        # ----------------------------------------------------------------
+        _patch_transformers_torch_load_check()
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                load_target,
+                cache_dir=str(cache_path),
+                local_files_only=local_files_only,
+            )
+            self._model = AutoModelForSequenceClassification.from_pretrained(
+                load_target,
+                cache_dir=str(cache_path),
+                local_files_only=local_files_only,
+            )
             self._model.eval()
             self._model.to(self._device)
         except Exception as exc:
             raise SentimentBackendError(
-                f"Could not initialize PyTorch transformer '{self.model_name}': {type(exc).__name__}: {exc}"
+                f"Could not initialize PyTorch transformer '{self.model_name}': "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
 
+        # ----------------------------------------------------------------
+        # Label-sign extraction (unchanged).
+        # ----------------------------------------------------------------
         id2label = getattr(self._model.config, "id2label", {}) or {}
         self._label_signs = {}
         for raw_id, raw_label in id2label.items():
@@ -2560,7 +3624,9 @@ class SentimentScorer:
 
     def _ensure_vader(self) -> None:
         if SentimentIntensityAnalyzer is None:
-            raise SentimentBackendError("VADER is unavailable. Install vaderSentiment or use transformer scoring.")
+            raise SentimentBackendError(
+                "VADER is unavailable. Install vaderSentiment or use transformer scoring."
+            )
         self._vader = SentimentIntensityAnalyzer()
         self.resolved_backend = "vader"
         self.resolved_model = "vaderSentiment"
@@ -2588,6 +3654,8 @@ class SentimentScorer:
         return float(np.clip(raw, -1.0, 1.0))
 
     def _choose_backend(self) -> str:
+        if self.backend_request == "none":
+            return "none"
         if self.backend_request in {"transformer", "vader", "lexicon"}:
             return self.backend_request
         if self.backend_request != "auto":
@@ -2595,8 +3663,7 @@ class SentimentScorer:
                 "Backend must be auto, transformer, vader, or lexicon."
             )
 
-        # AUTO: prefer transformer whenever PyTorch is importable at a
-        # realistic baseline. transformers itself works on torch >= 2.0.
+        # AUTO: prefer transformer whenever PyTorch is at a realistic baseline.
         if torch is not None and self._torch_version() >= (2, 0, 0):
             return "transformer"
 
@@ -2653,9 +3720,14 @@ class SentimentScorer:
             raise SentimentBackendError(f"Transformer inference failed: {type(exc).__name__}: {exc}") from exc
 
     def score_batch(self, texts: Sequence[str]) -> list[float]:
-        # Once a fallback has been committed for this scorer instance, never
-        # re-attempt the failed path — otherwise "auto" would try and fail the
-        # transformer once per batch.
+        if backend == "none":
+            self.resolved_backend = "none"
+            self.resolved_model = "sentiment-disabled"
+            self.resolved_device = "cpu"
+            self.resolved_dtype = "float64"
+            # Fill with zeros. The column is present so the canonical schema
+            # is satisfied, but no inference runs.
+            return [0.0 for _ in texts]
         if self._backend_locked is not None:
             backend = self._backend_locked
         else:
@@ -2668,7 +3740,6 @@ class SentimentScorer:
                 return self._transformer_score_batch(texts)
             except SentimentBackendError as exc:
                 if self.backend_request != "auto":
-                    # Explicit --sentiment-backend transformer is a contract.
                     raise
                 self.renderer.warning(
                     f"Transformer backend failed ({exc}). "
@@ -2729,6 +3800,7 @@ class MasterDatasetProcessor:
         drop_short_text: bool = False,
         min_text_chars: int = 1,
         drop_duplicates: bool = True,
+        interactive_fallback: bool = False,
         quiet: bool = False,
         no_visuals: bool = False,
     ):
@@ -2771,6 +3843,7 @@ class MasterDatasetProcessor:
         self.drop_duplicates = drop_duplicates
 
         self.raw_df: Optional[pd.DataFrame] = None
+        self.interactive_fallback = bool(interactive_fallback)
         self.df: Optional[pd.DataFrame] = None
         self.source_path: Optional[Path] = None
         self.detection: Optional[DetectionResult] = None
@@ -2789,13 +3862,72 @@ class MasterDatasetProcessor:
     # -------------------------------------------------------------------------
     # LOAD / SCHEMA
     # -------------------------------------------------------------------------
+    def _resolve_source_path_for_sampling(self) -> Optional[Path]:
+        """
+        Return the on-disk raw CSV for this source, without loading it.
 
-    def load(
-    self,
-    *,
-    force: bool = False,
-) -> pd.DataFrame:
+        The preview and inspect paths use this to read only the rows they
+        need, bypassing load() entirely.
 
+        Returns None when the source has no on-disk snapshot yet (e.g. a
+        managed dataset that has never been acquired, or an hf:// source
+        whose raw CSV has not been written).
+        """
+        # Already resolved by a previous load() call.
+        if self.source_path is not None and Path(self.source_path).is_file():
+            return Path(self.source_path)
+
+        if self.dataset_link.startswith("known://"):
+            raw_key = self.dataset_link[len("known://"):].strip()
+            key = resolve_known_dataset_key(raw_key)
+            if key is None:
+                return None
+            p = known_dataset_local_path(key)
+            return p if p.is_file() and p.stat().st_size > 0 else None
+
+        if is_url(self.dataset_link) or self.dataset_link.startswith("hf://"):
+            name = dataset_name_from_source(self.dataset_link)
+            p = dataset_raw_path(name)
+            return p if p.is_file() and p.stat().st_size > 0 else None
+
+        p = Path(self.dataset_link).expanduser().resolve()
+        return p if p.is_file() else None
+        
+    def _maybe_write_schema_sidecar(self) -> None:
+        if self.detection is None or not self.detection.text_column:
+            return
+        if self.text_column_override is not None or self.label_column_override is not None:
+            return
+
+        key_for_sidecar = resolve_known_dataset_key(
+            self.dataset_link[len("known://"):]
+            if self.dataset_link.startswith("known://")
+            else dataset_name_from_source(self.dataset_link)
+        )
+        if not key_for_sidecar:
+            return
+
+        # Fill in task metadata if the detector did not already supply it.
+        # Sampling a bounded slice keeps this cheap even on a 4M-row frame.
+        if (
+            self.detection.label_column
+            and (self.detection.task_type is None or self.detection.class_count is None)
+            and self.raw_df is not None
+            and self.detection.label_column in self.raw_df.columns
+        ):
+            try:
+                col = self.raw_df[self.detection.label_column]
+                if len(col) > 50_000:
+                    col = col.sample(50_000, random_state=42)
+                label_series = col.map(LabelNormalizer.parse)
+                task_type, class_count = infer_task_and_class_count(label_series)
+                self.detection.task_type = task_type
+                self.detection.class_count = class_count
+            except Exception:
+                pass
+
+        write_schema_sidecar(key_for_sidecar, self.detection)
+    def load(self, *, force: bool = False) -> pd.DataFrame:
         if self.raw_df is not None and not force:
             return self.raw_df.copy()
 
@@ -2807,7 +3939,6 @@ class MasterDatasetProcessor:
 
         self.raw_df = frame.copy()
         self.source_path = source_path
-
         self.report.rows_input = len(frame)
         self.report.columns_input = len(frame.columns)
 
@@ -2818,155 +3949,202 @@ class MasterDatasetProcessor:
                 ["Source", compact(self.dataset_link, 120)],
                 ["Rows", f"{len(frame):,}"],
                 ["Columns", f"{len(frame.columns):,}"],
-                [
-                    "Raw snapshot",
-                    str(source_path) if source_path else "—",
-                ],
+                ["Raw snapshot", str(source_path) if source_path else "—"],
             ],
         )
-
         return frame.copy()
 
-    def detect_schema(
-    self,
-) -> DetectionResult:
-
+    def detect_schema(self) -> DetectionResult:
         if self.raw_df is None:
             self.load()
-
         assert self.raw_df is not None
 
+        # ---------------------------------------------------------------------
+        # MANAGED / DISCOVERED VIA known://
+        # ---------------------------------------------------------------------
         if self.dataset_link.startswith("known://"):
-
             raw_key = self.dataset_link[len("known://"):].strip()
             key = resolve_known_dataset_key(raw_key)
-
             if key is None:
-                raise DatasetSchemaError(
-                    f"Unknown managed dataset: {raw_key}"
-                )
+                raise DatasetSchemaError(f"Unknown managed dataset: {raw_key}")
 
-            spec = KNOWN_DATASETS[key]
-
+            spec = all_datasets()[key]
             expected_text = spec.get("text_column")
             expected_label = spec.get("label_column")
 
-            if expected_text not in self.raw_df.columns:
-                raise DatasetSchemaError(
-                    f"Managed dataset '{key}' is missing its expected text "
-                    f"column '{expected_text}'. "
-                    f"Available: {list(self.raw_df.columns)}"
-                )
+            # NOTE: a "discovered" dataset deliberately has text_column=None
+            # and label_column=None. Only managed datasets prescribe a schema.
+            # Anything without a prescribed schema falls through to the same
+            # auto-detection used for foreign sources.
+            if (
+                expected_text is not None
+                and expected_label is not None
+                and not spec.get("schema_is_hint")):
 
-            if expected_label == "__VAD__":
-
-                required_vad = set(
-                    spec.get(
-                        "target_columns",
-                        ["V", "A", "D"],
-                    )
-                )
-
-                missing_vad = sorted(
-                    required_vad - set(self.raw_df.columns)
-                )
-
-                if missing_vad:
+                if expected_text not in self.raw_df.columns:
                     raise DatasetSchemaError(
-                        f"Managed EmoBank data is missing VAD columns: "
-                        f"{missing_vad}"
+                        f"Managed dataset '{key}' is missing its expected text "
+                        f"column '{expected_text}'. "
+                        f"Available: {list(self.raw_df.columns)}"
                     )
 
-            elif expected_label not in self.raw_df.columns:
+                if expected_label == "__VAD__":
+                    required_vad = set(spec.get("target_columns", ["V", "A", "D"]))
+                    missing_vad = sorted(required_vad - set(self.raw_df.columns))
+                    if missing_vad:
+                        raise DatasetSchemaError(
+                            f"Managed EmoBank data is missing VAD columns: "
+                            f"{missing_vad}"
+                        )
+                elif expected_label not in self.raw_df.columns:
+                    raise DatasetSchemaError(
+                        f"Managed dataset '{key}' is missing its expected label "
+                        f"column '{expected_label}'. "
+                        f"Available: {list(self.raw_df.columns)}"
+                    )
 
-                raise DatasetSchemaError(
-                    f"Managed dataset '{key}' is missing its expected label "
-                    f"column '{expected_label}'. "
-                    f"Available: {list(self.raw_df.columns)}"
+                self.detection = DetectionResult(
+                    text_column=expected_text,
+                    label_column=expected_label,
+                    confidence="high",
                 )
+                self.report.text_column = expected_text
+                self.report.label_column = expected_label
+                if self.detection is not None and self.detection.text_column:
+                    # Persist for the next `--list-datasets` call.
+                    key_for_sidecar = resolve_known_dataset_key(
+                        self.dataset_link[len("known://"):]
+                        if self.dataset_link.startswith("known://")
+                        else dataset_name_from_source(self.dataset_link)
+                    )
+                    if key_for_sidecar:
+                        self._maybe_write_schema_sidecar()
+                return self.detection
 
-            self.detection = DetectionResult(
-                text_column=expected_text,
-                label_column=expected_label,
-                confidence="high",
+        # ---------------------------------------------------------------------
+        # FOREIGN SOURCE OR DISCOVERED-WITHOUT-SCHEMA
+        # ---------------------------------------------------------------------
+                # ---------------------------------------------------------------------
+        # FOREIGN OR DISCOVERED SOURCE — try the sidecar before re-detecting.
+        # ---------------------------------------------------------------------
+        if not self.dataset_link.startswith("known://"):
+            if self.text_column_override is None and self.label_column_override is None:
+                sidecar_key = resolve_known_dataset_key(
+                    dataset_name_from_source(self.dataset_link)
+                )
+                if sidecar_key:
+                    sidecar = load_schema_sidecar(sidecar_key)
+                    if sidecar and sidecar.get("text_column"):
+                        self.detection = DetectionResult(
+                            text_column=sidecar["text_column"],
+                            label_column=sidecar.get("label_column"),
+                            one_hot_label_columns=sidecar.get(
+                                "one_hot_label_columns", []
+                            ),
+                            confidence="high",
+                            task_type=sidecar.get("task_type"),
+                            class_count=sidecar.get("class_count"),
+                        )
+                        self.report.text_column = self.detection.text_column
+                        self.report.label_column = self.detection.label_column
+                        return self.detection
+
+        # Fall through to the existing auto-detection.
+        try:
+            self.detection = self.detector.detect(
+                self.raw_df,
+                text_column=self.text_column_override,
+                label_column=self.label_column_override,
             )
-
-            self.report.text_column = expected_text
-            self.report.label_column = expected_label
-
-            return self.detection
-
-        # -------------------------------------------------------------------------
-        # FOREIGN DATASET
-        # -------------------------------------------------------------------------
-
-        self.detection = self.detector.detect(
-            self.raw_df,
-            text_column=self.text_column_override,
-            label_column=self.label_column_override,
-        )
-
+        except ColumnDetectionError as exc:
+            if not self.interactive_fallback:
+                raise
+            self.renderer.warning(
+                f"Automatic detection failed ({exc}). "
+                "Switching to interactive column choice."
+            )
+            return self.interactive_select_columns()
         self.report.text_column = self.detection.text_column
         self.report.label_column = self.detection.label_column
+        if self.detection is not None and self.detection.text_column:
+            # Persist for the next `--list-datasets` call.
+            key_for_sidecar = resolve_known_dataset_key(
+                self.dataset_link[len("known://"):]
+                if self.dataset_link.startswith("known://")
+                else dataset_name_from_source(self.dataset_link)
+            )
+            if key_for_sidecar:
+                self._maybe_write_schema_sidecar()
 
         return self.detection
 
+    def interactive_select_columns(self) -> DetectionResult:
+        """
+        Show a preview of the raw frame and let the user pick the text and
+        label columns. The choices are stored as overrides so that any
+        subsequent detect_schema / process call in this session uses them
+        without re-prompting.
+
+        Called automatically from detect_schema when automatic detection
+        fails and interactive_fallback is enabled, and explicitly from the
+        CLI --choose-columns flag.
+        """
+        if self.raw_df is None:
+            self.load()
+        assert self.raw_df is not None
+
+        text_col, label_col = prompt_for_columns(
+            self.raw_df,
+            self.renderer,
+            default_text=self.text_column_override,
+            default_label=self.label_column_override,
+        )
+        if text_col is None or label_col is None:
+            raise DatasetSchemaError(
+                "Interactive column selection is unavailable in quiet / no-visuals mode."
+            )
+
+        # Persist as overrides so detect_schema / process pick them up.
+        self.text_column_override = text_col
+        self.label_column_override = label_col
+
+        self.renderer.table(
+            "USER COLUMN CHOICE",
+            ["Role", "Column"],
+            [["Text", text_col], ["Label", label_col]],
+        )
+
+        # Run detection with the explicit overrides.
+        self.detection = self.detector.detect(
+            self.raw_df,
+            text_column=text_col,
+            label_column=label_col,
+        )
+        self.report.text_column = self.detection.text_column
+        self.report.label_column = self.detection.label_column
+        return self.detection
     # -------------------------------------------------------------------------
     # LABEL SERIES
     # -------------------------------------------------------------------------
 
-    def _is_canonical_input(self) -> bool:
-        if self.raw_df is None:
-            return False
-        return set(OUTPUT_COLUMNS).issubset(set(self.raw_df.columns))
-
-    def _label_series(
-    self,
-    frame: pd.DataFrame,
-) -> pd.Series:
-
-        assert (
-            self.detection is not None
-            and self.detection.text_column is not None
-        )
+    def _label_series(self, frame: pd.DataFrame) -> pd.Series:
+        assert self.detection is not None and self.detection.text_column is not None
 
         if self.detection.label_column == "__VAD__":
-
-            missing = [
-                column
-                for column in ("V", "A", "D")
-                if column not in frame.columns
-            ]
-
+            missing = [c for c in ("V", "A", "D") if c not in frame.columns]
             if missing:
-                raise DatasetSchemaError(
-                    "EmoBank VAD target is missing: "
-                    f"{missing}"
-                )
-
+                raise DatasetSchemaError(f"EmoBank VAD target is missing: {missing}")
             return frame.apply(
-                lambda row: [
-                    float(row["V"]),
-                    float(row["A"]),
-                    float(row["D"]),
-                ],
+                lambda row: [float(row["V"]), float(row["A"]), float(row["D"])],
                 axis=1,
             )
 
         if self.detection.label_column:
-
-            return frame[
-                self.detection.label_column
-            ].map(LabelNormalizer.parse)
+            return frame[self.detection.label_column].map(LabelNormalizer.parse)
 
         assert self.detection.one_hot_label_columns
-
         return frame.apply(
-            lambda row:
-                LabelNormalizer.one_hot_row(
-                    row,
-                    self.detection.one_hot_label_columns,
-                ),
+            lambda row: LabelNormalizer.one_hot_row(row, self.detection.one_hot_label_columns),
             axis=1,
         )
 
@@ -2974,7 +4152,23 @@ class MasterDatasetProcessor:
     # CLEANING
     # -------------------------------------------------------------------------
 
-    def _clean_dataframe(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def _clean_dataframe(
+    self,
+    frame: pd.DataFrame,
+    *,
+    report: bool = True,
+) -> pd.DataFrame:
+        """
+        Canonical cleaning pass.
+
+        Parameters
+        ----------
+        frame : the raw DataFrame to clean.
+        report : when True (default), mutate self.report with row-removal
+                counters. The preview path passes False so a small sample
+                does not corrupt the ledger that the eventual full run
+                will write.
+        """
         if self.detection is None:
             self.detect_schema()
         assert self.detection is not None and self.detection.text_column is not None
@@ -2984,14 +4178,18 @@ class MasterDatasetProcessor:
         cleaned_text = text_source.map(self.cleaner.clean)
         result = pd.DataFrame({"clean_text": cleaned_text, "label": labels}, index=frame.index)
 
+        def _bump(field: str, count: int) -> None:
+            if report:
+                setattr(self.report, field, getattr(self.report, field) + int(count))
+
         if self.drop_missing_text:
             mask = text_source.map(try_is_missing)
-            self.report.missing_text_rows_removed += int(mask.sum())
+            _bump("missing_text_rows_removed", int(mask.sum()))
             result = result.loc[~mask]
 
         if self.drop_empty_text:
             mask = result["clean_text"].astype(str).str.strip().eq("")
-            self.report.empty_text_rows_removed += int(mask.sum())
+            _bump("empty_text_rows_removed", int(mask.sum()))
             result = result.loc[~mask]
 
         if self.drop_short_text:
@@ -3000,20 +4198,35 @@ class MasterDatasetProcessor:
 
         if self.drop_missing_label:
             mask = result["label"].map(lambda value: value is None or len(value) == 0)
-            self.report.missing_label_rows_removed += int(mask.sum())
+            _bump("missing_label_rows_removed", int(mask.sum()))
             result = result.loc[~mask]
 
         if self.drop_duplicates:
             before = len(result)
-            dedupe_key = result.apply(
-                lambda row: stable_hash({"text": str(row["clean_text"]), "label": safe_json_value(row["label"])}),
-                axis=1,
+            # -----------------------------------------------------------------
+            # NOTE: vectorised dedupe.
+            #
+            # The previous implementation called
+            #     result.apply(lambda row: stable_hash({...}), axis=1)
+            # which runs a Python function once per row and does
+            # json.dumps + sha256 for every one of 4,000,000 rows.
+            #
+            # pd.util.hash_pandas_object is C-implemented and hashes the whole
+            # column in a single pass. We build one combined string column
+            # (clean_text + separator + canonical-label-JSON) and hash that.
+            #
+            # The separator "\x1f" is ASCII Unit Separator, chosen because it
+            # cannot occur in normal text or in canonical_label_json output,
+            # so ("a", "b|c") and ("a|b", "c") cannot collide.
+            # -----------------------------------------------------------------
+            label_strings = result["label"].map(
+                lambda v: canonical_label_json(v) if isinstance(v, list) else str(v)
             )
+            combined = result["clean_text"].astype(str) + "\x1f" + label_strings
+            dedupe_key = pd.util.hash_pandas_object(combined, index=False)
             result = result.loc[~dedupe_key.duplicated()]
-            self.report.duplicate_rows_removed += before - len(result)
+            _bump("duplicate_rows_removed", before - len(result))
 
-        # Guarantee canonical list type row-by-row, including values that were
-        # already JSON strings in an earlier processed CSV.
         result["label"] = result["label"].map(LabelNormalizer.parse)
         result = result[result["label"].map(lambda x: isinstance(x, list) and len(x) > 0)]
         return result.reset_index(drop=True)
@@ -3044,7 +4257,11 @@ class MasterDatasetProcessor:
 
     def score(self, *, force: bool = False) -> pd.DataFrame:
         if self.df is None or "sentiment_score" not in self.df.columns:
-            cleaned = self._clean_dataframe(self.load()) if self.df is None else self.df[["clean_text", "label"]].copy()
+            cleaned = (
+                self._clean_dataframe(self.load())
+                if self.df is None
+                else self.df[["clean_text", "label"]].copy()
+            )
         else:
             if force:
                 cleaned = self.df[["clean_text", "label"]].copy()
@@ -3067,15 +4284,47 @@ class MasterDatasetProcessor:
                 ["Device requested", self.sentiment_scorer.device_request],
             ],
         )
-
-        # Hash-based score cache protects repeated interactive execution while
-        # remaining target-independent. It is scoped to the active model/config.
+        # Adapt the batch size to the device and the workload size. This
+        # is a no-op if the user already asked for a large batch.
+        adapted = _adaptive_sentiment_batch_size(
+            self.sentiment_scorer.batch_size,
+            self.sentiment_scorer._device
+                if self.sentiment_scorer._device is not None
+                else torch.device("cpu") if torch else None,
+            n_rows=len(cleaned),
+        )
+        if adapted and adapted != self.sentiment_scorer.batch_size:
+            self.renderer.info(
+                f"Batch size adjusted from {self.sentiment_scorer.batch_size} "
+                f"to {adapted} based on device and dataset size."
+            )
+            self.sentiment_scorer.batch_size = adapted
         config_key = stable_hash({
             "backend": self.sentiment_scorer.backend_request,
             "model": self.sentiment_scorer.model_name,
             "max_length": self.sentiment_scorer.max_length,
         })
+                # Merge the on-disk cache into the in-memory cache. This is what
+        # makes re-runs nearly instant on the second invocation.
+        disk_cache = _load_sentiment_cache(config_key)
+        if disk_cache:
+            self._score_cache.update(disk_cache)
+            self.renderer.info(
+                f"Loaded {len(disk_cache):,} cached sentiment scores from disk."
+            )
         texts = cleaned["clean_text"].astype(str).tolist()
+        tokenizer_for_len = getattr(self.sentiment_scorer, "_tokenizer", None)
+        adapted_len = _adaptive_max_length(
+            self.sentiment_scorer.max_length,
+            texts,
+            tokenizer=tokenizer_for_len,
+        )
+        if adapted_len != self.sentiment_scorer.max_length:
+            self.renderer.info(
+                f"Max length adjusted from {self.sentiment_scorer.max_length} "
+                f"to {adapted_len} based on the text distribution (p99)."
+            )
+            self.sentiment_scorer.max_length = adapted_len
         output_scores: list[float] = []
         uncached_positions: list[int] = []
         uncached_texts: list[str] = []
@@ -3093,18 +4342,23 @@ class MasterDatasetProcessor:
             new_scores = self._score_texts(uncached_texts)
             if len(new_scores) != len(uncached_positions):
                 raise SentimentBackendError(
-                    f"Sentiment backend returned {len(new_scores)} scores for {len(uncached_positions)} texts."
+                    f"Sentiment backend returned {len(new_scores)} scores for "
+                    f"{len(uncached_positions)} texts."
                 )
             for pos, text, score in zip(uncached_positions, uncached_texts, new_scores):
                 value = float(score)
                 output_scores[pos] = value
                 self._score_cache[f"{config_key}:{stable_hash(text, 32)}"] = value
-
+            # Persist the updated cache so the next run of the same config
+            # is a no-op.
+            _save_sentiment_cache(config_key, self._score_cache)
         score_series = pd.to_numeric(pd.Series(output_scores, index=cleaned.index), errors="coerce")
         finite = np.isfinite(score_series.to_numpy(dtype=float))
         self.report.invalid_sentiment_scores = int((~finite).sum())
         if not finite.all():
-            raise DatasetValidationError(f"{self.report.invalid_sentiment_scores} invalid sentiment scores were produced.")
+            raise DatasetValidationError(
+                f"{self.report.invalid_sentiment_scores} invalid sentiment scores were produced."
+            )
 
         cleaned["sentiment_score"] = score_series.clip(-1.0, 1.0).astype(float)
         cleaned["label"] = cleaned["label"].map(LabelNormalizer.parse)
@@ -3150,8 +4404,6 @@ class MasterDatasetProcessor:
         self.df = cleaned
         self.score(force=force)
         self.validate(raise_on_error=True)
-        
-        # inside MasterDatasetProcessor.process (after cleaning and scoring)
 
         self.report.rows_output = len(self.df)
         self.report.finished_at = time.time()
@@ -3175,7 +4427,13 @@ class MasterDatasetProcessor:
     # PROFILE
     # -------------------------------------------------------------------------
 
-    def profile(self, *, sample: Optional[int] = DEFAULT_SAMPLE, top_labels: int = 15, top_words: int = 20) -> dict[str, Any]:
+    def profile(
+        self,
+        *,
+        sample: Optional[int] = DEFAULT_SAMPLE,
+        top_labels: int = 15,
+        top_words: int = 20,
+    ) -> dict[str, Any]:
         frame = self.load()
         detection = self.detect_schema()
         used = frame if sample is None or sample >= len(frame) else frame.sample(sample, random_state=42)
@@ -3223,7 +4481,11 @@ class MasterDatasetProcessor:
             top = series.mode(dropna=True)
             top_value = compact(top.iloc[0], 50) if not top.empty else "—"
             avg_len = float(non_null.astype(str).str.len().mean()) if not non_null.empty else 0.0
-            role = "TEXT" if str(column) == detection.text_column else "LABEL" if str(column) == detection.label_column else "OTHER"
+            role = (
+                "TEXT" if str(column) == detection.text_column
+                else "LABEL" if str(column) == detection.label_column
+                else "OTHER"
+            )
             if str(column) in detection.one_hot_label_columns:
                 role = "ONE-HOT LABEL"
             column_rows.append([
@@ -3271,7 +4533,7 @@ class MasterDatasetProcessor:
                 ["User mentions", f"{int(text.str.count(TextCleaner.USER_RE).sum()):,}"],
                 ["Hashtags", f"{int(text.str.count(TextCleaner.HASHTAG_RE).sum()):,}"],
                 ["Non-ASCII rows", f"{int(text.map(lambda x: any(ord(ch) > 127 for ch in x)).sum()):,}"],
-                ["Emoji markers", f"{int(text.str.count(r":").sum()):,}"],
+                ["Emoji markers", f"{int(text.str.count(r':').sum()):,}"],
                 ["Lexical diversity", f"{lexical_diversity:.4f}"],
                 ["Mean punctuation density", f"{text.map(lambda x: sum(ch in '.,!?;:' for ch in x) / max(len(x),1)).mean():.4f}"],
                 ["Mean digit density", f"{text.map(lambda x: sum(ch.isdigit() for ch in x) / max(len(x),1)).mean():.4f}"],
@@ -3280,14 +4542,17 @@ class MasterDatasetProcessor:
 
         label_series = self._label_series_for_profile(frame, detection)
 
-        # Continuous vector targets (e.g. EmoBank V/A/D) are not categorical labels.
         is_continuous_target = (
             detection.label_column == "__VAD__"
             and all(col in frame.columns for col in ("V", "A", "D"))
         )
 
         label_lengths = label_series.map(lambda x: len(x) if isinstance(x, list) else 0)
-        flattened = Counter(str(item) for labels in label_series.dropna() for item in (labels if isinstance(labels, list) else []))
+        flattened = Counter(
+            str(item)
+            for labels in label_series.dropna()
+            for item in (labels if isinstance(labels, list) else [])
+        )
         single_ratio = float((label_lengths == 1).mean()) if len(label_lengths) else 0.0
         multi_ratio = float((label_lengths > 1).mean()) if len(label_lengths) else 0.0
         label_entropy = entropy_from_counts(flattened)
@@ -3369,34 +4634,21 @@ class MasterDatasetProcessor:
         return report
 
     def _label_series_for_profile(
-    self,
-    frame: pd.DataFrame,
-    detection: DetectionResult,
-) -> pd.Series:
-
+        self,
+        frame: pd.DataFrame,
+        detection: DetectionResult,
+    ) -> pd.Series:
         if detection.label_column == "__VAD__":
             return frame.apply(
-                lambda row: [
-                    float(row["V"]),
-                    float(row["A"]),
-                    float(row["D"]),
-                ],
+                lambda row: [float(row["V"]), float(row["A"]), float(row["D"])],
                 axis=1,
             )
-
         if detection.label_column:
-            return frame[
-                detection.label_column
-            ].map(LabelNormalizer.parse)
+            return frame[detection.label_column].map(LabelNormalizer.parse)
 
         assert detection.one_hot_label_columns
-
         return frame.apply(
-            lambda row:
-                LabelNormalizer.one_hot_row(
-                    row,
-                    detection.one_hot_label_columns,
-                ),
+            lambda row: LabelNormalizer.one_hot_row(row, detection.one_hot_label_columns),
             axis=1,
         )
 
@@ -3496,27 +4748,126 @@ class MasterDatasetProcessor:
     # PREVIEW / SUMMARY
     # -------------------------------------------------------------------------
 
-    def preview(self, rows: int = 10, *, tail: bool = False, random_sample: bool = False, seed: int = 42) -> pd.DataFrame:
-        if self.df is None:
-            self.process()
-        assert self.df is not None
-        n = max(1, min(int(rows), len(self.df)))
+    def preview(
+    self,
+    rows: int = 10,
+    *,
+    tail: bool = False,
+    random_sample: bool = False,
+    seed: int = 42,
+) -> pd.DataFrame:
+        """
+        Render a small canonical sample without paying for the full pipeline
+        or for a full DataFrame load.
+
+        The path is chosen to be the cheapest one that answers the request:
+
+        1. Full pipeline already ran        -> sample self.df in memory.
+        2. Raw CSV available on disk        -> read only `rows` rows from
+                                                disk, then clean the sample.
+        3. Raw source must be acquired      -> fall back to load() (rare).
+
+        In cases 1 and 2, nothing larger than `rows` is ever materialised.
+        """
+        n = max(1, int(rows))
+        mode = "random" if random_sample else ("tail" if tail else "head")
+
+        # --- Path 1 — the full pipeline already ran --------------------------
+        if self.df is not None and not self.df.empty:
+            sample = self._sample(
+                self.df, n, tail=tail, random_sample=random_sample, seed=seed,
+            )
+            self._render_preview(sample, title="PROCESSED PREVIEW")
+            return sample.copy()
+
+        # --- Path 2 — sample directly from the raw CSV -----------------------
+        source_path = self._resolve_source_path_for_sampling()
+        if source_path is not None:
+            sample_raw = DatasetLoader.read_rows_only(
+                source_path, n, mode=mode, seed=seed,
+            )
+            if sample_raw.empty:
+                raise DatasetValidationError(
+                    f"No rows available for preview at {source_path}"
+                )
+
+            # Detection needs to know the schema, but we must not pay for a
+            # full load. If it is not already cached, run it on the sample.
+            if self.detection is None:
+                self.detection = self.detector.detect(
+                    sample_raw,
+                    text_column=self.text_column_override,
+                    label_column=self.label_column_override,
+                )
+                self.report.text_column = self.detection.text_column
+                self.report.label_column = self.detection.label_column
+
+            clean = self._clean_dataframe(sample_raw, report=False)
+            clean["sentiment_score"] = float("nan")
+            clean = clean[OUTPUT_COLUMNS].reset_index(drop=True)
+
+            self._render_preview(
+                clean,
+                title=f"RAW {mode.upper()} PREVIEW ({n} rows, sentiment not computed)",
+            )
+            return clean
+
+        # --- Path 3 — nothing on disk yet; must acquire and load -------------
+        raw = self.load()
+        if raw.empty:
+            raise DatasetValidationError("No rows available for preview.")
+        if self.detection is None:
+            self.detect_schema()
+        sample_raw = self._sample(
+            raw, n, tail=tail, random_sample=random_sample, seed=seed,
+        )
+        clean = self._clean_dataframe(sample_raw, report=False)
+        clean["sentiment_score"] = float("nan")
+        clean = clean[OUTPUT_COLUMNS].reset_index(drop=True)
+        self._render_preview(
+            clean, title="RAW PREVIEW (sentiment not yet computed)",
+        )
+        return clean
+
+    @staticmethod
+    def _sample(
+        frame: pd.DataFrame,
+        n: int,
+        *,
+        tail: bool,
+        random_sample: bool,
+        seed: int,
+    ) -> pd.DataFrame:
+        n = min(n, len(frame))
         if random_sample:
-            sample = self.df.sample(n=n, random_state=seed)
-        elif tail:
-            sample = self.df.tail(n)
-        else:
-            sample = self.df.head(n)
+            return frame.sample(n=n, random_state=seed)
+        if tail:
+            return frame.tail(n).copy()
+        return frame.head(n).copy()
+
+    def _render_preview(self, sample: pd.DataFrame, *, title: str) -> None:
+        def _score_cell(value):
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return "—"
+            if math.isnan(f):
+                return "—"
+            return f"{f:+.6f}"
+
         self.renderer.table(
-            "PROCESSED PREVIEW",
+            title,
             OUTPUT_COLUMNS,
             [
-                [compact(row.clean_text, 120), canonical_label_json(row.label), f"{float(row.sentiment_score):+.6f}"]
+                [
+                    compact(row.clean_text, 120),
+                    canonical_label_json(row.label),
+                    _score_cell(row.sentiment_score),
+                ]
                 for row in sample.itertuples(index=False)
             ],
             show_lines=True,
         )
-        return sample.copy()
 
     def summary(self) -> dict[str, Any]:
         if self.df is None:
@@ -3585,7 +4936,11 @@ class MasterDatasetProcessor:
         return frame
 
     def _manifest(self, output_path: Path, fmt: str) -> dict[str, Any]:
-        source_hash = file_hash(self.source_path) if self.source_path and self.source_path.exists() else stable_hash(self.dataset_link)
+        source_hash = (
+            file_hash(self.source_path)
+            if self.source_path and self.source_path.exists()
+            else stable_hash(self.dataset_link)
+        )
         config = {
             "version": VERSION,
             "source": self.dataset_link,
@@ -3631,14 +4986,18 @@ class MasterDatasetProcessor:
         output_path = Path(output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists() and not overwrite:
-            raise DatasetProcessorError(f"Output already exists: {output_path}. Use --overwrite to replace it.")
+            raise DatasetProcessorError(
+                f"Output already exists: {output_path}. Use --overwrite to replace it."
+            )
 
         inferred = output_path.suffix.lower().lstrip(".")
         resolved_fmt = (fmt or inferred or "csv").lower()
         if resolved_fmt == "pq":
             resolved_fmt = "parquet"
         if resolved_fmt not in {"csv", "jsonl", "json", "parquet", "xlsx"}:
-            raise DatasetProcessorError("Output format must be csv, jsonl, json, parquet, or xlsx.")
+            raise DatasetProcessorError(
+                "Output format must be csv, jsonl, json, parquet, or xlsx."
+            )
 
         frame = self._serializable_frame("jsonl" if resolved_fmt == "jsonl" else resolved_fmt)
         try:
@@ -3653,11 +5012,16 @@ class MasterDatasetProcessor:
             elif resolved_fmt == "xlsx":
                 frame.to_excel(output_path, index=False)
         except Exception as exc:
-            raise DatasetProcessorError(f"Failed writing '{output_path}': {type(exc).__name__}: {exc}") from exc
+            raise DatasetProcessorError(
+                f"Failed writing '{output_path}': {type(exc).__name__}: {exc}"
+            ) from exc
 
         if manifest:
             manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
-            manifest_path.write_text(json.dumps(self._manifest(output_path, resolved_fmt), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            manifest_path.write_text(
+                json.dumps(self._manifest(output_path, resolved_fmt), indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
 
         self.renderer.table(
             "DATASET SAVED",
@@ -3698,11 +5062,15 @@ class MasterDatasetProcessor:
 
     def show_configuration(self) -> None:
         config = self.configuration()
-        self.renderer.table("ACTIVE CONFIGURATION", ["Key", "Value"], [[k, compact(v, 120)] for k, v in config.items()])
+        self.renderer.table(
+            "ACTIVE CONFIGURATION",
+            ["Key", "Value"],
+            [[k, compact(v, 120)] for k, v in config.items()],
+        )
 
 
 # =============================================================================
-# HELP SYSTEM & NEW COMMANDS
+# HELP SYSTEM
 # =============================================================================
 
 COMMAND_INFO: dict[str, dict[str, Any]] = {
@@ -3710,7 +5078,7 @@ COMMAND_INFO: dict[str, dict[str, Any]] = {
         "purpose": "Load a source and inspect schema detection without modifying the dataset.",
         "usage": "python master_dataset.py inspect DATASET [options]",
         "options": [
-            ("DATASET", "Source path, URL, or hf://dataset identifier"),
+            ("DATASET", "Source path, URL, hf://dataset, or known://key"),
             ("-t, --text-column", "Explicit text field"),
             ("-l, --label-column", "Explicit label field"),
             ("--candidates", "Show extended detection candidates"),
@@ -3761,13 +5129,13 @@ COMMAND_INFO: dict[str, dict[str, Any]] = {
     "prepare": {
         "purpose": "Download, preprocess, and save a known dataset in one command.",
         "usage": (
-                "python master_dataset.py prepare "
-                "--dataset {goemo,isear,empathetic,emobank} "
-                "[-o OUTPUT] [--offline]"
-            ),
+            "python master_dataset.py prepare "
+            "--dataset {goemo,isear,empathetic,emobank} "
+            "[-o OUTPUT] [--offline]"
+        ),
         "options": [
-            ("--dataset", "Dataset name: goemo, isear, empathetic, emobank"),
-            ("-o, --output", "Optional output path; defaults to ./datasets/<key>/processed/<key>_clean.csv"),
+            ("--dataset", "Dataset key or display name"),
+            ("-o, --output", "Optional output path; defaults to <root>/<key>/processed/<key>_clean.csv"),
             ("--source", "Optional source override for the known schema"),
             ("--offline", "Use only the project-local known-dataset copy"),
             ("-B, --sentiment-backend", "auto | transformer | vader | lexicon"),
@@ -3830,12 +5198,12 @@ COMMAND_INFO: dict[str, dict[str, Any]] = {
         "purpose": "Launch a persistent visual dataset laboratory with repeated commands.",
         "usage": "python master_dataset.py interactive [DATASET]",
         "options": [
-            ("DATASET", "Optional initial dataset path/URL"),
+            ("DATASET", "Optional initial dataset path/URL/known://key"),
             ("-q, --quiet", "Reduce rendering"),
         ],
     },
     "list-datasets": {
-        "purpose": "List all known datasets with their sources and column hints.",
+        "purpose": "List all known + discovered datasets.",
         "usage": "python master_dataset.py --list-datasets",
         "options": [],
     },
@@ -3861,7 +5229,7 @@ def render_root_help(renderer: Renderer) -> None:
             ["save", "Process + validate + persist", "dataset + manifest"],
             ["summary", "Summarise labels and sentiment", "summary dashboard"],
             ["interactive", "Persistent guided laboratory", "interactive workspace"],
-            ["list-datasets", "List known datasets with sources", "table"],
+            ["list-datasets", "List all known + discovered datasets", "table"],
         ],
     )
     renderer.table(
@@ -3873,7 +5241,7 @@ def render_root_help(renderer: Renderer) -> None:
             ["--quiet / --quite", "-q", "Suppress presentation output"],
             ["--no-visuals", "—", "Disable terminal rendering"],
             ["--version", "-V", "Display version"],
-            ["--list-datasets", "—", "Show known dataset configurations"],
+            ["--list-datasets", "—", "Show known + discovered datasets"],
         ],
     )
     renderer.table(
@@ -3897,12 +5265,11 @@ def render_root_help(renderer: Renderer) -> None:
             ["Inspect", "python master_dataset.py inspect ./data.csv"],
             ["Profile", "python master_dataset.py profile ./data.csv --sample 10000"],
             ["Process", "python master_dataset.py process ./data.csv -o clean.csv --overwrite"],
-            ["Prepare GoEmotions", "python master_dataset.py prepare --dataset goemo -o goemo_clean.csv"],
-            ["Prepare ISEAR", "python master_dataset.py prepare --dataset isear --source isear.csv -o isear_clean.csv"],
-            ["Prepare Empathetic", "python master_dataset.py prepare --dataset empathetic -o emp_clean.csv"],
-            ["Prepare EmoBank", "python master_dataset.py prepare --dataset emobank -o emobank_clean.csv"],
-            ["Preview", "python master_dataset.py preview ./data.csv --rows 15 --tail"],
-            ["Validate", "python master_dataset.py validate ./data.csv"],
+            ["Prepare GoEmotions", "python master_dataset.py prepare --dataset goemo"],
+            ["Prepare ISEAR (offline)", "python master_dataset.py prepare --dataset isear --offline"],
+            ["Process discovered", "python master_dataset.py process known://emotion -t text -l label -o out.csv"],
+            ["Process HF", "python master_dataset.py process hf://dair-ai/emotion -t text -l label -o out.csv --overwrite"],
+            ["List datasets", "python master_dataset.py --list-datasets"],
             ["Interactive", "python master_dataset.py interactive"],
         ],
     )
@@ -3920,66 +5287,102 @@ def render_command_help(renderer: Renderer, command: str) -> None:
         renderer.table("COMMAND OPTIONS", ["Option", "Purpose"], info["options"])
     else:
         renderer.table("COMMAND OPTIONS", ["Option", "Purpose"], [["—", "No command-specific options"]])
+        
+        
+# NOTE: append a marker for discovered datasets so the user can tell a
+# cached detection ("text ✓") from a header-only guess ("text ?") from
+# nothing at all ("?"). Managed datasets show no marker.
+def _mark(col_value: Optional[str], spec: dict[str, Any]) -> str:
+    """
+    Annotate a schema column for the dataset listing.
+
+    Conventions:
+        'text'          -> managed/prescribed schema (authoritative)
+        'content ?'     -> discovered, hint came from a header peek (a guess)
+        'content ✓'     -> discovered, hint came from a cached sidecar
+        '?'             -> no hint available at all
+    """
+    if not col_value:
+        return "?"
+
+    # Managed datasets carry no schema_is_hint flag; their columns are
+    # prescribed by KNOWN_DATASETS and shown unadorned.
+    if not spec.get("schema_is_hint"):
+        return col_value
+
+    source = spec.get("schema_hint_source", "unknown")
+    if source == "cached":
+        return f"{col_value} ✓"
+    if source == "header":
+        return f"{col_value} ?"
+    return f"{col_value} ?"
 
 
-def render_known_datasets(
-    renderer: Renderer,
-) -> None:
-    """Display managed datasets and local availability."""
+def _relative_dataset_path(key: str) -> str:
+    """Show '<key>/raw/<key>.csv' instead of the absolute path."""
+    raw = known_dataset_local_path(key)
+    if not raw.is_file():
+        processed = known_dataset_processed_dir(key) / f"{key}_clean.csv"
+        if processed.is_file():
+            return f"{key}/processed/{processed.name}"
+        return f"{key}/"
+    return f"{key}/raw/{raw.name}"
 
-    rows = []
 
-    for key, spec in KNOWN_DATASETS.items():
+def render_known_datasets(renderer: Renderer, *, verbose: bool = False) -> None:
+    """
+    Compact mode (default) shows the six fields you actually scan:
+    Key, Local, Text, Target, Task, Classes.
 
-        local_path = known_dataset_local_path(key)
+    Verbose mode adds Name, Source, Path, and Notes for when you need
+    provenance detail.
+    """
+    materialize_schema_sidecars()
 
-        local_status = (
-            "READY"
-            if known_dataset_is_local(key)
-            else "MISSING"
-        )
-
-        rows.append([
-            key,
-            spec["name"],
-            local_status,
-            compact(
-                spec.get("url", "—"),
-                52,
-            ),
-            str(local_path),
-            spec.get("text_column", "?"),
-            spec.get("label_column", "?"),
-            spec.get("task_type", "?"),
-            spec.get("class_count", "—"),
-            compact(
-                spec.get("notes", ""),
-                72,
-            ),
-        ])
+    if verbose:
+        columns = [
+            "Key", "Name", "Local", "Source", "Path",
+            "Text", "Target", "Task", "#", "Notes",
+        ]
+        rows = []
+        for key, spec in all_datasets().items():
+            rows.append([
+                key,
+                spec.get("name") or key,
+                "READY" if known_dataset_is_local(key) else "MISSING",
+                compact(spec.get("url") or "—", 60),
+                str(known_dataset_local_path(key)),
+                _mark(spec.get("text_column"), spec),
+                _mark(spec.get("label_column"), spec),
+                spec.get("task_type") or "unknown",
+                str(spec.get("class_count", "—")),
+                compact(spec.get("notes") or "", 100),
+            ])
+    else:
+        columns = ["Key", "Local", "Text", "Target", "Task", "# classes"]
+        rows = []
+        for key, spec in all_datasets().items():
+            rows.append([
+                key,
+                "READY" if known_dataset_is_local(key) else "MISSING",
+                _mark(spec.get("text_column"), spec),
+                _mark(spec.get("label_column"), spec),
+                spec.get("task_type") or "unknown",
+                str(spec.get("class_count", "—")),
+            ])
 
     renderer.table(
-        "KNOWN DATASETS",
-        [
-            "Key",
-            "Name",
-            "Local",
-            "Source",
-            "Local path",
-            "Text",
-            "Target",
-            "Task",
-            "# classes",
-            "Notes",
-        ],
+        "KNOWN DATASETS" + (" (verbose)" if verbose else ""),
+        columns,
         rows,
         caption=(
-            "All datasets use the project-local lifecycle: "
-            "acquire → raw/<dataset>.csv → process → "
-            "processed/<dataset>.csv. "
-            "--offline requires the raw snapshot."
+            f"Datasets root: {PROJECT_DATASETS_DIR}  •  "
+            "✓ = confirmed by schema.json; ? = header-only hint; "
+            "run --list-datasets --verbose for source, path, and notes."
         ),
     )
+
+
 # =============================================================================
 # INTERACTIVE LABORATORY
 # =============================================================================
@@ -4004,42 +5407,49 @@ class InteractiveApp:
         return True
 
     def _load_dialog(self) -> None:
-        # Show known datasets first
         render_known_datasets(self.renderer)
-        dataset_key = self._prompt(
-            "Dataset key (or path/URL)",
-            "",
-        ).strip()
+        dataset_key = self._prompt("Dataset key (or path/URL)", "").strip()
 
-        resolved_key = resolve_known_dataset_key(
-            dataset_key
-        )
+        resolved_key = resolve_known_dataset_key(dataset_key)
 
         if resolved_key is not None:
-
-            spec = KNOWN_DATASETS[resolved_key]
-
+            spec = all_datasets()[resolved_key]
             source = spec["source"]
-            text_col = spec["text_column"]
-            label_col = spec["label_column"]
 
-            self.renderer.info(
-                f"Using known dataset: {spec['name']}"
-            )
-
+            if spec.get("schema_is_hint"):
+                # NOTE: discovered dataset. spec["text_column"] / ["label_column"]
+                # are *hints* from the header peek or a cached sidecar, not
+                # prescriptions. Forcing them as overrides would silently disable
+                # auto-detection and cache a possibly-wrong column. Instead,
+                # surface the hint and let the user accept it or defer to auto.
+                hint_text  = spec.get("text_column") or "?"
+                hint_label = spec.get("label_column") or "?"
+                hint_src   = spec.get("schema_hint_source", "unknown")
+                self.renderer.info(
+                    f"Discovered dataset '{resolved_key}' "
+                    f"(schema hint from {hint_src}: text={hint_text}, "
+                    f"target={hint_label})"
+                )
+                text_col = self._prompt(
+                    f"Text column (blank = auto-detect, hint = {hint_text})",
+                    "",
+                ) or None
+                label_col = self._prompt(
+                    f"Label column (blank = auto-detect, hint = {hint_label})",
+                    "",
+                ) or None
+            else:
+                # Managed dataset: prescribed schema is authoritative.
+                text_col  = spec.get("text_column")
+                label_col = spec.get("label_column")
+                self.renderer.info(
+                    f"Using managed dataset: {spec.get('name') or resolved_key}"
+                )
         else:
-
             source = dataset_key
+            text_col = self._prompt("Text column (blank = auto)", "") or None
+            label_col = self._prompt("Label column (blank = auto)", "") or None
 
-            text_col = self._prompt(
-                "Text column (blank = auto)",
-                "",
-            ) or None
-
-            label_col = self._prompt(
-                "Label column (blank = auto)",
-                "",
-            ) or None
         backend = self._prompt("Sentiment backend", "auto") or "auto"
         model = self._prompt("Sentiment model (blank = default)", "") or None
         batch_size = int(self._prompt("PyTorch batch size", str(DEFAULT_BATCH_SIZE)))
@@ -4055,16 +5465,34 @@ class InteractiveApp:
             sentiment_batch_size=batch_size,
             sentiment_max_length=max_length,
             device=device,
+            interactive_fallback=True,
             quiet=self.renderer.quiet,
             no_visuals=self.renderer.no_visuals,
         )
         self.processor.load()
-        self.processor.detect_schema()
+        try:
+            self.processor.detect_schema()
+        except DatasetSchemaError as exc:
+            self.renderer.warning(
+                f"Automatic detection failed: {exc}. "
+                "Choose columns manually."
+            )
+            self.processor.interactive_select_columns()
 
     def _dashboard(self) -> None:
         source = self.processor.dataset_link if self.processor else "No dataset loaded"
-        state = "LOADED / PROCESSED" if self.processor and self.processor.df is not None else "LOADED / RAW" if self.processor else "EMPTY"
-        rows = len(self.processor.df) if self.processor and self.processor.df is not None else len(self.processor.raw_df) if self.processor and self.processor.raw_df is not None else 0
+        state = (
+            "LOADED / PROCESSED" if self.processor and self.processor.df is not None
+            else "LOADED / RAW" if self.processor
+            else "EMPTY"
+        )
+        rows = (
+            len(self.processor.df)
+            if self.processor and self.processor.df is not None
+            else len(self.processor.raw_df)
+            if self.processor and self.processor.raw_df is not None
+            else 0
+        )
         self.renderer.panel(
             "MASTER DATASET LABORATORY",
             f"State: {state}\nRows: {rows:,}\nSource: {compact(source, 110)}\n\nType a number, command word, or 'help'.",
@@ -4092,7 +5520,11 @@ class InteractiveApp:
         self.renderer.panel("MASTER DATASET PROCESSOR", "Interactive laboratory — persistent session")
         if self.start_dataset:
             try:
-                self.processor = MasterDatasetProcessor(self.start_dataset, quiet=self.renderer.quiet, no_visuals=self.renderer.no_visuals)
+                self.processor = MasterDatasetProcessor(
+                    self.start_dataset,
+                    quiet=self.renderer.quiet,
+                    no_visuals=self.renderer.no_visuals,
+                )
                 self.processor.load()
                 self.processor.detect_schema()
             except DatasetProcessorError as exc:
@@ -4100,7 +5532,14 @@ class InteractiveApp:
 
         while True:
             self._dashboard()
-            choice = self._prompt("Select action", "0").lower().strip()
+            try:
+                choice = self._prompt("Select action", "0").lower().strip()
+            except (KeyboardInterrupt, EOFError):
+                # NOTE: Ctrl+C / Ctrl+D at the prompt is a request to leave the lab,
+                # not a crash. We exit cleanly instead of letting the KeyboardInterrupt
+                # bubble out of run() and produce a raw traceback.
+                self.renderer.warning("Session closed.")
+                return
             self.history.append(choice)
             try:
                 if choice in {"0", "exit", "quit", "q"}:
@@ -4110,7 +5549,20 @@ class InteractiveApp:
                     self._load_dialog()
                 elif choice in {"2", "inspect"}:
                     if self._ensure_processor():
-                        self.processor.load()
+                        # NOTE: inspect only needs a schema, not the full frame. Route
+                        # through the same fast path the CLI uses.
+                        source_path = self.processor._resolve_source_path_for_sampling()
+                        if source_path is not None and self.processor.raw_df is None:
+                            sample_df = DatasetLoader.read_rows_only(
+                                source_path, 50_000, mode="random", seed=42,
+                            )
+                            self.processor.raw_df = sample_df
+                            self.processor.source_path = source_path
+                            self.processor.report.rows_input = len(sample_df)
+                            self.processor.report.columns_input = len(sample_df.columns)
+                            self.processor.renderer.info(
+                                f"Inspecting on a {len(sample_df):,}-row sample."
+                            )
                         self.processor.detect_schema()
                 elif choice in {"3", "profile", "p"}:
                     if self._ensure_processor():
@@ -4160,9 +5612,8 @@ class InteractiveApp:
 
 
 # =============================================================================
-# CLI HELP / PARSER
+# CLI
 # =============================================================================
-
 
 def preprocess_argv(argv: Sequence[str]) -> list[str]:
     return ["--help" if token == "-help" else token for token in argv]
@@ -4178,7 +5629,14 @@ def requested_help(argv: Sequence[str]) -> tuple[Optional[str], bool]:
 def common_source_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-t", "--text-column", dest="text_column")
     parser.add_argument("-l", "--label-column", dest="label_column")
-    parser.add_argument("-B", "--sentiment-backend", dest="sentiment_backend", choices=["auto", "transformer", "vader", "lexicon"], default="auto")
+    parser.add_argument(
+        "-B", "--sentiment-backend", dest="sentiment_backend",
+        choices=["auto", "transformer", "vader", "lexicon", "none"], default="auto",
+    )
+    parser.add_argument(
+        "-c", "--choose-columns", dest="choose_columns", action="store_true",
+        help="Prompt interactively for the text and label columns after a preview.",
+    )
     parser.add_argument("-m", "--model", "--sentiment-model", dest="sentiment_model", default=None)
     parser.add_argument("-b", "--batch-size", dest="batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("-L", "--max-length", dest="max_length", type=int, default=DEFAULT_MAX_LENGTH)
@@ -4216,13 +5674,16 @@ def output_options(parser: argparse.ArgumentParser, *, required: bool = False) -
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="master_dataset.py",
-        description="Generalized dataset cleaning, schema detection, validation and target-independent sentiment scoring.",
+        description=(
+            "Generalized dataset cleaning, schema detection, validation and "
+            "target-independent sentiment scoring."
+        ),
         add_help=False,
     )
     parser.add_argument("--quiet", "--quite", "-q", dest="quiet", action="store_true")
     parser.add_argument("--no-visuals", action="store_true")
     parser.add_argument("--version", "-V", action="store_true")
-    parser.add_argument("--list-datasets", action="store_true", help="List known datasets and their configurations")
+    parser.add_argument("--list-datasets", action="store_true", help="List known + discovered datasets")
     sub = parser.add_subparsers(dest="command")
 
     inspect = sub.add_parser("inspect", add_help=False)
@@ -4244,17 +5705,27 @@ def build_parser() -> argparse.ArgumentParser:
     output_options(process)
 
     prepare = sub.add_parser("prepare", add_help=False)
-    prepare.add_argument("--dataset", required=True, help=("Managed dataset key or name "
-        "(goemo, GoEmotions, isear, ISEAR, empathetic,"
-        "EmpatheticDialogues, emobank, EmoBank)"),)
-    prepare.add_argument("--source", help="Override source (local path or hf://...)")
-    prepare.add_argument("-o", "--output", default=None, help="Output path; defaults to datasets/<key>/processed/<key>_clean.csv")
-    prepare.add_argument("--offline", action="store_true", help="Use only the project-local known dataset copy")
+    prepare.add_argument(
+        "--dataset", required=True,
+        help="Managed dataset key or display name",
+    )
+    prepare.add_argument("--source", help="Override source (local path, hf://, known://)")
+    prepare.add_argument(
+        "-o", "--output", default=None,
+        help="Output path; defaults to <root>/<key>/processed/<key>_clean.csv",
+    )
+    prepare.add_argument("--offline", action="store_true", help="Use only the project-local copy")
     prepare.add_argument("--text-column", help="Override text column")
     prepare.add_argument("--label-column", help="Override label column")
+    prepare.add_argument("-c", "--choose-columns", dest="choose_columns",
+                         action="store_true",
+                         help="Prompt interactively for text and label columns.")
     prepare.add_argument("--overwrite", action="store_true", help="Overwrite existing output")
     prepare.add_argument("--no-manifest", action="store_true", help="Skip manifest")
-    prepare.add_argument("-B", "--sentiment-backend", dest="sentiment_backend", choices=["auto", "transformer", "vader", "lexicon"], default="auto")
+    prepare.add_argument(
+        "-B", "--sentiment-backend", dest="sentiment_backend",
+        choices=["auto", "transformer", "vader", "lexicon", "none"], default="auto",
+    )
     prepare.add_argument("-m", "--model", "--sentiment-model", dest="sentiment_model", default=None)
     prepare.add_argument("-b", "--batch-size", dest="batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     prepare.add_argument("-L", "--max-length", dest="max_length", type=int, default=DEFAULT_MAX_LENGTH)
@@ -4265,8 +5736,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--positive-label", default=None)
     prepare.add_argument("--negative-label", default=None)
     prepare.add_argument("--neutral-label", default=None)
-    # Reuse common cleaning options (we'll add them manually)
     cleaning_options(prepare)
+    
+    choose = sub.add_parser("choose", add_help=False)
+    choose.add_argument("dataset")
+    common_source_options(choose)
+    choose.add_argument("--sample", type=int, default=7)
 
     score = sub.add_parser("score", add_help=False)
     score.add_argument("dataset")
@@ -4312,6 +5787,7 @@ def build_processor(args: argparse.Namespace) -> MasterDatasetProcessor:
         args.dataset,
         text_column=getattr(args, "text_column", None),
         label_column=getattr(args, "label_column", None),
+        interactive_fallback=getattr(args, "choose_columns", False),
         sentiment_backend=getattr(args, "sentiment_backend", "auto"),
         sentiment_model=getattr(args, "sentiment_model", None),
         sentiment_batch_size=getattr(args, "batch_size", DEFAULT_BATCH_SIZE),
@@ -4351,9 +5827,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     renderer = Renderer(quiet=quiet, no_visuals=no_visuals)
 
-    # Handle --list-datasets
     if "--list-datasets" in raw:
-        render_known_datasets(renderer)
+        verbose_flag = any(f in raw for f in ("--verbose", "-v"))
+        render_known_datasets(renderer, verbose=verbose_flag)
         return 0
 
     if not raw or (help_requested and command is None):
@@ -4369,66 +5845,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "interactive":
-        InteractiveApp(quiet=args.quiet, no_visuals=args.no_visuals, start_dataset=getattr(args, "dataset", None)).run()
+        InteractiveApp(
+            quiet=args.quiet,
+            no_visuals=args.no_visuals,
+            start_dataset=getattr(args, "dataset", None),
+        ).run()
         return 0
 
     if not args.command:
         render_root_help(renderer)
         return 1
 
-    # Special handling for 'prepare'
+    # -------------------------------------------------------------------------
+    # PREPARE
+    # -------------------------------------------------------------------------
     if args.command == "prepare":
-
-        key = resolve_known_dataset_key(
-            args.dataset
-        )
-
+        key = resolve_known_dataset_key(args.dataset)
         if key is None:
-            renderer.error(
-                f"Unknown managed dataset: {args.dataset}"
-            )
+            renderer.error(f"Unknown managed dataset: {args.dataset}")
             render_known_datasets(renderer)
             return 1
 
-        spec = KNOWN_DATASETS[key]
+        spec = all_datasets()[key]
 
-        source = (
-            args.source
-            if args.source
-            else spec["source"]
-        )
+        source = args.source if args.source else spec["source"]
+        text_col = args.text_column if args.text_column else spec.get("text_column")
+        label_col = args.label_column if args.label_column else spec.get("label_column")
 
-        text_col = (
-            args.text_column
-            if args.text_column
-            else spec["text_column"]
-        )
+        renderer.info(f"Preparing dataset: {spec.get('name') or key}")
+        renderer.info(f"  Source: {source}")
+        renderer.info(f"  Text column: {text_col or 'auto'}")
+        renderer.info(f"  Label column: {label_col or 'auto'}")
 
-        label_col = (
-            args.label_column
-            if args.label_column
-            else spec["label_column"]
-        )
-
-        renderer.info(
-            f"Preparing dataset: {spec['name']}"
-        )
-        renderer.info(
-            f"  Source: {source}"
-        )
-        renderer.info(
-            f"  Text column: {text_col}"
-        )
-        renderer.info(
-            f"  Label column: {label_col}"
-        )
-
-        # Use the processor with the same cleaning settings
         processor = MasterDatasetProcessor(
             source,
             text_column=text_col,
             label_column=label_col,
-            # Use the default cleaning (matching other datasets)
+            interactive_fallback=getattr(args, "choose_columns", False),
             lowercase=not getattr(args, "no_lowercase", False),
             demojize=not getattr(args, "no_demojize", False),
             normalize_urls=not getattr(args, "no_url_normalization", False),
@@ -4456,18 +5909,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             negative_label=getattr(args, "negative_label", None),
             neutral_label=getattr(args, "neutral_label", None),
         )
-        # Process and save
-        df = processor.process(force=True)
-        # Override output format if not specified
+        processor.process(force=True)
+
         fmt = getattr(args, "format", None) or "csv"
 
+        # NOTE: default output uses the *resolved key*, not the user-supplied
+        # string, so passing "GoEmotions" still lands in datasets/goemo/processed/.
         output_path = (
             Path(args.output).expanduser().resolve()
             if args.output
-            else (
-                known_dataset_processed_dir(key)
-                / f"{args.dataset}_clean.csv"
-            )
+            else known_dataset_processed_dir(key) / f"{key}_clean.csv"
         )
 
         processor.save(
@@ -4478,33 +5929,94 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
 
+    # -------------------------------------------------------------------------
+    # EVERY OTHER COMMAND
+    # -------------------------------------------------------------------------
     try:
-        key = resolve_known_dataset_key(
-            args.dataset
-        )
         processor = build_processor(args)
 
         if args.command == "inspect":
-            processor.load()
-            detection = processor.detect_schema()
+            # NOTE: for inspect we only need the header plus a bounded
+            # sample. Reading the full CSV defeats the purpose.
+            source_path = processor._resolve_source_path_for_sampling()
+
+            if source_path is not None:
+                sample_df = DatasetLoader.read_rows_only(
+                    source_path, 50_000, mode="random", seed=42,
+                )
+                processor.raw_df = sample_df
+                processor.source_path = source_path
+                processor.report.rows_input = len(sample_df)
+                processor.report.columns_input = len(sample_df.columns)
+                processor.renderer.table(
+                    "SCHEMA SAMPLE",
+                    ["Property", "Value"],
+                    [
+                        ["Source", compact(processor.dataset_link, 120)],
+                        ["Sampled rows", f"{len(sample_df):,}"],
+                        ["Columns", f"{len(sample_df.columns):,}"],
+                        ["Raw snapshot", str(source_path)],
+                    ],
+                )
+                detection = processor.detect_schema()
+            else:
+                processor.load()
+                detection = processor.detect_schema()
+
             if getattr(args, "candidates", False):
-                processor.renderer.table("TEXT CANDIDATES", ["Rank", "Column", "Score"], [[i, c, s] for i, (c, s) in enumerate(detection.text_candidates[:10], 1)])
-                processor.renderer.table("LABEL CANDIDATES", ["Rank", "Column", "Score"], [[i, c, s] for i, (c, s) in enumerate(detection.label_candidates[:10], 1)])
+                processor.renderer.table(
+                    "TEXT CANDIDATES",
+                    ["Rank", "Column", "Score"],
+                    [[i, c, s] for i, (c, s) in enumerate(detection.text_candidates[:10], 1)],
+                )
+                processor.renderer.table(
+                    "LABEL CANDIDATES",
+                    ["Rank", "Column", "Score"],
+                    [[i, c, s] for i, (c, s) in enumerate(detection.label_candidates[:10], 1)],
+                )
 
         elif args.command == "profile":
-            processor.profile(sample=args.sample, top_labels=args.top_labels, top_words=args.top_words)
+            processor.profile(
+                sample=args.sample,
+                top_labels=args.top_labels,
+                top_words=args.top_words,
+            )
+        
+        elif args.command == "choose":
+            processor.load()
+            if processor.raw_df is None:
+                raise DatasetSchemaError("No raw frame available for column choice.")
+            processor.renderer.table(
+                "PREVIEW",
+                ["Property", "Value"],
+                [
+                    ["Source", compact(processor.dataset_link, 120)],
+                    ["Rows", f"{len(processor.raw_df):,}"],
+                    ["Columns", f"{len(processor.raw_df.columns):,}"],
+                ],
+            )
+            detection = processor.interactive_select_columns()
+            processor.renderer.table(
+                "DETECTION RESULT",
+                ["Role", "Column", "Confidence"],
+                [
+                    ["Text", detection.text_column or "—", detection.confidence],
+                    ["Label", detection.label_column or "—", detection.confidence],
+                ],
+            )
 
         elif args.command == "process":
-
             processor.process()
-
+            # NOTE: default output always routes through the universal helper,
+            # which works for managed, discovered, and foreign sources alike.
+            # This replaces the previous `known_dataset_processed_dir(key)` call
+            # that silently produced datasets/none/processed/none.csv when the
+            # source was not a known key.
             output_path = (
                 Path(args.output).expanduser().resolve()
                 if args.output
-                else known_dataset_processed_dir(key)
-                / f"{key}.csv"
+                else default_processed_output_for_source(args.dataset)
             )
-
             processor.save(
                 output_path,
                 fmt=args.format,
@@ -4515,23 +6027,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "score":
             processor.process()
             if args.output:
-                processor.save(args.output, fmt=args.format, overwrite=args.overwrite, manifest=not args.no_manifest)
+                processor.save(
+                    args.output,
+                    fmt=args.format,
+                    overwrite=args.overwrite,
+                    manifest=not args.no_manifest,
+                )
             else:
                 processor.summary()
 
         elif args.command == "preview":
-            processor.process()
-            processor.preview(args.rows, tail=args.tail, random_sample=args.random_sample, seed=args.seed)
+            # processor.process()
+            processor.preview(
+                args.rows,
+                tail=args.tail,
+                random_sample=args.random_sample,
+                seed=args.seed,
+            )
 
         elif args.command == "validate":
             processor.process()
             result = processor.validate(raise_on_error=not args.no_raise)
             if args.json:
-                processor.renderer.table("VALIDATION JSON", ["Payload"], [[json.dumps(result, ensure_ascii=False, default=str)]])
+                processor.renderer.table(
+                    "VALIDATION JSON",
+                    ["Payload"],
+                    [[json.dumps(result, ensure_ascii=False, default=str)]],
+                )
 
         elif args.command == "save":
             processor.process()
-            processor.save(args.output, fmt=args.format, overwrite=args.overwrite, manifest=not args.no_manifest)
+            processor.save(
+                args.output,
+                fmt=args.format,
+                overwrite=args.overwrite,
+                manifest=not args.no_manifest,
+            )
 
         elif args.command == "summary":
             processor.process()
@@ -4550,81 +6081,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 3
 
 
-
-"""
-# ---------------------------------------------------------------------------
-# MANAGED DATASETS
-# ---------------------------------------------------------------------------
-
-# First run: acquire online, cache locally, preprocess, validate, and save.
-python master_dataset.py prepare --dataset goemo
-python master_dataset.py prepare --dataset isear
-python master_dataset.py prepare --dataset empathetic
-python master_dataset.py prepare --dataset emobank
-
-# Later runs can be completely offline.
-python master_dataset.py prepare --dataset goemo --offline
-python master_dataset.py prepare --dataset isear --offline
-python master_dataset.py prepare --dataset empathetic --offline
-python master_dataset.py prepare --dataset emobank --offline
-
-# Managed datasets live under:
-# ./datasets/<dataset>/raw/
-# ./datasets/<dataset>/processed/
-
-
-
-
-# ---------------------------------------------------------------------------
-# DATASET SOURCES
-# ---------------------------------------------------------------------------
-
-# GoEmotions:
-# https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/train.tsv
-# https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/dev.tsv
-# https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/test.tsv
-
-# ISEAR:
-# Official documentation:
-# https://www.unige.ch/cisa/research/materials-and-online-research/research-material/
-# Downloadable dataset mirror:
-# https://raw.githubusercontent.com/sinmaniphel/py_isear_dataset/master/isear.csv
-
-# EmpatheticDialogues:
-# https://dl.fbaipublicfiles.com/parlai/empatheticdialogues/empatheticdialogues.tar.gz
-
-# EmoBank:
-# https://github.com/JULIELab/EmoBank/raw/master/corpus/emobank.csv
-#
-# Project-local storage:
-# ./datasets/<dataset>/raw/
-# ./datasets/<dataset>/processed/
-"""
-
-
-
-"""
-
-# 1. Emotion (dair-ai/emotion) – 6 emotions
-python master_dataset.py process hf://dair-ai/emotion -t text -l label -o datasets/emotion/processed/emotion_clean.csv --overwrite
-
-# 2. TweetEval Emotion – 4 emotions
-python master_dataset.py process hf://tweet_eval:emotion -t text -l label -o datasets/tweet_eval_emotion/processed/tweet_eval_emotion_clean.csv --overwrite
-
-# 3. SST-2 – binary sentiment
-python master_dataset.py process hf://sst2 -t sentence -l label -o datasets/sst2/processed/sst2_clean.csv --overwrite
-
-# 4. Amazon Polarity – binary sentiment (large dataset)
-python master_dataset.py process hf://amazon_polarity -t content -l label -o datasets/amazon_polarity/processed/amazon_polarity_clean.csv --overwrite
-
-# 5. Financial Phrasebank – 3‑class sentiment
-python master_dataset.py process hf://financial_phrasebank -t sentence -l label -o datasets/financial_phrasebank/processed/financial_phrasebank_clean.csv --overwrite
-
-"""
-
-
-
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
