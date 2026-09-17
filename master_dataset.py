@@ -75,6 +75,11 @@ import io
 import json
 import math
 import os
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 import random
 import re
 import sys
@@ -1870,7 +1875,57 @@ def default_processed_output_for_source(source: str) -> Path:
         <root>/<dataset_name>/processed/<dataset_name>_clean.csv
     """
     return dataset_processed_path(dataset_name_from_source(source))
+def _adaptive_max_length(
+    requested_max_length: int,
+    texts: Sequence[str],
+    *,
+    tokenizer=None,
+    sample_size: int = 2000,
+    percentile: float = 0.99,
+    min_length: int = 16,
+) -> int:
+    """
+    Pick a tokenizer length that covers `percentile` of the text distribution,
+    capped at the user-requested max_length.
 
+    Rationale
+    ---------
+    
+    On short-text datasets (tweets, single sentences) a max_length of 256
+    wastes compute on padding. This samples the corpus, estimates the
+    p99 token length, rounds up to a multiple of 8, and returns it —
+    so long as it does not exceed what the user asked for.
+
+    Without a tokenizer we approximate ~4 characters per subword token.
+    With a tokenizer we run real encode() calls on a bounded sample.
+    """
+    if not texts:
+        return int(requested_max_length)
+
+    n = len(texts)
+    if n > sample_size:
+        step = max(1, n // sample_size)
+        sample = [texts[i] for i in range(0, n, step)][:sample_size]
+    else:
+        sample = list(texts)
+
+    if tokenizer is not None:
+        try:
+            lengths = [
+                len(tokenizer.encode(t, add_special_tokens=True, truncation=False))
+                for t in sample
+            ]
+        except Exception:
+            lengths = [max(1, len(t) // 4) for t in sample]
+    else:
+        lengths = [max(1, len(t) // 4) for t in sample]
+
+    if not lengths:
+        return int(requested_max_length)
+
+    p = float(np.percentile(lengths, percentile * 100.0))
+    rounded = int(((p + 7) // 8) * 8)
+    return max(int(min_length), min(int(requested_max_length), rounded))
 # =============================================================================
 # ROBUST DELIMITER-SEPARATED INGESTION
 # =============================================================================
@@ -3720,14 +3775,14 @@ class SentimentScorer:
             raise SentimentBackendError(f"Transformer inference failed: {type(exc).__name__}: {exc}") from exc
 
     def score_batch(self, texts: Sequence[str]) -> list[float]:
-        if backend == "none":
+        # Short-circuit: disabled backend -> zeros, no model, no tokenizer.
+        if self.backend_request == "none":
             self.resolved_backend = "none"
             self.resolved_model = "sentiment-disabled"
             self.resolved_device = "cpu"
             self.resolved_dtype = "float64"
-            # Fill with zeros. The column is present so the canonical schema
-            # is satisfied, but no inference runs.
             return [0.0 for _ in texts]
+
         if self._backend_locked is not None:
             backend = self._backend_locked
         else:
@@ -4293,12 +4348,28 @@ class MasterDatasetProcessor:
                 else torch.device("cpu") if torch else None,
             n_rows=len(cleaned),
         )
-        if adapted and adapted != self.sentiment_scorer.batch_size:
-            self.renderer.info(
-                f"Batch size adjusted from {self.sentiment_scorer.batch_size} "
-                f"to {adapted} based on device and dataset size."
+        # master_dataset.py :: MasterDatasetProcessor.score()
+
+        # ------------------------------------------------------------------
+        # Skip adaptive length when sentiment scoring is disabled.
+        # There is no tokenizer to probe and no cost to amortise.
+        # ------------------------------------------------------------------
+        backend_request = self.sentiment_scorer.backend_request.lower()
+        scoring_disabled = backend_request == "none"
+
+        if not scoring_disabled:
+            tokenizer_for_len = getattr(self.sentiment_scorer, "_tokenizer", None)
+            adapted_len = _adaptive_max_length(
+                self.sentiment_scorer.max_length,
+                texts,
+                tokenizer=tokenizer_for_len,
             )
-            self.sentiment_scorer.batch_size = adapted
+            if adapted_len != self.sentiment_scorer.max_length:
+                self.renderer.info(
+                    f"Max length adjusted from {self.sentiment_scorer.max_length} "
+                    f"to {adapted_len} based on the text distribution (p99)."
+                )
+                self.sentiment_scorer.max_length = adapted_len
         config_key = stable_hash({
             "backend": self.sentiment_scorer.backend_request,
             "model": self.sentiment_scorer.model_name,

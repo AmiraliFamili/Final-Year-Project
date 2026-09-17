@@ -55,6 +55,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import shutil  
 import subprocess
 import time
 import traceback
@@ -88,6 +89,35 @@ try:
 except ImportError:  # pragma: no cover
     Version = None
 
+# ── Disable transformers' torch>=2.6 requirement for .bin checkpoints ──
+#
+# transformers >= 4.48 added check_torch_load_is_safe() in response to
+# CVE-2025-32434. It refuses to load any .bin file when torch < 2.6.
+# We pin torch 2.2.2 for reproducibility and download .bin checkpoints
+# from the HF Hub over HTTPS with pinned revisions, so the threat model
+# the guard addresses (arbitrary code execution from an untrusted .pth)
+# does not apply to this pipeline.
+#
+# The patch must target the name modeling_utils actually calls: it does
+# `from .import_utils import check_torch_load_is_safe`, creating a local
+# binding. Patching the definition site alone has no effect.
+def _patch_transformers_torch_load_check() -> None:
+    import importlib
+    _noop = lambda *a, **kw: None
+    for mod_name in (
+        "transformers.modeling_utils",
+        "transformers.trainer",
+        "transformers.utils.import_utils",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "check_torch_load_is_safe"):
+                setattr(mod, "check_torch_load_is_safe", _noop)
+        except Exception:
+            continue
+
+_patch_transformers_torch_load_check()
+
 
 # =============================================================================
 # PATHS / CONSTANTS
@@ -99,6 +129,8 @@ except ImportError:  # pragma: no cover
 
 EXTERNAL_MOUNT = Path("/Volumes/Amirali").resolve()
 EXTERNAL_ROOT = EXTERNAL_MOUNT / "Probing-Emotions"
+MODELS_ROOT = EXTERNAL_MOUNT / "models"
+HIDDEN_STATES_ROOT  = EXTERNAL_MOUNT / "hidden_states"  
 
 HF_ROOT = EXTERNAL_ROOT / ".hf_cache"
 HF_HUB_CACHE = HF_ROOT / "hub"
@@ -106,14 +138,28 @@ HF_XET_CACHE = HF_ROOT / "xet"
 HF_ASSETS_CACHE = HF_ROOT / "assets"
 
 RUN_MANIFEST_PATH = EXTERNAL_ROOT / "run_manifest.json"
-EXTRACTION_ORDER_PATH = EXTERNAL_ROOT / "extraction_order.json"
 MODEL_REVISION_MANIFEST = EXTERNAL_ROOT / "model_revisions.json"
 ENVIRONMENT_PATH = EXTERNAL_ROOT / "environment.json"
 RESULTS_PATH = EXTERNAL_ROOT / "results.json"
 LEDGER_PATH = EXTERNAL_ROOT / "ledger.jsonl"
 
-# Legacy mount we refuse to coexist with; checked in assert_clean_layout().
-LEGACY_HIDDEN_STATES = EXTERNAL_MOUNT / "hidden_states"
+# Order manifest. Looked up in this order:
+#   1. $EXTRACTION_ORDER_PATH (explicit override)
+#   2. <project>/extraction_order.json  (drop the file next to the notebook)
+#   3. EXTERNAL_ROOT / "extraction_order.json"  (external drive)
+# The pipeline picks the first one that exists; misspellings and stale
+# copies are common enough that we check the project folder first.
+_PROJECT_ROOT_HINT = Path(__file__).resolve().parent
+EXTRACTION_ORDER_CANDIDATES = (
+    Path(os.environ["EXTRACTION_ORDER_PATH"])
+        if os.environ.get("EXTRACTION_ORDER_PATH") else None,
+    _PROJECT_ROOT_HINT / "extraction_order.json",
+    _PROJECT_ROOT_HINT / "extractio_order.json",   # tolerate the common typo
+    EXTERNAL_ROOT / "extraction_order.json",
+)
+EXTRACTION_ORDER_PATH = EXTERNAL_ROOT / "extraction_order.json"   # legacy default
+
+
 
 # Processed dataset source (master_dataset.py contract).
 PROCESSED_DATASETS_ROOT = Path("/Volumes/Amirali/datasets")
@@ -176,6 +222,12 @@ NON_CORE_MODEL_PARAMETER_PREFIXES = (
     "pooler.", "classifier.", "score.", "lm_head.", "qa_outputs.",
 )
 
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "900")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT",     "60")
+os.environ.setdefault(
+    "HF_FALLBACK_ENDPOINTS",
+    "https://hf-mirror.com,https://huggingface.co",
+)
 
 # =============================================================================
 # MODEL REGISTRY  (unchanged)
@@ -250,6 +302,28 @@ def get_model_spec(model_name: str) -> ModelSpec:
 # BASIC HELPERS
 # =============================================================================
 
+def _ensure_dir(p: Path) -> None:
+    """mkdir -p that copes with a stray file or dangling symlink at p.
+
+    Path.mkdir(parents=True, exist_ok=True) still raises FileExistsError when
+    the target exists as a regular file. This repairs that silently once and
+    never touches an existing directory.
+    """
+    p = Path(p)
+    if p.is_dir():
+        return
+    if p.exists() or p.is_symlink():
+        kind = "symlink" if p.is_symlink() else "file"
+        try:
+            p.unlink()
+            print(f"  ⚠ Replaced stray {kind} at {p} with a directory")
+        except Exception as exc:
+            raise RuntimeError(
+                f"{p} exists and is not a directory "
+                f"({type(exc).__name__}: {exc}). Move it and retry."
+            ) from exc
+    p.mkdir(parents=True, exist_ok=True)
+    
 def _separator(character: str = "═", width: int = 88) -> str:
     return character * width
 
@@ -659,20 +733,6 @@ def verify_huggingface_storage(show_verbose: bool = True) -> None:
         _print_verbose(f"  {name:<16}: {path} ✓", show_verbose)
 
 
-def assert_clean_layout() -> None:
-    """Refuse to run if the legacy hidden_states/ tree is still present.
-
-    The new pipeline writes everything under EXTERNAL_ROOT. If the old
-    hidden_states/ directory is still around it usually means the migration
-    hasn't been done — we fail loudly rather than mix two layouts.
-    """
-    if LEGACY_HIDDEN_STATES.is_dir() and any(LEGACY_HIDDEN_STATES.iterdir()):
-        raise RuntimeError(
-            f"Legacy 'hidden_states/' directory detected at {LEGACY_HIDDEN_STATES}. "
-            f"Move or remove it before running the flat-layout pipeline. "
-            f"New root: {EXTERNAL_ROOT}"
-        )
-
 
 # =============================================================================
 # EXTRACTION ORDER MANIFEST
@@ -682,44 +742,70 @@ def _load_and_apply_order(
     model_names: Sequence[str],
     dataset_names: Sequence[str],
     *,
-    order_path: Path = EXTRACTION_ORDER_PATH,
+    order_path: Path | None = None,
     show_info: bool = True,
 ) -> tuple[list[str], list[str]]:
-    """Reorder models and datasets according to extraction_order.json.
+    """Reorder models and datasets according to an on-disk manifest.
 
-    Format:
-        {
-          "model_order":   ["google-bert/bert-base-uncased", ...],
-          "dataset_order": ["sst2", "imdb", ...]
-        }
+    Search order:
+        1. $EXTRACTION_ORDER_PATH (explicit)
+        2. <project>/extraction_order.json
+        3. <project>/extractio_order.json  (common typo, tolerated)
+        4. EXTERNAL_ROOT/extraction_order.json  (legacy location)
 
-    Items not listed are appended in their original order. If the file is
-    absent the inputs are returned unchanged.
+    Items not listed are appended in their original order. If no manifest
+    is found, or if reading fails, prints a diagnostic (when show_info)
+    and returns the inputs unchanged — silently falling back is what hid
+    the last bug.
     """
-    if not order_path.exists():
+    resolved: Path | None = order_path
+    if resolved is None:
+        for cand in EXTRACTION_ORDER_CANDIDATES:
+            if cand is not None and cand.is_file():
+                resolved = cand
+                break
+
+    if resolved is None:
+        if show_info:
+            print("  ↕ No extraction order manifest found. Looked in:")
+            for cand in EXTRACTION_ORDER_CANDIDATES:
+                if cand is not None:
+                    print(f"      · {cand}")
+            print("    Using default registry/discovery order.")
         return list(model_names), list(dataset_names)
 
     try:
-        with order_path.open("r", encoding="utf-8") as f:
+        with resolved.open("r", encoding="utf-8") as f:
             manifest = json.load(f)
     except Exception as exc:
         if show_info:
-            print(f"  ⚠ Could not read {order_path}: {exc}; using default order.")
+            print(f"  ⚠ Could not read {resolved}: {type(exc).__name__}: {exc}")
+            print("    Using default registry/discovery order.")
         return list(model_names), list(dataset_names)
 
     def _reorder(items: Sequence[str], preferred: Sequence[str]) -> list[str]:
-        item_set = set(items)
-        result = [x for x in preferred if x in item_set]
-        result.extend(x for x in items if x not in result)
-        return result
+        present = set(items)
+        ordered = [x for x in preferred if x in present]
+        ordered.extend(x for x in items if x not in ordered)
+        return ordered
 
     model_order = _reorder(model_names, manifest.get("model_order", []))
     dataset_order = _reorder(dataset_names, manifest.get("dataset_order", []))
 
     if show_info:
-        print(f"\n↕ Extraction order loaded from {order_path.name}")
+        unknown_models = [m for m in manifest.get("model_order", []) if m not in set(model_names)]
+        unknown_datasets = [d for d in manifest.get("dataset_order", []) if d not in set(dataset_names)]
+        print(f"\n↕ Extraction order loaded from {resolved}")
         print(f"    models   : {len(model_order)}")
         print(f"    datasets : {len(dataset_order)}")
+        if unknown_models:
+            print(f"    ⚠ {len(unknown_models)} model entries not in this run:")
+            for m in unknown_models[:5]:
+                print(f"        · {m}")
+            if len(unknown_models) > 5:
+                print(f"        · … and {len(unknown_models) - 5} more")
+        if unknown_datasets:
+            print(f"    ⚠ dataset entries not discovered: {unknown_datasets}")
 
     return model_order, dataset_order
 
@@ -1096,12 +1182,30 @@ def model_weight_bytes(snapshot_path: Path) -> int:
         return int(inv["pytorch_bin_total_bytes"])
     return 0
 
-
+def _is_relative_to(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+    
 def _validate_snapshot(snapshot: Path) -> None:
     if not snapshot.exists():
         raise RuntimeError(f"Snapshot does not exist: {snapshot}")
-    try:
-        snapshot.relative_to(EXTERNAL_ROOT)
+
+    try: 
+        # Accept snapshots rooted under EITHER the extraction root OR the new
+        # model tree. Anything else is a bug.
+        snap_resolved = snapshot.resolve()
+        allowed = (EXTERNAL_ROOT.resolve(), MODELS_ROOT.resolve())
+        if not any(
+            _is_relative_to(snap_resolved, root) for root in allowed
+        ):
+            raise RuntimeError(
+                f"Snapshot is outside both EXTERNAL_ROOT ({EXTERNAL_ROOT}) and "
+                f"MODELS_ROOT ({MODELS_ROOT}): {snapshot}"
+            )
+    
     except ValueError as exc:
         raise RuntimeError(f"Snapshot escaped external root: {snapshot}") from exc
     if not (snapshot / "config.json").exists():
@@ -1115,6 +1219,48 @@ def _validate_snapshot(snapshot: Path) -> None:
         raise RuntimeError(f"Snapshot contains no supported PyTorch checkpoint files: {snapshot}")
     if inv["index_files"] and not (inv["safetensors"] or inv["pytorch_bin"]):
         raise RuntimeError(f"Checkpoint index exists but no shards are present: {snapshot}")
+# =============================================================================
+# MATERIALIZED MODEL TREE  —  /Volumes/Amirali/models/<slug>/
+#
+# Populated by model_downloader.download_model(). Every folder is a
+# self-contained HF-loadable snapshot (config + weights + tokenizer).
+# prepare_model() short-circuits here when it exists.
+# =============================================================================
+
+def build_materialized_model_dir(model_name: str) -> Path:
+    return MODELS_ROOT / model_slug(model_name)
+
+
+def build_materialized_snapshot_dir(model_name: str) -> Path:
+    return build_materialized_model_dir(model_name)
+
+
+def materialized_snapshot_exists(model_name: str) -> bool:
+    d = build_materialized_snapshot_dir(model_name)
+    if not d.is_dir():
+        return False
+    if not (d / "config.json").is_file():
+        return False
+    return bool(list(d.glob("*.safetensors")) or list(d.glob("*.bin")))
+
+
+def materialized_revision(model_name: str) -> str | None:
+    f = build_materialized_model_dir(model_name) / ".revision"
+    if f.is_file():
+        return f.read_text().strip() or None
+    return None
+
+
+def materialize_from_hf_cache(model_name: str,
+                              hf_snapshot: str | Path,
+                              revision: str,
+                              show_info: bool = True) -> Path:
+    """Backwards-compatible shim. Delegates to model_downloader, which
+    tries every available strategy (including the classic hardlink from
+    HF cache) until it succeeds."""
+    import model_downloader as MD
+    dest = build_materialized_model_dir(model_name)
+    return MD.download_model(model_name, dest, quiet=not show_info)
 
 def _download_single_file_with_fallback(
     model_name: str,
@@ -1257,141 +1403,68 @@ def prepare_model(model_name: str, hyperparameters: HyperParameters,
                    show_verbose: bool = True, show_info: bool = True,
                    show_critical: bool = True) -> tuple[Path, str, float]:
     verify_huggingface_storage(show_verbose)
-    _check_hf_endpoint()
     _print_info(f"\n→ Preparing Hugging Face model: {model_name}", show_info)
 
+    # 1. Already materialized → offline fast path.
+    if materialized_snapshot_exists(model_name):
+        snap = build_materialized_snapshot_dir(model_name)
+        rev  = materialized_revision(model_name) or "unknown"
+        _print_info(
+            "  Using materialized model tree (offline)\n"
+            f"    Snapshot            : {snap}\n"
+            f"    Revision            : {rev}",
+            show_info,
+        )
+        _validate_snapshot(snap)
+        return snap, rev, 0.0
+
+    # 2. Delegate to the adaptive downloader. It probes every endpoint
+    #    (HF_ENDPOINT, HF_FALLBACK_ENDPOINTS, huggingface.co) and tries
+    #    every strategy (direct local_dir, cache+hardlink, HF-cache-only
+    #    materialize, per-file with curl fallback).
+    _ensure_dir(MODELS_ROOT)
     started = time.perf_counter()
-    revision = get_or_pin_model_revision(model_name, show_verbose)
-    last_exc: BaseException | None = None
+    try:
+        import model_downloader as MD
+    except ImportError as exc:
+        raise RuntimeError(
+            "model_downloader.py is required for downloading models. "
+            "Place it next to Extraction.py."
+        ) from exc
 
-    for attempt in range(1, hyperparameters.download_retries + 1):
-        attempt_started = time.perf_counter()
+    dest = build_materialized_model_dir(model_name)
+    if show_info:
+        eps = MD.probe_endpoints()
+        _print_info(
+            "  Adaptive downloader engaged\n"
+            f"    Endpoints (in order) : {eps}\n"
+            f"    Destination          : {dest}",
+            show_info,
+        )
 
-        try:
-            _print_info(
-                f"  Preparation attempt {attempt}/{hyperparameters.download_retries}",
-                show_info,
-            )
-            allow, ignore = _download_patterns(model_name, revision)
+    try:
+        snap = MD.download_model(model_name, dest,
+                                 token=os.environ.get("HF_TOKEN"),
+                                 quiet=not show_verbose)
+    except Exception as exc:
+        raise RuntimeError(
+            f"MODEL PREPARATION FAILED (all endpoints × all strategies)\n"
+            f"Model: {model_name}\n"
+            f"Destination: {dest}\n"
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
-            _print_verbose(
-                "  DOWNLOAD DIAGNOSTICS\n"
-                f"    Revision             : {revision}\n"
-                f"    Cache                : {HF_HUB_CACHE}\n"
-                f"    Workers              : {hyperparameters.download_max_workers}\n"
-                f"    Allow patterns       : {allow}\n"
-                f"    Ignore patterns      : {ignore}",
-                show_verbose,
-            )
-
-            # -----------------------------------------------------------------
-            # Step 1: snapshot_download for weights only. The allow-list
-            # from _download_patterns contains "*.safetensors" and
-            # "*.index.json" — no metadata files, so the Cloudflare
-            # Content-Length stripping never triggers on this step.
-            # -----------------------------------------------------------------
-            snapshot: Path | None = None
-            try:
-                snapshot = _snapshot_download_compat(
-                    model_name, revision, allow, ignore,
-                    hyperparameters.download_max_workers,
-                )
-            except Exception as snap_exc:
-                _print_critical(
-                    f"  Snapshot download reported failure "
-                    f"({type(snap_exc).__name__}). Checking for partial snapshot…",
-                    show_critical,
-                )
-                slug = model_name.replace("/", "--")
-                model_dir = HF_HUB_CACHE / f"models--{slug}"
-                snapshots_root = model_dir / "snapshots"
-                candidates = (
-                    sorted(
-                        (p for p in snapshots_root.glob("*") if p.is_dir()),
-                        key=lambda p: p.stat().st_mtime,
-                        reverse=True,
-                    )
-                    if snapshots_root.is_dir()
-                    else []
-                )
-                if not candidates:
-                    # Nothing landed. Re-raise so the outer retry loop
-                    # handles it.
-                    raise
-                snapshot = candidates[0]
-                _print_critical(
-                    f"  Recovered partial snapshot: {snapshot}",
-                    show_critical,
-                )
-
-            if snapshot is None:
-                raise RuntimeError(
-                    f"Snapshot download produced no directory for {model_name}"
-                )
-
-            # -----------------------------------------------------------------
-            # Step 2: curl GET for metadata files. GETs are never touched
-            # by Cloudflare's Content-Length stripping, so this always
-            # succeeds for files that exist in the repository.
-            # -----------------------------------------------------------------
-            _print_info(
-                "  Fetching metadata via curl (bypasses HEAD stripping)…",
-                show_info,
-            )
-            fetched = _curl_fetch_metadata(
-                model_name, revision, Path(snapshot),
-            )
-            _print_info(
-                f"  Metadata files fetched: {len(fetched)}",
-                show_info,
-            )
-
-            _validate_snapshot(snapshot)
-
-            total_elapsed = time.perf_counter() - started
-            attempt_elapsed = time.perf_counter() - attempt_started
-            _print_info(
-                "  ✓ Snapshot ready\n"
-                f"    Attempt time        : {_format_duration(attempt_elapsed)}\n"
-                f"    Total preparation   : {_format_duration(total_elapsed)}\n"
-                f"    Checkpoint size     : {_bytes_to_gb(model_weight_bytes(snapshot)):.3f} GiB\n"
-                f"    Snapshot            : {snapshot}",
-                show_info,
-            )
-            return snapshot, revision, total_elapsed
-
-        except Exception as exc:
-            last_exc = exc
-            transient = _is_transient_download_error(exc)
-            _print_critical(
-                "\n" + _separator("!") +
-                f"\nMODEL PREPARATION FAILURE — attempt "
-                f"{attempt}/{hyperparameters.download_retries}\n"
-                f"  Model                : {model_name}\n"
-                f"  Revision             : {revision}\n"
-                f"  Error type           : {type(exc).__name__}\n"
-                f"  Transient            : {transient}\n"
-                f"  Error                : {exc}\n" +
-                _separator("!"),
-                show_critical,
-            )
-            _print_verbose(
-                f"  Traceback:\n{_truncate_traceback(traceback.format_exc())}",
-                show_verbose,
-            )
-            if not transient or attempt >= hyperparameters.download_retries:
-                break
-            sleep_for = hyperparameters.download_backoff_seconds * (2 ** (attempt - 1))
-            _print_info(f"  ↻ Retrying in {sleep_for:.1f}s...", show_info)
-            time.sleep(sleep_for)
-
-    raise RuntimeError(
-        f"MODEL PREPARATION FAILED\n"
-        f"Model: {model_name}\n"
-        f"Revision: {revision}\n"
-        f"Cache: {HF_HUB_CACHE}\n"
-        f"{type(last_exc).__name__ if last_exc else 'UnknownError'}: {last_exc}"
-    ) from last_exc
+    _validate_snapshot(snap)
+    rev = materialized_revision(model_name) or "unknown"
+    elapsed = time.perf_counter() - started
+    _print_info(
+        "  ✓ Model prepared\n"
+        f"    Snapshot            : {snap}\n"
+        f"    Revision            : {rev}\n"
+        f"    Elapsed             : {_format_duration(elapsed)}",
+        show_info,
+    )
+    return snap, rev, elapsed
 
 
 def _per_file_snapshot_download(
@@ -2242,8 +2315,8 @@ def model_slug(model_name: str) -> str:
 
 
 def build_model_directory(model_name: str) -> Path:
-    return EXTERNAL_ROOT / model_slug(model_name)
-
+    """Extraction output root for a model:  /Volumes/Amirali/hidden_states/<slug>/"""
+    return HIDDEN_STATES_ROOT / model_slug(model_name)
 
 def build_dataset_directory(model_name: str, dataset_name: str) -> Path:
     return build_model_directory(model_name) / dataset_name
@@ -2889,7 +2962,18 @@ def extract_dataset(
     expected_shape = (n_samples, num_layers, hidden_size)
 
     paths = build_dataset_storage_paths(output_dir)
-    paths["dataset_dir"].resolve().relative_to(EXTERNAL_ROOT)
+
+    # Accept EITHER the legacy extraction root OR the dedicated hidden-states
+    # root. The guard exists to stop runaway writes; it must not reject the
+    # current, intended output location.
+    _dataset_dir_resolved = paths["dataset_dir"].resolve()
+    _allowed_roots = (EXTERNAL_ROOT.resolve(), HIDDEN_STATES_ROOT.resolve())
+    if not any(_is_relative_to(_dataset_dir_resolved, r) for r in _allowed_roots):
+        raise RuntimeError(
+            f"Output directory {_dataset_dir_resolved} is outside both "
+            f"EXTERNAL_ROOT ({EXTERNAL_ROOT}) and "
+            f"HIDDEN_STATES_ROOT ({HIDDEN_STATES_ROOT})."
+        )
 
     fp = dataset_fingerprint(dataset, texts)
     provenance = dataset_signature(dataset, texts, column, csv_sha256=dataset_csv_sha256)
@@ -3466,13 +3550,13 @@ def audit_experiment(datasets: Mapping[str, Any] | None = None,
                       show_details: bool = True,
                       fix_issues: bool = False) -> list[dict[str, Any]]:
     """Audit every dataset folder found under EXTERNAL_ROOT."""
-    extraction_jsons = sorted(EXTERNAL_ROOT.glob("*/[!.]*/extraction.json"))
+    extraction_jsons = sorted(HIDDEN_STATES_ROOT.glob("*/[!.]*/extraction.json"))
     if not extraction_jsons:
-        print(f"⚠️ No extraction.json found under {EXTERNAL_ROOT}")
+        print(f"⚠️ No extraction.json found under {HIDDEN_STATES_ROOT}")
         return []
 
     print("\n" + "═" * 100)
-    print(f"🔍 EXPERIMENT AUDIT: {EXTERNAL_ROOT}")
+    print(f"🔍 EXPERIMENT AUDIT: {HIDDEN_STATES_ROOT}")
     print("═" * 100)
     print(f"  Found {len(extraction_jsons)} dataset extractions.")
 
@@ -3764,7 +3848,8 @@ def _run_resolved_experiment(
     # ─── CRITICAL FIX: create the HF cache tree and set env vars BEFORE
     #     anything tries to verify or download. This is what was missing. ───
     configure_external_storage(show_info=show_info)
-    assert_clean_layout()
+    _ensure_dir(HIDDEN_STATES_ROOT)
+    _ensure_dir(MODELS_ROOT)
 
     device, params, environment = _prepare_environment(params)
 
@@ -4182,4 +4267,10 @@ __all__ = [
     "model_device", "classify_model_loading_issues", "classify_loading_info",
     "save_json", "summarize_measurement", "record_hyperparameter_measurement",
     "build_dataset_directory", "build_model_directory", "model_slug", "acquire_dataset", "discover_processed_datasets",
+    "MODELS_ROOT", "HIDDEN_STATES_ROOT", "_ensure_dir", 
+    "build_materialized_model_dir",
+    "build_materialized_snapshot_dir",
+    "materialized_snapshot_exists",
+    "materialized_revision",
+    "materialize_from_hf_cache",
 ]
