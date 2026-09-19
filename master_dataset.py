@@ -4358,6 +4358,7 @@ class MasterDatasetProcessor:
         scoring_disabled = backend_request == "none"
 
         if not scoring_disabled:
+            texts = cleaned["clean_text"].astype(str).tolist()
             tokenizer_for_len = getattr(self.sentiment_scorer, "_tokenizer", None)
             adapted_len = _adaptive_max_length(
                 self.sentiment_scorer.max_length,
@@ -4383,19 +4384,7 @@ class MasterDatasetProcessor:
             self.renderer.info(
                 f"Loaded {len(disk_cache):,} cached sentiment scores from disk."
             )
-        texts = cleaned["clean_text"].astype(str).tolist()
-        tokenizer_for_len = getattr(self.sentiment_scorer, "_tokenizer", None)
-        adapted_len = _adaptive_max_length(
-            self.sentiment_scorer.max_length,
-            texts,
-            tokenizer=tokenizer_for_len,
-        )
-        if adapted_len != self.sentiment_scorer.max_length:
-            self.renderer.info(
-                f"Max length adjusted from {self.sentiment_scorer.max_length} "
-                f"to {adapted_len} based on the text distribution (p99)."
-            )
-            self.sentiment_scorer.max_length = adapted_len
+        
         output_scores: list[float] = []
         uncached_positions: list[int] = []
         uncached_texts: list[str] = []

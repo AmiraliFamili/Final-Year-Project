@@ -27,7 +27,7 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-
+import importlib
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -2412,7 +2412,7 @@ class UnifiedProbeAnalyzer:
             'completed_jobs': sorted(list(completed_jobs)),
             'main_records': main_records,
             'control_records': control_records,
-            'split_archive': split_archive,
+            'split_archive': {k: v.tolist() for k, v in split_archive.items()},
         }
         serialized = json.dumps(payload, sort_keys=True, default=str).encode()
         checksum = hashlib.sha256(serialized).hexdigest()

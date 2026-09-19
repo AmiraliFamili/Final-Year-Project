@@ -2259,9 +2259,7 @@ class EmotionProbePipeline:
         self.extraction_mod.run_experiments(
             datasets={self.config.dataset: dataset_obj},
             model_names=[self.config.model],
-            base_output=self.config.root,
             max_length=512,
-            auto_batch_size=False,
             continue_on_model_error=False,
             show_verbose=True,
             show_info=True,
