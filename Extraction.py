@@ -679,19 +679,19 @@ EXTRACTION_RESUME_FIELDS = (
 )
 
 
-def _params_compatible(existing: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
-    """Compare only the fields that affect the extracted tensor content.
-
-    Anything outside this tuple (e.g. device, download retry counts,
-    diagnostics settings) does not invalidate a completed extraction.
-    """
+def _params_compatible(existing, expected):
     for key in EXTRACTION_RESUME_FIELDS:
         if key not in expected:
             continue
-        if existing.get(key) != expected.get(key):
+        e = existing.get(key)
+        x = expected.get(key)
+        # A None in the stored value means "not recorded" — the repair pass
+        # strips csv_sha256. Don't invalidate the run over that.
+        if e is None and key == "dataset_csv_sha256":
+            continue
+        if e != x:
             return False
     return True
-
 
 # =============================================================================
 # EXTERNAL STORAGE / HF CACHE
@@ -2321,17 +2321,14 @@ def build_model_directory(model_name: str) -> Path:
 def build_dataset_directory(model_name: str, dataset_name: str) -> Path:
     return build_model_directory(model_name) / dataset_name
 
-
 def build_dataset_storage_paths(dataset_dir: str | Path) -> dict[str, Path]:
-    """Flat storage: every artefact sits directly inside the dataset folder.
+    """Flat storage: every extraction artefact sits directly inside dataset_dir.
 
-    Also pre-creates probe_results/ and plots/ so the probing stage can write
-    alongside the hidden states that produced them.
+    Probe outputs are the responsibility of Probe.py and live under
+    /Volumes/Amirali/probe/<model_slug>/<dataset>/, not here.
     """
     d = Path(dataset_dir)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "probe_results").mkdir(exist_ok=True)
-    (d / "plots").mkdir(exist_ok=True)
     return {
         "dataset_dir": d,
         "states":      d / "hidden_states.npy",
@@ -2345,10 +2342,7 @@ def build_dataset_storage_paths(dataset_dir: str | Path) -> dict[str, Path]:
         "metadata":    d / "extraction.json",
         "events":      d / "runtime_events.jsonl",
         "runtime":     d / "runtime_state.json",
-        "probe_dir":   d / "probe_results",
-        "plots_dir":   d / "plots",
     }
-
 
 def flush_array(array: np.ndarray) -> None:
     """Flush memmap data and force it to physical storage using fsync on the file only."""
@@ -2776,7 +2770,29 @@ def ensure_auxiliary_files(dataset: Any, paths: dict[str, Path], column: str,
         return {"actions": actions, "skipped": True, "reason": "hidden_states.npy missing"}
 
     texts = dataset_texts(dataset, column)
+    if paths["labels"].exists():
+        try:
+            existing = np.load(paths["labels"], allow_pickle=False)
+            labels_compatible = (
+                existing.shape == (n_samples,)
+                and existing.dtype == labels.dtype
+                and existing.dtype != object
+            )
+        except Exception:
+            # object array (multi-label), pickle required, or corrupted
+            labels_compatible = False
 
+        if not labels_compatible:
+            os.remove(paths["labels"])
+            actions.append("removed incompatible labels.npy")
+            labels_mmap = np.lib.format.open_memmap(
+                paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,),
+            )
+            labels_mmap[:] = labels
+            flush_array(labels_mmap)
+            actions.append("recreated labels.npy with consistent dtype")
+        else:
+            actions.append("labels.npy already compatible")
     if not paths["sample_ids"].exists() or not is_v2_sample_ids(paths["sample_ids"]):
         ids = get_sample_ids(dataset, column, texts)
         np.save(paths["sample_ids"], ids)
@@ -2889,9 +2905,13 @@ def repair_dataset_auxiliaries(dataset: Any, output_dir: str | Path,
                 meta["dataset"]["provenance"] = current_prov
                 meta["dataset"]["columns"] = get_dataset_columns(dataset)
                 meta["extraction"] = {
-                    "pooling": pooling, "max_length": max_length,
-                    "batch_size": batch_size, "device": "cpu",
-                    "storage_dtype": str(storage_dtype),
+                    "pooling": pooling,
+                    "max_length": max_length,
+                    "batch_size": batch_size,
+                    "device": "cpu",
+                    # Always normalise to numpy's canonical short name so it matches
+                    # what extract_dataset() writes.  str(np.float32) is NOT "float32".
+                    "storage_dtype": np.dtype(storage_dtype).name,
                     "runtime_batch_change": False,
                 }
                 save_json(meta_path, meta)
@@ -3670,6 +3690,10 @@ def print_dataset_format_report(dataset_dir: str | Path, show_samples: int = 5) 
     if paths["checksum"].exists():
         chk = paths["checksum"].read_text().strip()
         print(f"  checksum.sha256       : {chk[:16]}…")
+
+    # Probe outputs live under a sibling root.
+    probe_root = Path("/Volumes/Amirali/probe") / model_slug(model_name) / dataset_name
+    print(f"  probe output root     : {probe_root}")
     if paths["probe_dir"].exists():
         print(f"  probe_results/        : {paths['probe_dir']}")
     if paths["plots_dir"].exists():

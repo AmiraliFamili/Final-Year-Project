@@ -115,11 +115,37 @@ def get_environment_info() -> dict:
 # Constants
 # -----------------------------------------------------------------------------
 
-EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/Probed_Redults")
-DEFAULT_SEED = 42
-SCRIPT_VERSION = "4.5.0"
-DEBUG_MODE = False
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+AMIRALI_MOUNT       = Path("/Volumes/Amirali")
+
+# Stage roots — each stage owns exactly one and reads from its predecessors.
+DATASETS_ROOT       = AMIRALI_MOUNT / "datasets"
+MODELS_ROOT         = AMIRALI_MOUNT / "models"
+HIDDEN_STATES_ROOT  = AMIRALI_MOUNT / "hidden_states"   # extraction writes here
+PROBE_ROOT          = AMIRALI_MOUNT / "probe"           # probing writes here
+
+DEFAULT_SEED    = 42
+SCRIPT_VERSION  = "4.5.0"
+DEBUG_MODE      = False
 VERBOSE_DEFAULT = 3 if DEBUG_MODE else 0
+
+
+def model_slug(model_name: str) -> str:
+    """Mirror Extraction.py's slug: 'Qwen/Qwen2-0.5B' → 'Qwen2-0.5B'."""
+    return model_name.split("/")[-1]
+
+
+def artifact_dir_for(model_name: str, dataset_name: str) -> Path:
+    """Where Extraction.py put the hidden states for this (model, dataset)."""
+    return HIDDEN_STATES_ROOT / model_slug(model_name) / dataset_name
+
+
+def probe_dir_for(model_name: str, dataset_name: str) -> Path:
+    """Where Probe.py will write probe runs for this (model, dataset)."""
+    return PROBE_ROOT / model_slug(model_name) / dataset_name
 
 GOEMOTIONS_CLASSES = [
     "admiration", "amusement", "anger", "annoyance", "approval", "caring",
@@ -144,38 +170,7 @@ COMMON_ID_COLUMNS = {"id", "idx", "index", "user_id", "conv_id", "utterance_idx"
 # -----------------------------------------------------------------------------
 # General utilities
 # -----------------------------------------------------------------------------
-def probe_output_dir(experiment_id: str, model_name: str, dataset_name: str) -> Path:
-    """
-    Canonical probing output directory, co-located with the hidden states
-    the probes were trained on.
 
-    Returns a path of the form:
-        /Volumes/Amirali/hidden_states/runs/<experiment_id>/
-            models/<owner>__<model>/datasets/<dataset>/probing/
-
-    The directory is created on demand; callers may write into it freely.
-    """
-    slug = model_name.replace("/", "__")
-    out = (
-        HIDDEN_STATES_ROOT
-        / "runs" / experiment_id
-        / "models" / slug
-        / "datasets" / dataset_name
-        / "probing"
-    )
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "plots").mkdir(exist_ok=True)
-    (out / "probe_results").mkdir(exist_ok=True)
-    return out
-
-def hidden_states_dir(experiment_id: str, model_name: str, dataset_name: str) -> Path:
-    slug = model_name.replace("/", "__")
-    return (
-        HIDDEN_STATES_ROOT
-        / "runs" / experiment_id
-        / "models" / slug
-        / "datasets" / dataset_name
-    )
 
 def stable_hash(value: Any, length: int = 16) -> str:
     payload = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str).encode()
@@ -196,7 +191,7 @@ def save_json(path: Path, data: Mapping[str, Any]) -> None:
 
 def save_npz(path: Path, **arrays: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **arrays)
+    np.savez(path, **arrays)
 
 
 def seed_everything(seed: int) -> None:
@@ -590,28 +585,28 @@ class ProbeLogger:
 
 class ExtractionArtifact:
     def __init__(self, dataset_dir: Path, verify_checksum: bool = False):
-        self.dataset_dir = dataset_dir.resolve()
-        self.data_dir = self.dataset_dir / "data"
-        self.metadata_dir = self.dataset_dir / "metadata"
-        self.states_path = self.dataset_dir / "hidden_states.npy"
-        self.completed_path = self.dataset_dir / "completed.npy"
-        self.metadata_path = self.dataset_dir / "extraction.json"
+        self.dataset_dir = Path(dataset_dir).resolve()
 
-        # Also update the other paths that use data_dir and metadata_dir:
+        # Flat layout — every artefact sits directly inside dataset_dir.
+        self.states_path     = self.dataset_dir / "hidden_states.npy"
+        self.completed_path  = self.dataset_dir / "completed.npy"
+        self.metadata_path   = self.dataset_dir / "extraction.json"
         self.sample_ids_path = self.dataset_dir / "sample_ids.npy"
         self.text_hashes_path = self.dataset_dir / "text_hashes.npy"
-        self.checksum_path = self.dataset_dir / "checksum.sha256"
+        self.checksum_path   = self.dataset_dir / "checksum.sha256"
 
         missing = [str(p) for p in (
-            self.states_path, self.completed_path, self.metadata_path
+            self.states_path, self.completed_path, self.metadata_path,
         ) if not p.exists()]
         if missing:
-            raise FileNotFoundError("Missing required extraction artifact(s):\n- " + "\n- ".join(missing))
+            raise FileNotFoundError(
+                "Missing required extraction artifact(s):\n- " + "\n- ".join(missing)
+            )
 
         with self.metadata_path.open("r", encoding="utf-8") as f:
             self.metadata = json.load(f)
 
-        self.states = np.load(self.states_path, mmap_mode="r")
+        self.states    = np.load(self.states_path, mmap_mode="r")
         self.completed = np.load(self.completed_path, mmap_mode="r")
 
         self.sample_ids = None
@@ -2068,56 +2063,73 @@ def compute_computational_trial_config(config_dict: dict) -> dict:
 def build_trial_config(
     artifact: ExtractionArtifact,
     config: AnalysisConfig,
-    external_root: Path,
-    experiment_id: str,
-    dataset_name: str,
 ) -> dict:
     dataset_contract = asdict(config.dataset)
     dataset_contract.pop("allow_missing_label_fingerprint", None)
     return {
         "extraction": {
-            "model_name": artifact.model_name,
-            "dataset_name": artifact.dataset_name,
-            "experiment_id": experiment_id,
-            "pooling": artifact.pooling,
-            "max_length": artifact.metadata.get("extraction", {}).get("max_length"),
-            "batch_size": artifact.metadata.get("extraction", {}).get("batch_size"),
-            "storage_dtype": artifact.metadata.get("extraction", {}).get("storage_dtype"),
-            "hidden_layers": artifact.hidden_layers,
-            "hidden_size": artifact.hidden_size,
+            "model_name":          artifact.model_name,
+            "dataset_name":        artifact.dataset_name,
+            "experiment_id":       artifact.experiment_id,
+            "pooling":             artifact.pooling,
+            "max_length":          artifact.metadata.get("extraction", {}).get("max_length"),
+            "batch_size":          artifact.metadata.get("extraction", {}).get("batch_size"),
+            "storage_dtype":       artifact.metadata.get("extraction", {}).get("storage_dtype"),
+            "hidden_layers":       artifact.hidden_layers,
+            "hidden_size":         artifact.hidden_size,
             "dataset_fingerprint": artifact.dataset_fingerprint,
-            "model_snapshot": artifact.metadata.get("model", {}).get("snapshot"),
+            "model_snapshot":      artifact.metadata.get("model", {}).get("snapshot"),
         },
         "dataset_contract": dataset_contract,
-        "probes": [asdict(p) for p in config.probes],
-        "split": asdict(config.split),
+        "probes":           [asdict(p) for p in config.probes],
+        "split":            asdict(config.split),
         "analysis": {
-            "layers": config.layers,
-            "repeats": config.repeats,
-            "max_samples": config.max_samples,
-            "shuffled_label_control": config.shuffled_label_control,
-            "shuffled_control_repeats": config.shuffled_control_repeats,
-            "run_control_on_all_layers": config.run_control_on_all_layers,
-            "pca_enabled": config.pca_enabled,
-            "pca_samples": config.pca_samples,
-            "silhouette_enabled": config.silhouette_enabled,
-            "silhouette_samples": config.silhouette_samples,
-            "enable_abstention": config.enable_abstention,
-            "enable_per_class_metrics": config.enable_per_class_metrics,
-            "enable_feature_statistics": config.enable_feature_statistics,
-            "score_weights": config.score_weights,
-            "complexity_penalty_scale": config.complexity_penalty_scale,
-            "output_subdir": config.output_subdir,
-            "verbose": config.verbose,
+            "layers":                     config.layers,
+            "repeats":                    config.repeats,
+            "max_samples":                config.max_samples,
+            "shuffled_label_control":     config.shuffled_label_control,
+            "shuffled_control_repeats":   config.shuffled_control_repeats,
+            "run_control_on_all_layers":  config.run_control_on_all_layers,
+            "pca_enabled":                config.pca_enabled,
+            "pca_samples":                config.pca_samples,
+            "silhouette_enabled":         config.silhouette_enabled,
+            "silhouette_samples":         config.silhouette_samples,
+            "enable_abstention":          config.enable_abstention,
+            "enable_per_class_metrics":   config.enable_per_class_metrics,
+            "enable_feature_statistics":  config.enable_feature_statistics,
+            "score_weights":              config.score_weights,
+            "complexity_penalty_scale":   config.complexity_penalty_scale,
+            "output_subdir":              config.output_subdir,
+            "verbose":                    config.verbose,
         },
         "probe_version": SCRIPT_VERSION,
     }
 
-
 def generate_trial_hash(config_dict: dict) -> str:
     return stable_hash(config_dict, length=12)
 
+def build_probe_run_key(
+    config_dict: dict,
+    trial_hash: str,
+    *,
+    max_prefix_len: int = 140,
+) -> str:
+    """Human-readable + unique probe-run folder name.
 
+    Format:
+        <model>__<dataset>__<probes>__L<n_layers>__R<repeats>__S<max>__h<hash10>
+    """
+    ext = config_dict["extraction"]
+    model  = ext["model_name"].replace("/", "-").replace("__", "-")
+    dataset = ext["dataset_name"]
+    probes  = "+".join(p["name"] for p in config_dict["probes"])
+    layers  = ext.get("hidden_layers", "?")
+    repeats = config_dict["analysis"]["repeats"]
+    max_s   = config_dict["analysis"]["max_samples"] or "full"
+    prefix  = f"{model}__{dataset}__{probes}__L{layers}__R{repeats}__S{max_s}"
+    if len(prefix) > max_prefix_len:
+        prefix = prefix[: max_prefix_len - 12]
+    return f"{prefix}__h{trial_hash[:10]}"
 def build_trial_dir_name(
     config_dict: dict,
     trial_hash: str,
@@ -2140,23 +2152,30 @@ def build_trial_dir_name(
 
 
 def find_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
-    for run_dir in base_dir.glob("probe_run__*"):
-        meta_path = run_dir / "complete_run_metadata.json"
-        if not meta_path.exists():
-            continue
-        try:
-            meta = json.loads(meta_path.read_text())
-            stored_comp_hash = meta.get("extra_info", {}).get("computational_hash")
-            if stored_comp_hash is None:
-                trial_cfg = meta.get("extra_info", {}).get("trial_config")
-                if trial_cfg:
-                    stored_comp_hash = generate_trial_hash(
-                        compute_computational_trial_config(trial_cfg)
-                    )
-            if stored_comp_hash == comp_hash:
-                return run_dir
-        except Exception:
-            continue
+    """Return the probe-run directory whose stored config hashes to comp_hash.
+
+    Supports both the legacy "probe_run__*" prefix and the new layout,
+    because a project in transition will have both.
+    """
+    patterns = ("probe_run__*", "*__h*")   # legacy + new
+    for pattern in patterns:
+        for run_dir in base_dir.glob(pattern):
+            meta_path = run_dir / "complete_run_metadata.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text())
+                stored = meta.get("extra_info", {}).get("computational_hash")
+                if stored is None:
+                    trial_cfg = meta.get("extra_info", {}).get("trial_config")
+                    if trial_cfg:
+                        stored = generate_trial_hash(
+                            compute_computational_trial_config(trial_cfg)
+                        )
+                if stored == comp_hash:
+                    return run_dir
+            except Exception:
+                continue
     return None
 
 
@@ -2169,72 +2188,70 @@ class UnifiedProbeAnalyzer:
         self,
         artifact: ExtractionArtifact,
         config: AnalysisConfig,
-        output_dir: Path | None = None,
         dataset_df: pd.DataFrame | Any | None = None,
     ):
         config.validate_verbose()
         self.artifact = artifact
-        self.config = config
-        self.device = choose_device()
-        self.logger = ProbeLogger(config.verbose)
+        self.config   = config
+        self.device   = choose_device()
+        self.logger   = ProbeLogger(config.verbose)
 
         self.logger.section("INITIALISING UNIFIED HIDDEN-STATE PROBE", 1)
 
-        self.df = to_dataframe(dataset_df) if dataset_df is not None else load_dataframe(config.dataset)
+        self.df = to_dataframe(dataset_df) if dataset_df is not None \
+                  else load_dataframe(config.dataset)
         if len(self.df) != artifact.sample_count:
             raise RuntimeError(
-                f"Dataset rows={len(self.df)} != hidden-state samples={artifact.sample_count}. "
-                "This is a hard alignment failure."
+                f"Dataset rows={len(self.df)} != hidden-state samples="
+                f"{artifact.sample_count}. Hard alignment failure."
             )
 
         self.y, self.classes, self.target_meta = build_targets(self.df, config.dataset)
-        self.task_type = self.target_meta["task_type"]
-        self.target_validation = validate_targets(self.y, self.classes, self.task_type)
-        self.text_alignment = validate_text_alignment(artifact, self.df, config.dataset)
-        self.label_alignment = validate_label_alignment(artifact, self.df, config.dataset, self.y, self.classes)
+        self.task_type          = self.target_meta["task_type"]
+        self.target_validation  = validate_targets(self.y, self.classes, self.task_type)
+        self.text_alignment     = validate_text_alignment(artifact, self.df, config.dataset)
+        self.label_alignment    = validate_label_alignment(
+            artifact, self.df, config.dataset, self.y, self.classes
+        )
 
         if self.text_alignment.get("verified") and not self.label_alignment.get("verified"):
             self.label_alignment["verification_basis"] = (
-                "Label row order inherits verification from the cryptographically matched "
-                "text sequence in the same dataframe."
+                "Label row order inherits verification from the cryptographically "
+                "matched text sequence in the same dataframe."
             )
 
         self.layers = self._resolve_layers(config.layers)
 
-        trial_cfg = build_trial_config(
-            artifact=artifact,
-            config=config,
-            external_root=Path(EXTERNAL_ROOT_DEFAULT),
-            experiment_id=artifact.experiment_id or "unknown",
-            dataset_name=artifact.dataset_name,
-        )
-        trial_hash = generate_trial_hash(trial_cfg)
-        folder_name = build_trial_dir_name(trial_cfg, trial_hash)
+        # ── Output root: PROBE_ROOT mirrors HIDDEN_STATES_ROOT exactly. ──
+        trial_cfg   = build_trial_config(artifact=artifact, config=config)
+        trial_hash  = generate_trial_hash(trial_cfg)
+        folder_name = build_probe_run_key(trial_cfg, trial_hash)
 
-        base_output = artifact.dataset_dir / config.output_subdir
+        base_output = probe_dir_for(artifact.model_name, artifact.dataset_name)
+        base_output.mkdir(parents=True, exist_ok=True)
+
         output_dir = base_output / folder_name
 
+        # Recover a prior run whose computational hash matches, even if the
+        # folder name differs (e.g. different SCRIPT_VERSION string).
         if not output_dir.exists():
-            comp_cfg = compute_computational_trial_config(trial_cfg)
-            comp_hash = generate_trial_hash(comp_cfg)
-            existing = find_matching_run_dir(base_output, comp_hash)
+            comp_hash = generate_trial_hash(compute_computational_trial_config(trial_cfg))
+            existing  = find_matching_run_dir(base_output, comp_hash)
             if existing is not None:
-                self.logger.emit(f"Found existing run with matching computational config: {existing}")
-                self.logger.emit(f"Renaming to expected directory {output_dir}")
+                self.logger.emit(f"Found existing run with matching config: {existing}")
                 existing.rename(output_dir)
-                output_dir = existing
 
         if output_dir.exists() and (output_dir / "completion.json").exists():
             self.logger.emit(f"Trial already completed: {output_dir}", 1)
-            self.output_dir = output_dir
             self.skip_run = True
         else:
             self.logger.emit(f"Starting new trial: {output_dir}", 1)
-            self.output_dir = safe_relative_output(artifact.dataset_dir, output_dir)
+            safe_relative_output(PROBE_ROOT, output_dir)   # keep the sandbox guard
             self.skip_run = False
 
+        self.output_dir = output_dir
         self.trial_config = trial_cfg
-        self.trial_hash = trial_hash
+        self.trial_hash   = trial_hash
 
         self._preflight()
 
@@ -2247,7 +2264,46 @@ class UnifiedProbeAnalyzer:
             f"Alignment: text={self.text_alignment['status']} | labels={self.label_alignment['status']}",
             1,
         )
+        
+    def _update_probe_index(self) -> None:
+        """Refresh <dataset>/probe/index.json with a registry of all runs.
 
+        The analyser reads this single file to discover probe results without
+        walking the whole tree.
+        """
+        index_path = self.output_dir.parent / "index.json"
+        entry = {
+            "run_key":        self.output_dir.name,
+            "trial_hash":     self.trial_hash,
+            "model":          self.artifact.model_name,
+            "dataset":        self.artifact.dataset_name,
+            "probes":         [p.name for p in self.config.probes],
+            "repeats":        self.config.repeats,
+            "max_samples":    self.config.max_samples,
+            "layers":         len(self.layers),
+            "task_type":      self.task_type,
+            "n_classes":      len(self.classes),
+            "completed_at":   time.time(),
+            "results_csv":    str((self.output_dir / "layer_probe_results.csv").relative_to(index_path.parent)),
+            "best_csv":       str((self.output_dir / "final_probe_score_matrix.csv").relative_to(index_path.parent)),
+            "metadata_json":  str((self.output_dir / "complete_run_metadata.json").relative_to(index_path.parent)),
+        }
+        current = {"runs": []}
+        if index_path.exists():
+            try:
+                current = json.loads(index_path.read_text())
+            except Exception:
+                pass
+
+        current["runs"] = [r for r in current.get("runs", [])
+                        if r.get("run_key") != entry["run_key"]]
+        current["runs"].append(entry)
+        current["updated_at"] = time.time()
+
+        tmp = index_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(current, indent=2, default=str))
+        os.replace(tmp, index_path)
+        
     def _resolve_layers(self, requested):
         available = [f"layer_{i}" for i in range(self.artifact.hidden_layers)]
         if requested == "all":
@@ -2816,6 +2872,7 @@ class UnifiedProbeAnalyzer:
         # Store best for return
         self._best_df = best
         self._scored_df = scored
+        self._update_probe_index()
 
 
 # -----------------------------------------------------------------------------
@@ -2950,44 +3007,44 @@ def lookup_result_by_hash(checkpoint_dir: Path, hash_or_filename: str) -> dict:
 
 def validate_checkpoint_consistency(checkpoint_dir: Path, verbose: bool = True) -> bool:
     checkpoint_file = checkpoint_dir / "probe_matrix_checkpoint.json"
-    results_subdir = checkpoint_dir / "per_entry_results"
+    results_subdir  = checkpoint_dir / "per_entry_results"
     if not checkpoint_file.exists():
         if verbose:
             print("[validate] Checkpoint file not found.")
         return True
 
-    with open(checkpoint_file) as f:
-        checkpoint = json.load(f)
+    checkpoint = json.loads(checkpoint_file.read_text())
+    completed  = checkpoint.get("completed", {})
+    inconsistent: list[tuple[str, str]] = []
 
-    completed = checkpoint.get("completed", {})
-    inconsistent = []
     for key, info in completed.items():
         trial_hash = info.get("trial_hash")
-        stored_config = info.get("trial_config")
+        stored_comp = info.get("comp_hash")
         expected_file = results_subdir / f"{trial_hash}_layer_probe_results.csv"
         if not expected_file.exists():
-            inconsistent.append((key, "missing file"))
+            inconsistent.append((key, "missing result CSV"))
             continue
-        if stored_config is not None:
-            computed_hash = generate_trial_hash(stored_config)
-            if computed_hash != trial_hash:
-                inconsistent.append((key, "hash mismatch (stored config)"))
+        if stored_comp is None:
+            # Old checkpoints written before comp_hash existed. Skip rather
+            # than flag; run_matrix will re-run them on the next pass.
+            continue
+        # Nothing to recompute here — comp_hash is authoritative and stored.
+        # We only verify file presence above.
+
     if inconsistent:
         if verbose:
             print("[validate] Inconsistencies found:")
             for k, reason in inconsistent:
                 print(f"  - {k}: {reason}")
         return False
-    else:
-        if verbose:
-            print("[validate] Checkpoint is consistent.")
-        return True
+    if verbose:
+        print("[validate] Checkpoint is consistent.")
+    return True
 
 
 def run_matrix(
     entries: Sequence[Mapping[str, Any]],
     *,
-    external_root: Path,
     experiment_id: str,
     probes: Sequence[ProbeSpec],
     split: SplitConfig | None = None,
@@ -2999,36 +3056,40 @@ def run_matrix(
     shuffled_control_repeats: int = 3,
 ) -> pd.DataFrame:
     split = split or SplitConfig(train=0.80, validation=0.10, test=0.10, seed=42)
-    if not validate_checkpoint_consistency(checkpoint_dir, verbose=verbose):
-        print("!!![!warning!]!!! Checkpoint inconsistencies detected. Consider running migration or cleaning !")
+
     if checkpoint_dir is None:
-        checkpoint_dir = external_root / "experiments" / experiment_id / "matrix_checkpoint"
+        # The checkpoint lives alongside the probe outputs it summarizes.
+        checkpoint_dir = PROBE_ROOT / "_matrix_checkpoint"
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_file = checkpoint_dir / "probe_matrix_checkpoint.json"
-    results_subdir = checkpoint_dir / "per_entry_results"
+    results_subdir  = checkpoint_dir / "per_entry_results"
     results_subdir.mkdir(exist_ok=True)
+
+    if not validate_checkpoint_consistency(checkpoint_dir, verbose=verbose):
+        print("!!![!warning!]!!! Checkpoint inconsistencies detected.")
 
     checkpoint = {"completed": {}, "errors": []}
     if checkpoint_file.exists():
         try:
-            with open(checkpoint_file, "r") as f:
-                checkpoint = json.load(f)
+            checkpoint = json.loads(checkpoint_file.read_text())
         except Exception:
             if verbose >= 1:
-                print(f"[checkpoint] Could not load checkpoint file {checkpoint_file}; starting fresh.")
+                print(f"[checkpoint] Could not load {checkpoint_file}; starting fresh.")
 
-    per_entry_results = []
-    error_records = []
+    per_entry_results: list[pd.DataFrame] = []
+    error_records:     list[dict]         = []
 
     for i, entry in enumerate(entries, start=1):
-        model_name = str(entry["model"])
+        model_name   = str(entry["model"])
         dataset_name = str(entry["dataset"])
 
-        art = ExtractionArtifact(
-            dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name)
-        )
+        # ── Canonical artifact dir: explicitly provided by discovery, or
+        #    derived from the flat layout. Never rebuilt from scratch. ──
+        artifact_dir = Path(entry.get("artifact_dir") or artifact_dir_for(model_name, dataset_name))
+        art = ExtractionArtifact(artifact_dir)
+
         cfg = AnalysisConfig(
             dataset=entry["contract"],
             probes=list(probes),
@@ -3047,97 +3108,75 @@ def run_matrix(
             verbose=verbose,
         )
 
-        trial_cfg = build_trial_config(art, cfg, external_root, experiment_id, dataset_name)
-        trial_hash = generate_trial_hash(trial_cfg)
-        unique_key = f"{model_name}::{dataset_name}::{trial_hash}"
-        folder_name = build_trial_dir_name(trial_cfg, trial_hash)
-        out_dir = (
-            dataset_dir_from_args(external_root, experiment_id, model_name, dataset_name)
-            / "analysis" / "probes" / "matrix_runs" / folder_name
-        )
-        result_csv = results_subdir / f"{trial_hash}_layer_probe_results.csv"
+        trial_cfg   = build_trial_config(art, cfg)
+        trial_hash  = generate_trial_hash(trial_cfg)
+        comp_hash   = generate_trial_hash(compute_computational_trial_config(trial_cfg))
+        unique_key  = f"{model_name}::{dataset_name}::{trial_hash}"
 
-        comp_cfg = compute_computational_trial_config(trial_cfg)
-        comp_hash = generate_trial_hash(comp_cfg)
+        result_csv  = results_subdir / f"{trial_hash}_layer_probe_results.csv"
 
         if verbose >= 1:
-            print(f"[matrix] {i}/{len(entries)} | {model_name} | {dataset_name} | trial {trial_hash[:8]}")
+            print(f"[matrix] {i}/{len(entries)} | {model_name} | {dataset_name} | {trial_hash[:8]}")
 
+        # ── Resume path ──
         if unique_key in checkpoint.get("completed", {}):
-            stored_info = checkpoint["completed"][unique_key]
-            if stored_info.get("comp_hash") == comp_hash:
-                stored_config = stored_info.get("trial_config", None)
-                if stored_config is not None and stored_config != trial_cfg:
-                    if verbose >= 1:
-                        print(f"[checkpoint] Stored config for {unique_key} differs from current. Ignoring old result.")
-                else:
-                    if verbose >= 1:
-                        print(f"[checkpoint] Already completed, loading from {result_csv.name}")
-                    if result_csv.exists():
-                        try:
-                            df = pd.read_csv(result_csv)
-                            per_entry_results.append(df)
-                        except Exception as e:
-                            print(f"[checkpoint] Failed to load {result_csv}: {e}. Will re-run this entry.")
-                            checkpoint["completed"].pop(unique_key, None)
-                        else:
-                            continue
-                    else:
-                        print(f"[checkpoint] Checkpoint says completed but result file missing. Re-running.")
-                        checkpoint["completed"].pop(unique_key, None)
+            info = checkpoint["completed"][unique_key]
+            if info.get("comp_hash") == comp_hash and result_csv.exists():
+                if verbose >= 1:
+                    print(f"[checkpoint] Resuming from {result_csv.name}")
+                try:
+                    per_entry_results.append(pd.read_csv(result_csv))
+                    continue
+                except Exception as exc:
+                    print(f"[checkpoint] Failed to load {result_csv}: {exc}. Re-running.")
+                    checkpoint["completed"].pop(unique_key, None)
             else:
-                print("re-running ...   No Checkpoint Data.")
+                if verbose >= 1:
+                    print("[checkpoint] Stored config differs — re-running.")
+                checkpoint["completed"].pop(unique_key, None)
 
+        # ── Fresh run ──
         try:
-            analyzer = UnifiedProbeAnalyzer(art, cfg, out_dir, dataset_df=entry.get("dataset_df"))
+            analyzer = UnifiedProbeAnalyzer(art, cfg, dataset_df=entry.get("dataset_df"))
             scored, _ = analyzer.run()
 
             scored = scored.copy()
-            scored["model"] = model_name
-            scored["dataset"] = dataset_name
-            scored["artifact_dir"] = str(out_dir)
-            scored["metadata_path"] = str(out_dir / "complete_run_metadata.json")
-            scored["trial_hash"] = trial_hash
+            scored["model"]         = model_name
+            scored["dataset"]       = dataset_name
+            scored["artifact_dir"]  = str(analyzer.output_dir)
+            scored["metadata_path"] = str(analyzer.output_dir / "complete_run_metadata.json")
+            scored["trial_hash"]    = trial_hash
 
             scored.to_csv(result_csv, index=False)
             update_results_index(checkpoint_dir, result_csv, model_name, dataset_name, trial_hash)
-            if verbose >= 1:
-                print(f"[checkpoint] Saved {result_csv.name}")
 
             per_entry_results.append(scored)
-
             checkpoint["completed"][unique_key] = {
-                "model": model_name,
-                "dataset": dataset_name,
-                "trial_hash": trial_hash,
-                "comp_hash": comp_hash,
-                "trial_config": trial_cfg,
-                "result_csv": str(result_csv),
-                "completed_at": time.time(),
+                "model":          model_name,
+                "dataset":        dataset_name,
+                "trial_hash":     trial_hash,
+                "comp_hash":      comp_hash,
+                "result_csv":     str(result_csv),
+                "artifact_dir":   str(analyzer.output_dir),
+                "completed_at":   time.time(),
             }
             _save_checkpoint(checkpoint_file, checkpoint)
 
-        except Exception as e:
-            if verbose >= 0:
-                print(f"[matrix] ERROR for {model_name}/{dataset_name}: {type(e).__name__}: {e}")
+        except Exception as exc:
+            print(f"[matrix] ERROR {model_name}/{dataset_name}: {type(exc).__name__}: {exc}")
             error_records.append({
-                "model": model_name,
-                "dataset": dataset_name,
+                "model": model_name, "dataset": dataset_name,
                 "trial_hash": trial_hash,
-                "error_type": type(e).__name__,
-                "error_message": str(e),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
                 "status": "failed",
             })
 
-    if per_entry_results:
-        full_df = pd.concat(per_entry_results, ignore_index=True)
-    else:
-        full_df = pd.DataFrame()
+    full_df = pd.concat(per_entry_results, ignore_index=True) if per_entry_results else pd.DataFrame()
 
     if error_records:
-        error_df = pd.DataFrame(error_records)
         error_csv = checkpoint_dir / "probe_errors.csv"
-        error_df.to_csv(error_csv, index=False)
+        pd.DataFrame(error_records).to_csv(error_csv, index=False)
         if verbose >= 0:
             print(f"[matrix] {len(error_records)} entries failed. See {error_csv}.")
 

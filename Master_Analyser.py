@@ -760,7 +760,11 @@ class ProjectAnalyser:
         csv_files.extend(self.exp_root.glob("**/analysis/probes/**/layer_probe_results.csv"))
         # Also from matrix_runs
         csv_files.extend(self.exp_root.glob("**/analysis/probes/matrix_runs/*/layer_probe_results.csv"))
+        # new canonical location
+        csv_files.extend(self.result_root.glob("**/probe/*/layer_probe_results.csv"))
 
+        self.analyzer_plots = self.result_root.glob("**/probe/*/plots")
+        
         # Deduplicate
         csv_files = list(set(csv_files))
         csv_files = [f for f in csv_files if not f.name.startswith("._")]
