@@ -73,6 +73,43 @@ except ImportError:
 # Environment helpers
 # -----------------------------------------------------------------------------
 
+# =============================================================================
+# MODULE CONSTANTS
+# =============================================================================
+
+# Reproducibility / configuration defaults
+DEFAULT_SEED = 42
+VERBOSE_DEFAULT = 1
+
+# Script identity
+SCRIPT_VERSION = "4.5"
+
+# External storage
+EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/hidden_states")
+EXTERNAL_ROOT = EXTERNAL_ROOT_DEFAULT
+
+# Hidden-state artifacts and probe outputs use the same experiment root.
+HIDDEN_STATES_ROOT = EXTERNAL_ROOT_DEFAULT
+PROBE_ROOT = HIDDEN_STATES_ROOT
+
+# =============================================================================
+# MODULE CONSTANTS / PATHS
+# =============================================================================
+
+DEFAULT_SEED = 42
+VERBOSE_DEFAULT = 1
+SCRIPT_VERSION = "4.5"
+
+EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/hidden_states")
+EXTERNAL_ROOT = EXTERNAL_ROOT_DEFAULT
+
+HIDDEN_STATES_ROOT = EXTERNAL_ROOT_DEFAULT
+PROBE_ROOT = HIDDEN_STATES_ROOT
+
+# =============================================================================
+# ENVIRONMENT HELPERS
+# =============================================================================
+
 def get_environment_info() -> dict:
     info = {
         "timestamp": time.time(),
@@ -89,49 +126,36 @@ def get_environment_info() -> dict:
             "pandas": pd.__version__,
             "sklearn": __import__("sklearn").__version__,
             "torch": torch.__version__,
-            "transformers": __import__("transformers").__version__ if importlib.util.find_spec("transformers") else None,
+            "transformers": (
+                __import__("transformers").__version__
+                if importlib.util.find_spec("transformers")
+                else None
+            ),
             "matplotlib": __import__("matplotlib").__version__,
             "seaborn": __import__("seaborn").__version__,
         },
         "device": {
             "chosen": choose_device(),
             "cuda_available": torch.cuda.is_available(),
-            "mps_available": torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False,
+            "mps_available": (
+                torch.backends.mps.is_available()
+                if hasattr(torch.backends, "mps")
+                else False
+            ),
         },
         "memory": {},
     }
+
     if psutil is not None:
         vm = psutil.virtual_memory()
         info["memory"] = {
-            "total_gb": vm.total / (1024**3),
-            "available_gb": vm.available / (1024**3),
-            "used_gb": vm.used / (1024**3),
+            "total_gb": vm.total / (1024 ** 3),
+            "available_gb": vm.available / (1024 ** 3),
+            "used_gb": vm.used / (1024 ** 3),
             "percent_used": vm.percent,
         }
+
     return info
-
-
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-
-AMIRALI_MOUNT       = Path("/Volumes/Amirali")
-
-# Stage roots — each stage owns exactly one and reads from its predecessors.
-DATASETS_ROOT       = AMIRALI_MOUNT / "datasets"
-MODELS_ROOT         = AMIRALI_MOUNT / "models"
-HIDDEN_STATES_ROOT  = AMIRALI_MOUNT / "hidden_states"   # extraction writes here
-PROBE_ROOT          = AMIRALI_MOUNT / "probe"           # probing writes here
-
-DEFAULT_SEED    = 42
-SCRIPT_VERSION  = "4.5.0"
-DEBUG_MODE      = False
-VERBOSE_DEFAULT = 3 if DEBUG_MODE else 0
-
 
 def model_slug(model_name: str) -> str:
     """Mirror Extraction.py's slug: 'Qwen/Qwen2-0.5B' → 'Qwen2-0.5B'."""
@@ -903,21 +927,41 @@ def parse_string_list(value: Any) -> list[str]:
 
 
 def infer_target_type(df: pd.DataFrame, contract: DatasetContract) -> str:
-    if contract.target_type != "auto":
+    """
+    Determine the target adapter.
+
+    Important:
+    - Explicit contract.target_type always wins.
+    - GoEmotions is detected from genuine multi-label 'labels' structure.
+    - A generic 'emotion' column is NOT assumed to mean ISEAR.
+      It is treated as custom unless the contract explicitly says isear.
+    """
+    if contract.target_type and contract.target_type != "auto":
         return contract.target_type.lower()
+
     cols = set(map(str, df.columns))
+
+    # Detect GoEmotions only when its characteristic multi-label structure
+    # is actually present.
     if "labels" in cols:
-        sample = df["labels"].head(20).tolist()
+        sample = df["labels"].head(100).tolist()
         try:
             parsed = [parse_integer_list(x) for x in sample]
             if any(len(v) > 1 for v in parsed):
                 return "goemotions"
         except Exception:
             pass
-        if "emotion" not in cols and "emotion_label" not in cols and "dominant_emotion" not in cols:
+
+        # A labels column without another obvious emotion column is still
+        # likely to be a GoEmotions-style target.
+        if not any(
+            c in cols
+            for c in ("emotion", "emotion_label", "dominant_emotion")
+        ):
             return "goemotions"
-    if any(c in cols for c in ("emotion", "emotion_label", "dominant_emotion")):
-        return "isear" if "dominant_emotion" not in cols and "emotion" in cols else "custom"
+
+    # Never infer ISEAR purely from a column name.
+    # Generic single-label emotion datasets must remain generic/custom.
     return "custom"
 
 
@@ -1049,52 +1093,140 @@ def canonical_goemotions_target(df: pd.DataFrame, contract: DatasetContract):
 
 
 def canonical_isear_target(df: pd.DataFrame, contract: DatasetContract):
+    """
+    Canonicalise ISEAR labels.
+
+    Accepted forms include:
+        1
+        [1]
+        "1"
+        "[1]"
+        "joy"
+        ["joy"]
+
+    ISEAR numeric IDs are 1..7 and are converted to canonical
+    zero-based class IDs 0..6.
+    """
     label_col, resolution = resolve_column(
-        df, contract.label_column,
+        df,
+        contract.label_column,
         ["emotion", "label", "labels", "category", "emotion_label"],
         role="label",
     )
+
     raw_values = df[label_col].tolist()
-    aliases = {"joy": "joy", "fear": "fear", "anger": "anger", "sadness": "sadness", "disgust": "disgust", "shame": "shame", "guilt": "guilt"}
-    if all(isinstance(x, (int, np.integer)) for x in raw_values):
-        order = contract.class_order or ISEAR_CLASSES
-        if len(order) != 7:
-            raise ValueError("ISEAR class_order must contain 7 emotions for numeric mapping.")
-        y = np.asarray([int(x) - 1 for x in raw_values], dtype=np.int64)
-        if np.any(y < 0) or np.any(y >= len(order)):
-            raise ValueError("ISEAR numeric labels out of range.")
-        return y, order, {
-            "adapter": "isear",
-            "task_type": "single_label",
-            "raw_label_column": label_col,
-            "label_resolution": resolution,
-            "class_names": order,
-            "class_count": len(order),
-            "normalisation": "numeric index to class_order",
-        }
-    else:
-        raw = [_normalise_name(x) for x in raw_values]
-        normalised = []
-        for i, x in enumerate(raw):
-            key = aliases.get(x)
-            if key is None:
-                raise ValueError(f"ISEAR row {i} has unknown emotion {x!r}")
-            normalised.append(key)
-        order = contract.class_order or ISEAR_CLASSES
-        mapping = {_normalise_name(name): i for i, name in enumerate(order)}
-        unknown = sorted(set(normalised) - set(_normalise_name(x) for x in order))
-        if unknown:
-            raise ValueError(f"ISEAR labels missing from class_order: {unknown}")
-        y = np.asarray([mapping[_normalise_name(x)] for x in normalised], dtype=np.int64)
-        return y, order, {
-            "adapter": "isear",
-            "task_type": "single_label",
-            "raw_label_column": label_col,
-            "label_resolution": resolution,
-            "class_names": order,
-            "class_count": len(order),
-            "normalisation": "lowercase categorical canonicalisation",
-        }
+
+    order = contract.class_order or ISEAR_CLASSES
+
+    if len(order) != 7:
+        raise ValueError(
+            f"ISEAR class_order must contain exactly 7 emotions, got {len(order)}."
+        )
+
+    aliases = {
+        "joy": "joy",
+        "fear": "fear",
+        "anger": "anger",
+        "sadness": "sadness",
+        "disgust": "disgust",
+        "shame": "shame",
+        "guilt": "guilt",
+    }
+
+    mapping = {
+        _normalise_name(name): i
+        for i, name in enumerate(order)
+    }
+
+    canonical_ids = []
+    input_modes = set()
+
+    for row_index, raw_value in enumerate(raw_values):
+        value = _maybe_literal(raw_value)
+
+        # ---------------------------------------------------------
+        # Sequence form: [1], [2], ["joy"], ["fear"], etc.
+        # ---------------------------------------------------------
+        if isinstance(value, (list, tuple, set, np.ndarray)):
+            seq = list(value)
+
+            if len(seq) != 1:
+                raise ValueError(
+                    f"ISEAR row {row_index} must contain exactly one label; "
+                    f"got {seq!r}"
+                )
+
+            value = seq[0]
+            input_modes.add("single_element_sequence")
+
+        # ---------------------------------------------------------
+        # Numeric ID: 1..7
+        # ---------------------------------------------------------
+        if isinstance(value, (int, np.integer)):
+            numeric_id = int(value)
+
+            if not 1 <= numeric_id <= 7:
+                raise ValueError(
+                    f"ISEAR row {row_index} has numeric label {numeric_id}; "
+                    f"expected integer in 1..7."
+                )
+
+            canonical_ids.append(numeric_id - 1)
+            input_modes.add("numeric_id")
+            continue
+
+        # ---------------------------------------------------------
+        # String forms:
+        #   "1"
+        #   "[1]"
+        #   "joy"
+        # ---------------------------------------------------------
+        if isinstance(value, str):
+            s = value.strip()
+
+            # Numeric string
+            if re.fullmatch(r"[1-7]", s):
+                canonical_ids.append(int(s) - 1)
+                input_modes.add("numeric_id_string")
+                continue
+
+            # Named emotion
+            name = aliases.get(_normalise_name(s))
+
+            if name is not None:
+                canonical_ids.append(mapping[_normalise_name(name)])
+                input_modes.add("string_name")
+                continue
+
+            raise ValueError(
+                f"ISEAR row {row_index} has unknown emotion {value!r}"
+            )
+
+        raise ValueError(
+            f"ISEAR row {row_index} contains unsupported label value "
+            f"{raw_value!r}"
+        )
+
+    y = np.asarray(canonical_ids, dtype=np.int64)
+
+    if len(y) != len(df):
+        raise RuntimeError(
+            f"ISEAR target length {len(y)} != dataframe length {len(df)}"
+        )
+
+    if np.any(y < 0) or np.any(y >= len(order)):
+        raise ValueError("ISEAR canonical labels are outside class range.")
+
+    return y, order, {
+        "adapter": "isear",
+        "task_type": "single_label",
+        "raw_label_column": label_col,
+        "label_resolution": resolution,
+        "class_names": order,
+        "class_count": len(order),
+        "normalisation": "ISEAR numeric/name/list canonicalisation",
+        "label_input_modes": sorted(input_modes),
+    }
 
 
 def canonical_custom_target(df: pd.DataFrame, contract: DatasetContract):
