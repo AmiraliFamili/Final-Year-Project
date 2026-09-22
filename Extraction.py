@@ -2762,47 +2762,25 @@ class RuntimeReporter:
 # CHANGED: no longer takes hyperparameter_hash. Renamed parameter
 # `experiment_id` retained (it is not a hash).
 
-def ensure_auxiliary_files(dataset: Any, paths: dict[str, Path], column: str,
-                            n_samples: int, batch_size: int, device: torch.device,
-                            storage_dtype: np.dtype, show_info: bool = True) -> Dict[str, Any]:
-    actions = []
+def ensure_auxiliary_files(
+    dataset, paths, column, n_samples, batch_size, device,
+    storage_dtype, show_info: bool = True,
+):
+    """Backfill any missing auxiliary files for an existing extraction.
+
+    The order matters: labels are resolved first, so the compatibility
+    check on an existing labels.npy can compare against the *actual*
+    dtype we would write, rather than referencing an undefined variable
+    (which is what caused 'cannot access local variable labels' before).
+    """
+    actions: list[str] = []
     if not paths["states"].exists():
-        return {"actions": actions, "skipped": True, "reason": "hidden_states.npy missing"}
+        return {"actions": actions, "skipped": True,
+                "reason": "hidden_states.npy missing"}
 
     texts = dataset_texts(dataset, column)
-    if paths["labels"].exists():
-        try:
-            existing = np.load(paths["labels"], allow_pickle=False)
-            labels_compatible = (
-                existing.shape == (n_samples,)
-                and existing.dtype == labels.dtype
-                and existing.dtype != object
-            )
-        except Exception:
-            # object array (multi-label), pickle required, or corrupted
-            labels_compatible = False
 
-        if not labels_compatible:
-            os.remove(paths["labels"])
-            actions.append("removed incompatible labels.npy")
-            labels_mmap = np.lib.format.open_memmap(
-                paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,),
-            )
-            labels_mmap[:] = labels
-            flush_array(labels_mmap)
-            actions.append("recreated labels.npy with consistent dtype")
-        else:
-            actions.append("labels.npy already compatible")
-    if not paths["sample_ids"].exists() or not is_v2_sample_ids(paths["sample_ids"]):
-        ids = get_sample_ids(dataset, column, texts)
-        np.save(paths["sample_ids"], ids)
-        actions.append("created/upgraded sample_ids.npy (v2)")
-
-    if not paths["text_hashes"].exists():
-        hashes = get_text_hashes(texts)
-        np.save(paths["text_hashes"], hashes)
-        actions.append("created text_hashes.npy")
-
+    # ── 1. Resolve the label column and build the canonical label array. ──
     label_column = None
     dataset_cols = get_dataset_columns(dataset)
     for cand in ("labels", "label", "target", "emotion"):
@@ -2810,41 +2788,91 @@ def ensure_auxiliary_files(dataset: Any, paths: dict[str, Path], column: str,
             label_column = cand
             break
 
-    if label_column:
-        labels_raw = np.asarray(dataset[label_column])
-        if labels_raw.dtype.kind in ("U", "S", "O"):
-            unique_labels, encoded = np.unique(labels_raw, return_inverse=True)
-            np.save(paths["label_codes"], unique_labels)
-            labels = encoded.astype(np.int32)
-        else:
-            labels = labels_raw.astype(np.int64)
-            if not paths["label_codes"].exists():
-                unique_labels = np.unique(labels)
-                np.save(paths["label_codes"], unique_labels)
+    labels = None            # may stay None if no label column exists
+    labels_mmap = None
 
-        if paths["labels"].exists():
+    if label_column is not None:
+        labels_raw = np.asarray(dataset[label_column], dtype=object)
+
+        is_multi = any(
+            isinstance(x, (list, tuple, set, np.ndarray)) and len(x) > 1
+            for x in labels_raw[:100]
+        )
+
+        if is_multi:
+            all_labels: list = []
+            for x in labels_raw:
+                if isinstance(x, (list, tuple, set, np.ndarray)):
+                    all_labels.extend(x)
+                else:
+                    all_labels.append(x)
+            unique_labels = sorted(set(all_labels), key=str)
+            label_to_id = {lbl: i for i, lbl in enumerate(unique_labels)}
+            labels = np.empty(len(labels_raw), dtype=object)
+            for i, x in enumerate(labels_raw):
+                if isinstance(x, (list, tuple, set, np.ndarray)):
+                    labels[i] = [label_to_id[y] for y in x]
+                else:
+                    labels[i] = [label_to_id[x]]
+            np.save(paths["label_codes"], np.array(unique_labels, dtype=object))
+        else:
+            unique_labels, encoded = np.unique(labels_raw, return_inverse=True)
+            labels = encoded.astype(np.int64)
+            np.save(paths["label_codes"], unique_labels)
+
+    # ── 2. Reconcile labels.npy if it already exists. ──
+    if paths["labels"].exists():
+        compatible = False
+        try:
             existing = np.load(paths["labels"], allow_pickle=False)
-            if existing.shape != (n_samples,) or existing.dtype != labels.dtype:
-                os.remove(paths["labels"])
-                actions.append("removed incompatible labels.npy")
+            if labels is not None:
+                compatible = (
+                    existing.shape == (n_samples,)
+                    and existing.dtype == labels.dtype
+                    and existing.dtype != object
+                )
+            else:
+                compatible = existing.shape == (n_samples,)
+        except Exception:
+            compatible = False
+
+        if not compatible:
+            os.remove(paths["labels"])
+            actions.append("removed incompatible labels.npy")
+            if labels is not None:
                 labels_mmap = np.lib.format.open_memmap(
-                    paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,),
+                    paths["labels"], mode="w+", dtype=labels.dtype,
+                    shape=(n_samples,),
                 )
                 labels_mmap[:] = labels
                 flush_array(labels_mmap)
                 actions.append("recreated labels.npy with consistent dtype")
-            else:
-                actions.append("labels.npy already compatible")
         else:
-            labels_mmap = np.lib.format.open_memmap(
-                paths["labels"], mode="w+", dtype=labels.dtype, shape=(n_samples,),
-            )
-            labels_mmap[:] = labels
-            flush_array(labels_mmap)
-            actions.append("created labels.npy")
+            actions.append("labels.npy already compatible")
+    elif labels is not None:
+        labels_mmap = np.lib.format.open_memmap(
+            paths["labels"], mode="w+", dtype=labels.dtype,
+            shape=(n_samples,),
+        )
+        labels_mmap[:] = labels
+        flush_array(labels_mmap)
+        actions.append("created labels.npy")
     else:
-        actions.append("no label column found")
+        actions.append("no label column found in dataset")
 
+    # ── 3. Sample IDs. ──
+    if not paths["sample_ids"].exists() or not is_v2_sample_ids(paths["sample_ids"]):
+        ids = get_sample_ids(dataset, column, texts)
+        np.save(paths["sample_ids"], ids)
+        actions.append("created/upgraded sample_ids.npy (v2)")
+
+    # ── 4. Text hashes. ──
+    if not paths["text_hashes"].exists():
+        hashes = get_text_hashes(texts)
+        np.save(paths["text_hashes"], hashes)
+        actions.append("created text_hashes.npy")
+
+    # ── 5. Integrity hashes. ──
     if not paths["integrity"].exists():
         states = np.load(paths["states"], mmap_mode="r")
         with paths["integrity"].open("w") as f:
@@ -2852,8 +2880,10 @@ def ensure_auxiliary_files(dataset: Any, paths: dict[str, Path], column: str,
                 end = min(start + batch_size, n_samples)
                 data = np.asarray(states[start:end])
                 h = hashlib.sha256(data.tobytes()).hexdigest()
-                f.write(json.dumps({"batch_start": start, "batch_end": end,
-                                     "hash": h, "timestamp": time.time()}) + "\n")
+                f.write(json.dumps({
+                    "batch_start": start, "batch_end": end,
+                    "hash": h, "timestamp": time.time(),
+                }) + "\n")
         actions.append("created integrity_hashes.jsonl")
 
     return {"actions": actions, "skipped": False}

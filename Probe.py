@@ -100,11 +100,11 @@ DEFAULT_SEED = 42
 VERBOSE_DEFAULT = 1
 SCRIPT_VERSION = "4.5"
 
-EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/hidden_states")
-EXTERNAL_ROOT = EXTERNAL_ROOT_DEFAULT
-
-HIDDEN_STATES_ROOT = EXTERNAL_ROOT_DEFAULT
-PROBE_ROOT = HIDDEN_STATES_ROOT
+AMIRALI_MOUNT       = Path("/Volumes/Amirali")
+EXTERNAL_ROOT       = AMIRALI_MOUNT / "hidden_states"   # Extraction.py output
+HIDDEN_STATES_ROOT  = EXTERNAL_ROOT
+INTEREX_ROOT        = AMIRALI_MOUNT / "interEx"          # Probe.py output
+PROBE_ROOT          = INTEREX_ROOT
 
 # =============================================================================
 # ENVIRONMENT HELPERS
