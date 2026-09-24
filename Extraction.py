@@ -126,23 +126,34 @@ _patch_transformers_torch_load_check()
 # run-level files at the top level. The legacy `RUNS_ROOT` / `ARCHIVE_ROOT`
 # / `HYPERPARAMETER_CONFIG_PATH` constants were deleted because the
 # `/runs/<id>/` tree no longer exists.
+# ── Paths: the single source of truth is _shared.py. ──
+# Never redefine these locally. If you need a new root, add it to _shared.py
+# and import it here.
+from _shared import (                       # noqa: E402
+    AMIRALI_MOUNT,
+    HIDDEN_STATES_ROOT,
+    MODELS_ROOT,
+    DATASETS_ROOT,
+    EXTRACTION_META_ROOT,
+    HF_CACHE_ROOT,
+    HF_HUB_CACHE,
+    HF_XET_CACHE,
+    HF_ASSETS_CACHE,
+)
 
-EXTERNAL_MOUNT = Path("/Volumes/Amirali").resolve()
-EXTERNAL_ROOT = EXTERNAL_MOUNT / "Probing-Emotions"
-MODELS_ROOT = EXTERNAL_MOUNT / "models"
-HIDDEN_STATES_ROOT  = EXTERNAL_MOUNT / "hidden_states"  
+# EXTERNAL_MOUNT and EXTERNAL_ROOT are kept as aliases so nothing else in
+# this file needs to change. EXTERNAL_ROOT used to mean "a folder named
+# Probing-Emotions"; it now means "the top of the project tree".
+EXTERNAL_MOUNT       = AMIRALI_MOUNT
+EXTERNAL_ROOT        = AMIRALI_MOUNT
+HF_ROOT              = HF_CACHE_ROOT
 
-HF_ROOT = EXTERNAL_ROOT / ".hf_cache"
-HF_HUB_CACHE = HF_ROOT / "hub"
-HF_XET_CACHE = HF_ROOT / "xet"
-HF_ASSETS_CACHE = HF_ROOT / "assets"
-
-RUN_MANIFEST_PATH = EXTERNAL_ROOT / "run_manifest.json"
-MODEL_REVISION_MANIFEST = EXTERNAL_ROOT / "model_revisions.json"
-ENVIRONMENT_PATH = EXTERNAL_ROOT / "environment.json"
-RESULTS_PATH = EXTERNAL_ROOT / "results.json"
-LEDGER_PATH = EXTERNAL_ROOT / "ledger.jsonl"
-
+RUN_MANIFEST_PATH       = EXTRACTION_META_ROOT / "run_manifest.json"
+MODEL_REVISION_MANIFEST = EXTRACTION_META_ROOT / "model_revisions.json"
+ENVIRONMENT_PATH        = EXTRACTION_META_ROOT / "environment.json"
+RESULTS_PATH            = EXTRACTION_META_ROOT / "results.json"
+LEDGER_PATH             = EXTRACTION_META_ROOT / "ledger.jsonl"
+PROCESSED_DATASETS_ROOT = DATASETS_ROOT  
 # Order manifest. Looked up in this order:
 #   1. $EXTRACTION_ORDER_PATH (explicit override)
 #   2. <project>/extraction_order.json  (drop the file next to the notebook)
@@ -161,8 +172,6 @@ EXTRACTION_ORDER_PATH = EXTERNAL_ROOT / "extraction_order.json"   # legacy defau
 
 
 
-# Processed dataset source (master_dataset.py contract).
-PROCESSED_DATASETS_ROOT = Path("/Volumes/Amirali/datasets")
 
 PROCESSED_CSV_TEMPLATE = "{name}/processed/{name}_clean.csv"
 PROCESSED_COLUMNS = ("clean_text", "label", "sentiment_score")
@@ -703,17 +712,13 @@ def verify_external_drive() -> None:
 
 
 def configure_external_storage(show_info: bool = False) -> None:
-    """Create the entire directory tree and set HF env vars.
-
-    MUST be called before any model download or storage verification.
-    This is the fix for the historical 'Required external path missing' error.
-    """
     verify_external_drive()
-    for p in (EXTERNAL_ROOT, HF_ROOT, HF_HUB_CACHE, HF_XET_CACHE, HF_ASSETS_CACHE):
+    for p in (HF_ROOT, HF_HUB_CACHE, HF_XET_CACHE, HF_ASSETS_CACHE,
+              EXTRACTION_META_ROOT, HIDDEN_STATES_ROOT, MODELS_ROOT):
         p.mkdir(parents=True, exist_ok=True)
-    os.environ["HF_HOME"] = str(HF_ROOT)
-    os.environ["HF_HUB_CACHE"] = str(HF_HUB_CACHE)
-    os.environ["HF_XET_CACHE"] = str(HF_XET_CACHE)
+    os.environ["HF_HOME"]         = str(HF_ROOT)
+    os.environ["HF_HUB_CACHE"]    = str(HF_HUB_CACHE)
+    os.environ["HF_XET_CACHE"]    = str(HF_XET_CACHE)
     os.environ["HF_ASSETS_CACHE"] = str(HF_ASSETS_CACHE)
     if show_info:
         print(f"  ✓ HF cache configured: {HF_HUB_CACHE}")
@@ -3347,9 +3352,19 @@ def extract_dataset(
                 reporter.set_stage("memmap_write")
                 t = time.perf_counter()
                 pooled_final = pooled_np.astype(storage_dtype, copy=False)
+                # 1. Write the payload — no commit bit yet.
                 for j, orig_idx in enumerate(batch_indices):
                     states[orig_idx] = pooled_final[j]
+
+                # 2. Make the payload durable BEFORE writing any commit bit.
+                flush_array(states)          # does .flush() + os.fsync()
+
+                # 3. Now write the commit bits.
+                for orig_idx in batch_indices:
                     completed[orig_idx] = True
+
+                # 4. completed.npy's fsync can be deferred — the commit bits being lost
+                #    just means the batch gets rewritten next run, with the same values.
                 write_s = time.perf_counter() - t
 
                 # CHANGED: removed dead `update_checksum(pooled_final)` call.

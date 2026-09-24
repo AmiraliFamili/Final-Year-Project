@@ -1,0 +1,2 @@
+model,dataset,run_key,align_text,align_labels,sample_ids_match,split_overlap_max,split_repeats,n_layers,n_probes,best_macro_f1,best_layer,best_probe,first_layer_f1,last_layer_f1,control_max_f1,selectivity
+Qwen2-0.5B,isear,Qwen-Qwen2-0.5B__isear__linear_logistic+mlp_1_hidden+mlp_2_hidden+mlp_3_hidden__L25__R4__Sfull__ha719251697,verified,unverified,,0,4,25,4,0.689539248838308,11,mlp_1_hidden,0.5578039834101789,0.5852094314988798,0.1524443480045399,0.5370949008337681

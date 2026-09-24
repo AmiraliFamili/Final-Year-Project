@@ -84,27 +84,33 @@ VERBOSE_DEFAULT = 1
 # Script identity
 SCRIPT_VERSION = "4.5"
 
-# External storage
-EXTERNAL_ROOT_DEFAULT = Path("/Volumes/Amirali/hidden_states")
-EXTERNAL_ROOT = EXTERNAL_ROOT_DEFAULT
 
-# Hidden-state artifacts and probe outputs use the same experiment root.
-HIDDEN_STATES_ROOT = EXTERNAL_ROOT_DEFAULT
-PROBE_ROOT = HIDDEN_STATES_ROOT
+# ── Paths: the single source of truth is _shared.py. ──
+from _shared import (                      # noqa: E402
+    AMIRALI_MOUNT,
+    HIDDEN_STATES_ROOT,
+    INTEREX_ROOT,
+    PROBE_ROOT,
+    MODELS_ROOT,
+    DATASETS_ROOT,
+    model_slug,
+    artifact_dir as _shared_artifact_dir,
+    interex_dir   as _shared_interex_dir,
+)
 
-# =============================================================================
-# MODULE CONSTANTS / PATHS
-# =============================================================================
+EXTERNAL_ROOT_DEFAULT = HIDDEN_STATES_ROOT   # legacy alias
+EXTERNAL_ROOT         = HIDDEN_STATES_ROOT   # legacy alias
+PROCESSED_DATASETS_ROOT = DATASETS_ROOT  
 
-DEFAULT_SEED = 42
-VERBOSE_DEFAULT = 1
-SCRIPT_VERSION = "4.5"
+def artifact_dir_for(model_name: str, dataset_name: str) -> Path:
+    """Where Extraction.py wrote the frozen hidden states for this pair."""
+    return _shared_artifact_dir(model_slug(model_name), dataset_name)
 
-AMIRALI_MOUNT       = Path("/Volumes/Amirali")
-EXTERNAL_ROOT       = AMIRALI_MOUNT / "hidden_states"   # Extraction.py output
-HIDDEN_STATES_ROOT  = EXTERNAL_ROOT
-INTEREX_ROOT        = AMIRALI_MOUNT / "interEx"          # Probe.py output
-PROBE_ROOT          = INTEREX_ROOT
+
+def probe_dir_for(model_name: str, dataset_name: str) -> Path:
+    """Where Probe.py writes probe runs for this pair."""
+    return _shared_interex_dir(model_slug(model_name), dataset_name)
+
 
 # =============================================================================
 # ENVIRONMENT HELPERS
@@ -1228,14 +1234,82 @@ def canonical_isear_target(df: pd.DataFrame, contract: DatasetContract):
         "label_input_modes": sorted(input_modes),
     }
 
+def canonical_dimensional_target(df: pd.DataFrame, contract: DatasetContract):
+    """Continuous-vector targets. Returns (N, D) float32 and D dimension names."""
+    # EmoBank exposes V/A/D as three columns rather than one vector column.
+    if all(c in df.columns for c in ("V", "A", "D")):
+        cols = ["V", "A", "D"]
+        y = df[cols].to_numpy(dtype=np.float32)
+        if not np.isfinite(y).all():
+            raise ValueError("VAD target contains NaN or Inf")
+        return y, cols, {
+            "adapter": "dimensional",
+            "task_type": "dimensional",
+            "raw_label_column": "__VAD__",
+            "class_names": cols,
+            "class_count": len(cols),
+            "dimension_count": len(cols),
+        }
 
+    label_col, resolution = resolve_column(
+        df, contract.label_column,
+        ["label", "labels", "target", "targets", "vad", "embedding"],
+        role="label",
+    )
+    rows = []
+    for i, x in enumerate(df[label_col].tolist()):
+        x = _maybe_literal(x)
+        if not isinstance(x, (list, tuple, np.ndarray)):
+            raise ValueError(
+                f"Dimensional row {i} is not a vector: {type(x).__name__}"
+            )
+        rows.append([float(v) for v in x])
+    y = np.asarray(rows, dtype=np.float32)
+    if y.ndim != 2:
+        raise ValueError(f"Dimensional target shape {y.shape}, expected (N, D)")
+    if not np.isfinite(y).all():
+        raise ValueError("Dimensional target contains NaN or Inf")
+
+    dims = contract.class_order or [f"dim_{i}" for i in range(y.shape[1])]
+    if len(dims) != y.shape[1]:
+        raise ValueError(
+            f"class_order has {len(dims)} entries but target has "
+            f"{y.shape[1]} dimensions"
+        )
+    return y, list(dims), {
+        "adapter": "dimensional",
+        "task_type": "dimensional",
+        "raw_label_column": label_col,
+        "label_resolution": resolution,
+        "class_names": list(dims),
+        "class_count": y.shape[1],
+        "dimension_count": y.shape[1],
+    }
 def canonical_custom_target(df: pd.DataFrame, contract: DatasetContract):
-    label_col, resolution = resolve_column(df, contract.label_column, COMMON_LABEL_COLUMNS, role="label")
+    label_col, resolution = resolve_column(
+        df, contract.label_column, COMMON_LABEL_COLUMNS, role="label"
+    )
     raw = df[label_col].tolist()
-    task_type = contract.task_type
 
-    if task_type == "multi_label" or (task_type == "auto" and any(isinstance(_maybe_literal(x), (list, tuple, set)) for x in raw)):
-        label_lists = [parse_string_list(x) for x in raw]
+    # ── Unwrap single-element lists: [0] → 0, ["joy"] → "joy". ──
+    unwrapped: list = []
+    for x in raw:
+        x = _maybe_literal(x)
+        if isinstance(x, (list, tuple, set, np.ndarray)) and len(x) == 1:
+            x = list(x)[0]
+        unwrapped.append(x)
+
+    task_type = contract.task_type
+    if task_type == "auto":
+        task_type = "multi_label" if any(
+            isinstance(x, (list, tuple, set, np.ndarray)) for x in unwrapped
+        ) else "single_label"
+
+    # ─────────────────────────────────────────────────────────────────
+    # Multi-label: existing behaviour, unchanged.
+    # ─────────────────────────────────────────────────────────────────
+    if task_type == "multi_label":
+        label_lists = [parse_string_list(x) for x in unwrapped]
         classes = contract.class_order or sorted({x for row in label_lists for x in row})
         mapping = {str(name): i for i, name in enumerate(classes)}
         y = np.zeros((len(label_lists), len(classes)), dtype=np.int64)
@@ -1243,9 +1317,9 @@ def canonical_custom_target(df: pd.DataFrame, contract: DatasetContract):
             if not row:
                 raise ValueError(f"Custom multi-label row {i} has no labels")
             for label in row:
-                if label not in mapping:
+                if str(label) not in mapping:
                     raise ValueError(f"Unknown custom label {label!r} at row {i}")
-                y[i, mapping[label]] = 1
+                y[i, mapping[str(label)]] = 1
         return y, classes, {
             "adapter": "custom",
             "task_type": "multi_label",
@@ -1255,33 +1329,103 @@ def canonical_custom_target(df: pd.DataFrame, contract: DatasetContract):
             "class_count": len(classes),
         }
 
-    scalar = [str(x) for x in raw]
-    classes = contract.class_order or sorted(pd.unique(np.asarray(scalar, dtype=object)).tolist())
-    mapping = {name: i for i, name in enumerate(classes)}
-    unknown = sorted(set(scalar) - set(mapping))
-    if unknown:
-        raise ValueError(f"Unknown custom labels: {unknown}")
-    y = np.asarray([mapping[x] for x in scalar], dtype=np.int64)
-    return y, classes, {
+    # ─────────────────────────────────────────────────────────────────
+    # Single-label.
+    # ─────────────────────────────────────────────────────────────────
+    # Normalise to ints if possible, else keep as strings.
+    def _coerce(x):
+        if isinstance(x, (int, np.integer)):
+            return int(x)
+        if isinstance(x, (float, np.floating)) and float(x).is_integer():
+            return int(x)
+        s = str(x).strip()
+        if re.fullmatch(r"-?\d+", s):
+            return int(s)
+        return s
+
+    scalar = [_coerce(x) for x in unwrapped]
+
+    # ── Case A: contract supplies class_order as a positional name map.
+    #   class_order[i] names class id i. Requires integer labels.
+    if contract.class_order is not None:
+        if not all(isinstance(v, int) for v in scalar):
+            raise ValueError(
+                "class_order was provided but labels are not integers. "
+                "Either drop class_order, or supply integer labels."
+            )
+        classes = list(contract.class_order)
+        y = np.asarray(scalar, dtype=np.int64)
+        if y.min() < 0 or y.max() >= len(classes):
+            raise ValueError(
+                f"Labels reach {y.max()} but class_order has only "
+                f"{len(classes)} entries (valid ids 0..{len(classes)-1})."
+            )
+        meta = {
+            "adapter": "custom",
+            "task_type": "single_label",
+            "raw_label_column": label_col,
+            "label_resolution": resolution,
+            "class_names": classes,
+            "class_count": len(classes),
+            "class_order_source": "contract",
+        }
+        return y, classes, meta
+
+    # ── Case B: derive the class list from the data.
+    #   Integers sort numerically; strings sort lexically.
+    def _sort_key(v):
+        if isinstance(v, int):
+            return (0, v, "")
+        return (1, 0, str(v))
+    unique = sorted(set(scalar), key=_sort_key)
+    classes = unique
+    mapping = {v: i for i, v in enumerate(unique)}
+    y = np.asarray([mapping[v] for v in scalar], dtype=np.int64)
+    meta = {
         "adapter": "custom",
         "task_type": "single_label",
         "raw_label_column": label_col,
         "label_resolution": resolution,
         "class_names": classes,
         "class_count": len(classes),
+        "class_order_source": "derived",
     }
+    return y, classes, meta
 
+def infer_target_type(df, contract):
+    if contract.target_type and contract.target_type != "auto":
+        return contract.target_type.lower()
 
-def build_targets(df: pd.DataFrame, contract: DatasetContract):
+    cols = set(map(str, df.columns))
+
+    # Dimensional: VAD columns, or an explicit vector column.
+    if {"V", "A", "D"}.issubset(cols):
+        return "dimensional"
+
+    if "labels" in cols:
+        sample = df["labels"].head(100).tolist()
+        try:
+            parsed = [parse_integer_list(x) for x in sample]
+            if any(len(v) > 1 for v in parsed):
+                return "goemotions"
+        except Exception:
+            pass
+        if not any(c in cols for c in ("emotion", "emotion_label", "dominant_emotion")):
+            return "goemotions"
+
+    return "custom"
+
+def build_targets(df, contract):
     target_type = infer_target_type(df, contract)
     if target_type == "goemotions":
         return canonical_goemotions_target(df, contract)
     if target_type == "isear":
         return canonical_isear_target(df, contract)
+    if target_type == "dimensional":
+        return canonical_dimensional_target(df, contract)
     if target_type == "custom":
         return canonical_custom_target(df, contract)
     raise ValueError(f"Unsupported target_type={target_type}")
-
 
 # -----------------------------------------------------------------------------
 # Provenance and target validation
@@ -1388,6 +1532,22 @@ def validate_targets(y, classes, task_type):
     y = np.asarray(y)
     if len(classes) < 2:
         issues.append("At least two classes are required")
+    if task_type == "dimensional":
+        y = np.asarray(y)
+        if y.ndim != 2:
+            issues.append(f"Dimensional target must be rank-2 [N, D], got {y.shape}")
+        elif not np.issubdtype(y.dtype, np.floating):
+            issues.append(f"Dimensional target must be float, got {y.dtype}")
+        elif not np.isfinite(y).all():
+            issues.append("Dimensional target contains NaN/Inf")
+        else:
+            for j, name in enumerate(classes):
+                col = y[:, j]
+                if col.std() < 1e-6:
+                    warnings.append(f"Dimension {name!r} has near-zero variance")
+        if issues:
+            raise RuntimeError("Target validation failed:\n- " + "\n- ".join(issues))
+        return {"status": "pass", "warnings": warnings, "class_count": y.shape[1]}
     if task_type == "single_label":
         if y.ndim != 1:
             issues.append(f"Single-label target must be rank-1, got {y.shape}")
@@ -2345,6 +2505,13 @@ class UnifiedProbeAnalyzer:
         self.label_alignment    = validate_label_alignment(
             artifact, self.df, config.dataset, self.y, self.classes
         )
+        self._row_perm, self._alignment_mode = self._strict_text_join()
+
+        # build_targets returns labels in CSV order. Reindex to hidden_state order.
+        y_csv, classes, meta = build_targets(self.df, self.config.dataset)
+        self.y          = y_csv[self._row_perm]
+        self.classes    = classes
+        self.target_meta = meta
 
         if self.text_alignment.get("verified") and not self.label_alignment.get("verified"):
             self.label_alignment["verification_basis"] = (
@@ -2450,7 +2617,69 @@ class UnifiedProbeAnalyzer:
             out.append(name)
         return sorted(set(out), key=parse_layer_number)
 
+    import hashlib
+    from collections import defaultdict
+
+    def _strict_text_join(self) -> tuple[np.ndarray, str]:
+        """
+        Returns (perm, mode):
+            hidden_states[j]  ↔  CSV row perm[j]
+
+        Raises RuntimeError if a bijection cannot be established.
+        Never falls back to positional indexing on failure.
+        """
+        if self.artifact.text_hashes is None:
+            raise RuntimeError(
+                "text_hashes.npy is missing. This extraction predates the "
+                "alignment guarantee. Re-run extraction for this (model, dataset)."
+            )
+
+        text_col = self.text_alignment["text_column"]
+        csv_texts = one_dim_strings(self.df[text_col].tolist())
+
+        csv_hashes = np.empty((len(csv_texts), 32), dtype=np.uint8)
+        for i, t in enumerate(csv_texts):
+            csv_hashes[i] = np.frombuffer(
+                hashlib.sha256(str(t).encode("utf-8")).digest(), dtype=np.uint8
+            )
+
+        stored = np.asarray(self.artifact.text_hashes)
+        if stored.shape != csv_hashes.shape:
+            raise RuntimeError(
+                f"Row-count mismatch: hidden_states has {stored.shape[0]} rows, "
+                f"CSV has {csv_hashes.shape[0]}. The CSV has drifted since extraction."
+            )
+
+        # Fast path: perfect positional identity. 99% of runs take this.
+        if np.array_equal(stored, csv_hashes):
+            return np.arange(len(stored), dtype=np.int64), "positional_identity"
+
+        # Slow path: content-addressed join. Same complexity, O(N) once.
+        csv_index: dict[bytes, list[int]] = defaultdict(list)
+        for i in range(len(csv_hashes)):
+            csv_index[csv_hashes[i].tobytes()].append(i)
+
+        perm = np.empty(len(stored), dtype=np.int64)
+        for j in range(len(stored)):
+            key = stored[j].tobytes()
+            candidates = csv_index.get(key, [])
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"hidden_states row {j} has a text hash that appears in "
+                    f"{len(candidates)} CSV rows. Cannot establish a bijection. "
+                    f"Refusing to probe — this would silently mis-align labels."
+                )
+            perm[j] = candidates[0]
+
+        if len(set(perm.tolist())) != len(perm):
+            raise RuntimeError(
+                "Two hidden_state rows matched the same CSV row. "
+                "The CSV contains duplicates that extraction did not see."
+            )
+
+        return perm, "hash_join"
     def _preflight(self):
+        
         self.config.split.validate()
         for p in self.config.probes:
             validate_probe_spec(p, self.task_type)

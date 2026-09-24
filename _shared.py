@@ -17,6 +17,8 @@ import json, os, time, hashlib
 import numpy as np
 
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Canonical roots
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,6 +32,19 @@ DATASETS_ROOT       = AMIRALI_MOUNT / "datasets"
 # `PROBE_ROOT` is kept as an alias so existing imports in Probe.py keep
 # working without a rename.  It points at the interEx tree.
 PROBE_ROOT = INTEREX_ROOT
+
+# Extraction run metadata (manifest, ledger, environment, results).
+# Historically lived in Probing-Emotions/; now it lives beside the tensors
+# it describes. Underscore prefix keeps it out of the model-scan glob.
+EXTRACTION_META_ROOT = HIDDEN_STATES_ROOT / "_meta"
+
+# HuggingFace cache. Top-level so it survives any extraction-root rename.
+HF_CACHE_ROOT    = AMIRALI_MOUNT / ".hf_cache"
+HF_HUB_CACHE     = HF_CACHE_ROOT / "hub"
+HF_XET_CACHE     = HF_CACHE_ROOT / "xet"
+HF_ASSETS_CACHE  = HF_CACHE_ROOT / "assets"
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +86,21 @@ def analysis_dir_for_probe(run_key_dir: Path) -> Path:
     return d
 
 
+
+        
+def _fsync_dir(p: Path) -> None:
+    """Make the directory entry durable. Must be called AFTER os.replace."""
+    fd = os.open(str(p), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+        
+        
+        
+        
+        
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Atomic writers
 #
@@ -95,6 +125,7 @@ def atomic_json(path: Path, payload: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
 
 
 def atomic_npz(path: Path, **arrays) -> None:
@@ -115,6 +146,7 @@ def atomic_npz(path: Path, **arrays) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,3 +278,225 @@ def read_block(states, sample_idx, chunk_rows: int = 1500):
         idx = sample_idx_sorted[start:start + chunk_rows]
         X = np.asarray(states[idx], dtype=np.float32)
         yield idx, X
+        
+        
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset schema & contract resolution  (SINGLE SOURCE OF TRUTH)
+#
+# Three tiers of intervention. A dataset that appears in NO dict still works:
+# contract_dict_for returns target_type="custom", class_order=None, and every
+# other field comes from the auto-generated schema sidecar.
+#
+#   Tier 1 — target_type override
+#       KNOWN_TARGET_TYPES. Use only when the dataset needs a specialist
+#       adapter (goemotions, isear, dimensional) rather than "custom".
+#
+#   Tier 2 — canonical vocabulary
+#       KNOWN_CLASS_ORDERS (categorical) or KNOWN_DIMENSION_NAMES
+#       (dimensional). Use when the integer labels have a fixed meaning
+#       that matters for cross-model comparison.
+#
+#   Tier 3 — auto-detector escape hatch
+#       SCHEMA_OVERRIDES. Use only when master_dataset.SchemaDetector picks
+#       the wrong column or task_type and you cannot fix the source CSV.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from typing import Any
+
+
+# ── Tier 1: target_type overrides ──────────────────────────────────────────
+KNOWN_TARGET_TYPES: dict[str, str] = {
+    "goemo":    "goemotions",     # 0..27, multi-label
+    "isear":    "isear",          # 1..7,  single-label, 1-based IDs
+    "emobank":  "dimensional",    # VAD regression
+}
+
+# ── Tier 2a: categorical vocabularies ─────────────────────────────────────
+# Positional: index i names class id i. Length must equal the class count.
+# Numeric labels must be 0-based; the adapter raises if they aren't.
+KNOWN_CLASS_ORDERS: dict[str, tuple[str, ...]] = {
+    "goemo": (
+        "admiration", "amusement", "anger", "annoyance", "approval", "caring",
+        "confusion", "curiosity", "desire", "disappointment", "disapproval",
+        "disgust", "embarrassment", "excitement", "fear", "gratitude", "grief",
+        "joy", "love", "nervousness", "optimism", "pride", "realization",
+        "relief", "remorse", "sadness", "surprise", "neutral",
+    ),
+    "isear": ("joy", "fear", "anger", "sadness", "disgust", "shame", "guilt"),
+    "emotion": (
+        "sadness", "joy", "love", "anger", "fear", "surprise",
+    ),
+    "tweet_eval_emotion": ("anger", "joy", "optimism", "sadness"),
+    "sst2": ("negative", "positive"),
+    "amazon_polarity": ("negative", "positive"),
+}
+
+# ── Tier 2b: dimensional vocabularies ─────────────────────────────────────
+KNOWN_DIMENSION_NAMES: dict[str, tuple[str, ...]] = {
+    "emobank": ("valence", "arousal", "dominance"),
+}
+
+# ── Tier 3: auto-detector escape hatches ──────────────────────────────────
+SCHEMA_OVERRIDES: dict[str, dict[str, object]] = {
+    # "some_weird_dataset": {"text_column": "sentence", "label_column": "gold"},
+}
+
+
+# In-process cache. Invalidated by invalidate_schema_cache().
+_SCHEMA_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def dataset_schema_path(dataset_name: str) -> Path:
+    """Where master_dataset.py writes its schema sidecar."""
+    return DATASETS_ROOT / dataset_name / "schema.json"
+
+
+def _processed_csv_for(dataset_name: str) -> Path | None:
+    base = DATASETS_ROOT / dataset_name / "processed"
+    for cand in (f"{dataset_name}_clean.csv", f"{dataset_name}.csv"):
+        p = base / cand
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+def load_dataset_schema(
+    dataset_name: str, *, use_cache: bool = True
+) -> dict[str, Any]:
+    """Read the schema sidecar written by master_dataset.py. {} if absent."""
+    if use_cache and dataset_name in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[dataset_name]
+    p = dataset_schema_path(dataset_name)
+    if not p.is_file():
+        return {}
+    try:
+        schema = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if use_cache:
+        _SCHEMA_CACHE[dataset_name] = schema
+    return schema
+
+
+def ensure_dataset_schema(dataset_name: str) -> dict[str, Any]:
+    """Return the schema for a dataset, computing it if the sidecar is missing.
+
+    Reads the sidecar if present. Otherwise runs master_dataset.SchemaDetector
+    on the processed CSV and writes the sidecar. Returns {} if there is no
+    processed CSV to sample — the caller then falls back to contract defaults.
+    """
+    schema = load_dataset_schema(dataset_name)
+    if (
+        schema
+        and schema.get("text_column")
+        and schema.get("task_type") not in (None, "unknown")
+    ):
+        return schema
+
+    csv_path = _processed_csv_for(dataset_name)
+    if csv_path is None:
+        return schema
+
+    try:
+        import master_dataset as md
+    except Exception:
+        return schema
+
+    try:
+        sample = md.DatasetLoader.read_rows_only(
+            csv_path, 5_000, mode="random", seed=42
+        )
+        if sample.empty:
+            return schema
+
+        detector = md.SchemaDetector(md.Renderer(quiet=True, no_visuals=True))
+        detection = detector.detect(sample)
+
+        if detection.label_column:
+            try:
+                label_series = sample[detection.label_column].map(
+                    md.LabelNormalizer.parse
+                )
+                task_type, class_count = md.infer_task_and_class_count(label_series)
+                detection.task_type = task_type
+                detection.class_count = class_count
+            except Exception:
+                pass
+
+        md.write_schema_sidecar(dataset_name, detection)
+        _SCHEMA_CACHE.pop(dataset_name, None)
+        return load_dataset_schema(dataset_name, use_cache=False)
+    except Exception as exc:
+        print(f"[_shared] could not compute schema for {dataset_name!r}: {exc}")
+        return schema
+
+
+def contract_dict_for(dataset_name: str) -> dict[str, Any]:
+    """Resolve a dataset name to a DatasetContract kwargs dict.
+
+    Resolution order:
+        1. schema sidecar (text_column, label_column, task_type)
+        2. KNOWN_TARGET_TYPES (target_type override)
+        3. KNOWN_CLASS_ORDERS / KNOWN_DIMENSION_NAMES (canonical vocabulary)
+        4. SCHEMA_OVERRIDES (manual escape hatch, applied last)
+
+    Every dataset — including ones never seen before — gets a valid contract.
+    A dataset with no entry in any dict returns:
+        target_type="custom", task_type from the sidecar, class_order=None.
+    """
+    schema = ensure_dataset_schema(dataset_name)
+
+    # ── Tier 1: target_type ──
+    target_type = KNOWN_TARGET_TYPES.get(dataset_name, "custom")
+
+    # ── task_type: fixed by target_type when that type is specialised. ──
+    FIXED_TASK_TYPES = {
+        "goemotions":  "multi_label",
+        "isear":       "single_label",
+        "dimensional": "dimensional",
+    }
+    task_type = (
+        FIXED_TASK_TYPES.get(target_type)
+        or schema.get("task_type")
+        or "auto"
+    )
+    if task_type == "unknown":
+        task_type = "auto"
+
+    # ── Tier 2: class_order / dimension names. ──
+    if target_type == "dimensional":
+        dims = KNOWN_DIMENSION_NAMES.get(dataset_name)
+        class_order = list(dims) if dims else None
+    else:
+        names = KNOWN_CLASS_ORDERS.get(dataset_name)
+        class_order = list(names) if names else None
+
+    contract: dict[str, Any] = {
+        "target_type":  target_type,
+        "text_column":  schema.get("text_column")  or "auto",
+        "label_column": schema.get("label_column") or "auto",
+        "id_column":    "auto",
+        "task_type":    task_type,
+        "label_format": "auto",
+        "class_order":  class_order,
+        "single_label_policy": "first_label" if task_type == "multi_label" else None,
+        "require_provenance":               True,
+        "require_label_fingerprint":        False,
+        "lenient_provenance":               False,
+        "allow_missing_label_fingerprint":  True,
+    }
+
+    # ── Tier 3: escape hatch applied last. ──
+    contract.update(SCHEMA_OVERRIDES.get(dataset_name, {}))
+    return contract
+
+
+def invalidate_schema_cache(dataset_name: str | None = None) -> None:
+    """Drop the cache. Call after reprocessing a dataset."""
+    if dataset_name is None:
+        _SCHEMA_CACHE.clear()
+    else:
+        _SCHEMA_CACHE.pop(dataset_name, None)

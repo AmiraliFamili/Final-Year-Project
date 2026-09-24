@@ -181,61 +181,73 @@ def within_class_dispersion(X: np.ndarray, y: np.ndarray, n_classes: int) -> np.
 # Per-layer orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
+# geometry.py — per_layer_geometry (replaces the existing function)
+
 def per_layer_geometry(
-    states: np.ndarray,              # memmap [N, L, D]
+    states: np.ndarray,              # memmap [N, L, D], C-order
     y: np.ndarray,                   # [N] int64
     n_classes: int,
     *,
     sample_idx: np.ndarray | None = None,
     silhouette_cap: int = SILHOUETTE_CAP,
     seed: int = SEED,
+    memory_budget_bytes: int = 500_000_000,   # 500 MB ceiling for X_all
 ) -> pd.DataFrame:
-    """
-    One row per layer. Columns describe the emotional geometry of that layer.
+    """One row per layer. Columns describe the emotional geometry.
 
-    The `sample_idx` argument is the mechanism that keeps this analysis cheap.
-    Instead of computing centroids over all N samples (which on Amazon
-    Polarity would be 4M), we compute them over the same bounded subsample
-    for every layer. The subsample is deterministic (rng with fixed seed),
-    so re-running the analysis produces identical numbers.
-
-    Row schema (all columns present regardless of model size):
-        layer_index            : 0-based index of the layer
-        relative_depth         : layer_index / (L - 1), a [0, 1] coordinate
-        mean_pairwise_centroid : mean of the non-diagonal entries of the
-                                 pairwise centroid distance matrix
-        min_pairwise_centroid  : the two most-similar emotions in this layer
-        max_pairwise_centroid  : the two most-distinct emotions in this layer
-        mean_within_dispersion : mean of the per-class dispersions
-        separation_ratio       : mean_pairwise_centroid / mean_within_dispersion
-                                 — the single number we plot as a depth curve
-        silhouette             : sklearn silhouette score, in [-1, 1]
+    Performance note
+    ----------------
+    `states` is a C-order memmap [N, L, D].  Naive per-layer indexing
+    (`states[sample_idx, l, :]`) forces 5000 seek-and-read-4KB operations
+    per layer, which on an external HDD is catastrophic.  We therefore
+    materialise every sampled row ONCE with a single contiguous read
+    (`states[sample_idx]`, which walks the file sequentially), then slice
+    that array in memory per layer.  For Qwen3-0.6B-Base on 5000 samples
+    this is ~590 MB; if that exceeds the memory budget, we down-sample.
     """
     if sample_idx is None:
         sample_idx = np.arange(len(y))
+    sample_idx = np.sort(np.asarray(sample_idx))
+
+    n_layers    = states.shape[1]
+    hidden_size = states.shape[2]
+
+    # ── Bound the memory footprint. ──
+    bytes_per_sample = n_layers * hidden_size * 4   # float32
+    max_samples_by_memory = max(500, memory_budget_bytes // max(1, bytes_per_sample))
+
+    if len(sample_idx) > max_samples_by_memory:
+        print(f"[geom] reducing sample_idx {len(sample_idx)} → {max_samples_by_memory} "
+              f"to keep X_all under {memory_budget_bytes / 1e6:.0f} MB")
+        rng = np.random.default_rng(seed)
+        sample_idx = np.sort(rng.choice(sample_idx, max_samples_by_memory, replace=False))
+
+    print(f"[geom] materialising {len(sample_idx)} samples × "
+          f"{n_layers} layers × {hidden_size} dims "
+          f"(≈ {len(sample_idx) * bytes_per_sample / 1e6:.0f} MB) …")
+    t0 = time.perf_counter()
+
+    # ── THE FIX: one contiguous read for all sampled rows. ──
+    # states[sample_idx] with an array index walks the file in row order.
+    # All 29 layers of each sample are read in a single 118 KB block, and
+    # consecutive sample indices are adjacent, so this is effectively a
+    # sequential read of the file's tail region that we care about.
+    X_all = np.asarray(states[sample_idx], dtype=np.float32)   # [M, L, D]
+
+    elapsed = time.perf_counter() - t0
+    print(f"[geom] read complete in {elapsed:.2f}s "
+          f"({len(sample_idx) * bytes_per_sample / max(elapsed, 1e-3) / 1e6:.1f} MB/s)")
+
+    ys = y[sample_idx]
 
     rows: list[dict] = []
+    for layer in range(n_layers):
+        X = X_all[:, layer, :]        # in-memory slice, no I/O
 
-    for layer in range(states.shape[1]):
-        # ── Step 1: materialise ONE layer's subsampled activations. ──
-        # states[sample_idx, layer, :] would copy the whole [M, D] block.
-        # For M=5000 and D=768, that is 15 MB. Fine. For D=3584, 72 MB.
-        # Still fine, and it is freed at the end of each loop iteration.
-        X = np.asarray(states[sample_idx, layer, :], dtype=np.float32)
-        ys = y[sample_idx]
-
-        # ── Step 2: centroids and their pairwise distances. ──
         ctr  = class_centroids(X, ys, n_classes)
         dmat = pairwise_centroid_distances(ctr)
-
-        # ── Step 3: within-class dispersion. ──
         disp = within_class_dispersion(X, ys, n_classes)
 
-        # ── Step 4: silhouette on a bounded sub-subsample. ──
-        # Silhouette is O(N²). We cap aggressively because it is the
-        # bottleneck. The value is a *relative* indicator, so a smaller
-        # sample is acceptable as long as the cap is consistent across
-        # layers and models.
         sil = float("nan")
         if len(sample_idx) > silhouette_cap:
             rng     = np.random.default_rng(seed + layer)
@@ -248,26 +260,17 @@ def per_layer_geometry(
             try:
                 sil = float(silhouette_score(Xs, ys_sil))
             except Exception:
-                # Degenerate cases (e.g. every sample in one class) leave
-                # silhouette as NaN and do not abort the analysis.
                 pass
 
-        # ── Step 5: assemble the row. ──
-        # We use np.nanmean / np.nanmin / np.nanmax so that absent classes
-        # (whose centroids are NaN) do not poison the aggregate statistics.
         mean_sep = float(np.nanmean(dmat)) if dmat.size else float("nan")
         min_sep  = float(np.nanmin(dmat))  if dmat.size else float("nan")
         max_sep  = float(np.nanmax(dmat))  if dmat.size else float("nan")
         mean_dis = float(np.nanmean(disp))
-
-        # Guard the ratio: if dispersion is zero (all samples of every class
-        # are identical), the ratio is undefined and we return NaN rather
-        # than inf, so downstream plotting does not draw a false spike.
-        ratio = mean_sep / mean_dis if mean_dis > 1e-9 else float("nan")
+        ratio    = mean_sep / mean_dis if mean_dis > 1e-9 else float("nan")
 
         rows.append({
             "layer_index":            layer,
-            "relative_depth":         layer / max(1, states.shape[1] - 1),
+            "relative_depth":         layer / max(1, n_layers - 1),
             "mean_pairwise_centroid": mean_sep,
             "min_pairwise_centroid":  min_sep,
             "max_pairwise_centroid":  max_sep,
@@ -275,6 +278,9 @@ def per_layer_geometry(
             "separation_ratio":       ratio,
             "silhouette":             sil,
         })
+
+    # Free the big buffer before the caller continues.
+    del X_all
 
     return pd.DataFrame(rows)
 
