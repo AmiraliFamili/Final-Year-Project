@@ -16,6 +16,15 @@ probing alone cannot provide.
 Feasibility note. Training an SAE on a 5000 × 768 matrix for 10,000 steps 
 takes ~30 minutes on CPU. It is expensive but not prohibitive for a handful of (model, layer) pairs."""
 
+# ── Path bootstrap: keep `from _shared import ...` working from expl/ ──
+import sys as _sys
+from pathlib import Path as _Path
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_PROJECT_ROOT))
+# ──────────────────────────────────────────────────────────────────────
+
+
 
 
 

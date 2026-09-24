@@ -15,6 +15,15 @@ Caveat. The J-lens is currently demonstrated on Claude Opus 4.6 and Qwen 3.6 27B
 not a drop-in. If your time budget allows, this is the highest-risk, highest-reward technique on this list.
 """
 
+# ── Path bootstrap: keep `from _shared import ...` working from expl/ ──
+import sys as _sys
+from pathlib import Path as _Path
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_PROJECT_ROOT))
+# ──────────────────────────────────────────────────────────────────────
+
+
 
 
 # this is an ongoing area of research with only test on Claude Opus 4.6 and Qwen 3.6 27B 

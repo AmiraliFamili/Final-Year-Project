@@ -166,7 +166,7 @@ def discover_probe_runs(root: Path | None = None) -> pd.DataFrame:
 
 def _run_extraction_level_techniques(force: bool, dry_run: bool) -> None:
     from _shared import HIDDEN_STATES_ROOT
-    import geometry, geometry_multilabel, cka
+    import expl.geometry as geometry, geometry_multilabel, cka
 
     for model_slug_, dataset, _ in _iter_extraction_pairs(HIDDEN_STATES_ROOT):
         from _shared import analysis_dir_for_extraction
@@ -198,7 +198,7 @@ def _run_extraction_level_techniques(force: bool, dry_run: bool) -> None:
 
 def _run_cross_model_cka(force: bool, dry_run: bool) -> None:
     from _shared import HIDDEN_STATES_ROOT, INTEREX_ROOT
-    import cka
+    import expl.cka as cka
 
     slugs: list[str] = []
     for model_dir in sorted(p for p in HIDDEN_STATES_ROOT.iterdir() if p.is_dir()):
@@ -224,7 +224,7 @@ def _run_cross_model_cka(force: bool, dry_run: bool) -> None:
 def _run_attention(force: bool, dry_run: bool) -> None:
     from _shared import HIDDEN_STATES_ROOT, MODELS_ROOT, DATASETS_ROOT
     from _shared import analysis_dir_for_extraction
-    import attention
+    import expl.attention as attention
 
     for model_slug_, dataset, _ in _iter_extraction_pairs(HIDDEN_STATES_ROOT):
         if not (MODELS_ROOT / model_slug_).is_dir():
@@ -266,9 +266,9 @@ def _run_attention(force: bool, dry_run: bool) -> None:
 
 def _run_probe_level_techniques(force: bool, dry_run: bool) -> None:
     from _shared import DATASETS_ROOT, load_labels
-    import tcav
+    import expl.tcav as tcav
     try:
-        import protopics
+        import expl.protopics as protopics
     except ImportError:
         protopics = None
 

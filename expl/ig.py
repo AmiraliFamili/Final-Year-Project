@@ -1,4 +1,13 @@
 from __future__ import annotations
+
+# ── Path bootstrap: keep `from _shared import ...` working from expl/ ──
+import sys as _sys
+from pathlib import Path as _Path
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_PROJECT_ROOT))
+# ──────────────────────────────────────────────────────────────────────
+
 """
 Integrated Gradients through the probe
 

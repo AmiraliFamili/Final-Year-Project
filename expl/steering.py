@@ -13,6 +13,15 @@ and that hybrid approaches are needed in practice. Another 2026 paper introduces
 These are directly relevant: they tell you that steering is powerful but fragile, and you must report both the steering effect and its side effects.
 """
 
+# ── Path bootstrap: keep `from _shared import ...` working from expl/ ──
+import sys as _sys
+from pathlib import Path as _Path
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_PROJECT_ROOT))
+# ──────────────────────────────────────────────────────────────────────
+
+
 
 def steering_effect(
     model, tokenizer, probe, layer_index, direction, text, device="cpu",

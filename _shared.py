@@ -476,8 +476,11 @@ def contract_dict_for(dataset_name: str) -> dict[str, Any]:
 
     contract: dict[str, Any] = {
         "target_type":  target_type,
-        "text_column":  schema.get("text_column")  or "auto",
-        "label_column": schema.get("label_column") or "auto",
+        # Enforced by PROCESSED_COLUMNS in Extraction.py. The schema sidecar
+        # records the RAW column names (text, labels, ...) which do not exist
+        # in the processed CSV. Ignore them here.
+        "text_column":  "clean_text",
+        "label_column": "label",
         "id_column":    "auto",
         "task_type":    task_type,
         "label_format": "auto",
