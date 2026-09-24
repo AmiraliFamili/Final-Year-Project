@@ -2397,21 +2397,22 @@ def build_trial_config(artifact, config):
 
 def generate_trial_hash(config_dict: dict) -> str:
     return stable_hash(config_dict, length=12)
+def _cfg_model_name(config_dict: dict) -> str:
+    """Read model_name from either layout. New layout: top level.
+    Old layout: nested under 'extraction'."""
+    ext = config_dict.get("extraction", {}) or {}
+    return str(config_dict.get("model_name") or ext.get("model_name") or "unknown")
 
-def build_probe_run_key(
-    config_dict: dict,
-    trial_hash: str,
-    *,
-    max_prefix_len: int = 140,
-) -> str:
-    """Human-readable + unique probe-run folder name.
 
-    Format:
-        <model>__<dataset>__<probes>__L<n_layers>__R<repeats>__S<max>__h<hash10>
-    """
-    ext = config_dict["extraction"]
-    model  = ext["model_name"].replace("/", "-").replace("__", "-")
-    dataset = ext["dataset_name"]
+def _cfg_dataset_name(config_dict: dict) -> str:
+    ext = config_dict.get("extraction", {}) or {}
+    return str(config_dict.get("dataset_name") or ext.get("dataset_name") or "unknown")
+
+
+def build_probe_run_key(config_dict, trial_hash, *, max_prefix_len=140):
+    ext     = config_dict.get("extraction", {}) or {}
+    model   = _cfg_model_name(config_dict).replace("/", "-").replace("__", "-")
+    dataset = _cfg_dataset_name(config_dict)
     probes  = "+".join(p["name"] for p in config_dict["probes"])
     layers  = ext.get("hidden_layers", "?")
     repeats = config_dict["analysis"]["repeats"]
@@ -2420,17 +2421,15 @@ def build_probe_run_key(
     if len(prefix) > max_prefix_len:
         prefix = prefix[: max_prefix_len - 12]
     return f"{prefix}__h{trial_hash[:10]}"
-def build_trial_dir_name(
-    config_dict: dict,
-    trial_hash: str,
-    max_path_length: int = 200,
-) -> str:
-    ext = config_dict["extraction"]
-    model_part = ext["model_name"].replace("/", "_")
-    dataset_part = ext["dataset_name"]
-    probes = "+".join([p["name"] for p in config_dict["probes"]])
-    max_samples = config_dict["analysis"]["max_samples"] or "full"
-    repeats = config_dict["analysis"]["repeats"]
+
+
+def build_trial_dir_name(config_dict, trial_hash, max_path_length=200):
+    model_part   = _cfg_model_name(config_dict).replace("/", "_")
+    dataset_part = _cfg_dataset_name(config_dict)
+    ext          = config_dict.get("extraction", {}) or {}
+    probes       = "+".join(p["name"] for p in config_dict["probes"])
+    max_samples  = config_dict["analysis"]["max_samples"] or "full"
+    repeats      = config_dict["analysis"]["repeats"]
     name = (
         f"probe_run__{model_part}__{dataset_part}"
         f"__max{max_samples}__rep{repeats}__probes={probes}__hash{trial_hash}"
@@ -2440,16 +2439,44 @@ def build_trial_dir_name(
         name = f"{prefix}...{trial_hash}"
     return name
 
-
-def find_any_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
-    """Return any run_dir whose trial_cfg hashes to comp_hash, complete or not."""
+def find_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
+    """Return a *completed* run folder whose config hashes to comp_hash."""
     for pattern in ("probe_run__*", "*__h*"):
         for run_dir in base_dir.glob(pattern):
             if not run_dir.is_dir():
                 continue
-            # Prefer the completed metadata, fall back to the progress file.
             meta_path = run_dir / "complete_run_metadata.json"
-            cfg: dict | None = None
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text())
+                stored = meta.get("extra_info", {}).get("computational_hash")
+                if stored is None:
+                    trial_cfg = meta.get("extra_info", {}).get("trial_config")
+                    if trial_cfg:
+                        stored = generate_trial_hash(
+                            compute_computational_trial_config(trial_cfg)
+                        )
+                if stored == comp_hash:
+                    return run_dir
+            except Exception:
+                continue
+    return None
+
+
+def find_any_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
+    """Return any run folder (complete or partial) whose config hashes to comp_hash.
+
+    Partial runs are recovered by comparing the trial_cfg stored in
+    complete_run_metadata.json OR in the progress.json of an interrupted run.
+    """
+    for pattern in ("probe_run__*", "*__h*"):
+        for run_dir in base_dir.glob(pattern):
+            if not run_dir.is_dir():
+                continue
+
+            cfg = None
+            meta_path = run_dir / "complete_run_metadata.json"
             if meta_path.exists():
                 try:
                     meta = json.loads(meta_path.read_text())
@@ -2457,11 +2484,11 @@ def find_any_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
                 except Exception:
                     cfg = None
             if cfg is None:
-                prog = run_dir / "progress.json"
-                if prog.exists():
-                    # No trial_cfg in progress.json — skip, can't compare.
-                    continue
-            if cfg is None:
+                # Interrupted runs do not write complete_run_metadata.json.
+                # We can still infer identity from the folder name's hash.
+                m = re.search(r"__h([a-f0-9]{10})", run_dir.name)
+                if m and m.group(1) == comp_hash[:10]:
+                    return run_dir
                 continue
             stored = generate_trial_hash(compute_computational_trial_config(cfg))
             if stored == comp_hash:
