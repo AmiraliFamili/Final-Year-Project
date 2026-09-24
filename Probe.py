@@ -2352,47 +2352,45 @@ def compute_computational_trial_config(config_dict: dict) -> dict:
     return comp
 
 
-def build_trial_config(
-    artifact: ExtractionArtifact,
-    config: AnalysisConfig,
-) -> dict:
+def build_trial_config(artifact, config):
     dataset_contract = asdict(config.dataset)
     dataset_contract.pop("allow_missing_label_fingerprint", None)
+
+    ext = artifact.metadata.get("extraction", {})
+    extraction_identity = {
+        "pooling":       artifact.pooling,
+        "max_length":    ext.get("max_length"),
+        "batch_size":    ext.get("batch_size"),
+        "storage_dtype": ext.get("storage_dtype"),
+        "hidden_layers": artifact.hidden_layers,
+        "hidden_size":   artifact.hidden_size,
+    }
+
     return {
-        "extraction": {
-            "model_name":          artifact.model_name,
-            "dataset_name":        artifact.dataset_name,
-            "experiment_id":       artifact.experiment_id,
-            "pooling":             artifact.pooling,
-            "max_length":          artifact.metadata.get("extraction", {}).get("max_length"),
-            "batch_size":          artifact.metadata.get("extraction", {}).get("batch_size"),
-            "storage_dtype":       artifact.metadata.get("extraction", {}).get("storage_dtype"),
-            "hidden_layers":       artifact.hidden_layers,
-            "hidden_size":         artifact.hidden_size,
-            "dataset_fingerprint": artifact.dataset_fingerprint,
-            "model_snapshot":      artifact.metadata.get("model", {}).get("snapshot"),
-        },
+        "extraction":   extraction_identity,
+        "model_name":   artifact.model_name,
+        "dataset_name": artifact.dataset_name,
         "dataset_contract": dataset_contract,
-        "probes":           [asdict(p) for p in config.probes],
-        "split":            asdict(config.split),
-        "analysis": {
-            "layers":                     config.layers,
-            "repeats":                    config.repeats,
-            "max_samples":                config.max_samples,
-            "shuffled_label_control":     config.shuffled_label_control,
-            "shuffled_control_repeats":   config.shuffled_control_repeats,
-            "run_control_on_all_layers":  config.run_control_on_all_layers,
-            "pca_enabled":                config.pca_enabled,
-            "pca_samples":                config.pca_samples,
-            "silhouette_enabled":         config.silhouette_enabled,
-            "silhouette_samples":         config.silhouette_samples,
-            "enable_abstention":          config.enable_abstention,
-            "enable_per_class_metrics":   config.enable_per_class_metrics,
-            "enable_feature_statistics":  config.enable_feature_statistics,
-            "score_weights":              config.score_weights,
-            "complexity_penalty_scale":   config.complexity_penalty_scale,
-            "output_subdir":              config.output_subdir,
-            "verbose":                    config.verbose,
+        "probes":       [asdict(p) for p in config.probes],
+        "split":        asdict(config.split),
+        "analysis":     {
+            "layers":                    config.layers,
+            "repeats":                   config.repeats,
+            "max_samples":               config.max_samples,
+            "shuffled_label_control":    config.shuffled_label_control,
+            "shuffled_control_repeats":  config.shuffled_control_repeats,
+            "run_control_on_all_layers": config.run_control_on_all_layers,
+            "pca_enabled":               config.pca_enabled,
+            "pca_samples":               config.pca_samples,
+            "silhouette_enabled":        config.silhouette_enabled,
+            "silhouette_samples":        config.silhouette_samples,
+            "enable_abstention":         config.enable_abstention,
+            "enable_per_class_metrics":  config.enable_per_class_metrics,
+            "enable_feature_statistics": config.enable_feature_statistics,
+            "score_weights":             config.score_weights,
+            "complexity_penalty_scale":  config.complexity_penalty_scale,
+            "output_subdir":             config.output_subdir,
+            "verbose":                   config.verbose,
         },
         "probe_version": SCRIPT_VERSION,
     }
@@ -2443,31 +2441,31 @@ def build_trial_dir_name(
     return name
 
 
-def find_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
-    """Return the probe-run directory whose stored config hashes to comp_hash.
-
-    Supports both the legacy "probe_run__*" prefix and the new layout,
-    because a project in transition will have both.
-    """
-    patterns = ("probe_run__*", "*__h*")   # legacy + new
-    for pattern in patterns:
+def find_any_matching_run_dir(base_dir: Path, comp_hash: str) -> Path | None:
+    """Return any run_dir whose trial_cfg hashes to comp_hash, complete or not."""
+    for pattern in ("probe_run__*", "*__h*"):
         for run_dir in base_dir.glob(pattern):
+            if not run_dir.is_dir():
+                continue
+            # Prefer the completed metadata, fall back to the progress file.
             meta_path = run_dir / "complete_run_metadata.json"
-            if not meta_path.exists():
+            cfg: dict | None = None
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                    cfg = meta.get("extra_info", {}).get("trial_config")
+                except Exception:
+                    cfg = None
+            if cfg is None:
+                prog = run_dir / "progress.json"
+                if prog.exists():
+                    # No trial_cfg in progress.json — skip, can't compare.
+                    continue
+            if cfg is None:
                 continue
-            try:
-                meta = json.loads(meta_path.read_text())
-                stored = meta.get("extra_info", {}).get("computational_hash")
-                if stored is None:
-                    trial_cfg = meta.get("extra_info", {}).get("trial_config")
-                    if trial_cfg:
-                        stored = generate_trial_hash(
-                            compute_computational_trial_config(trial_cfg)
-                        )
-                if stored == comp_hash:
-                    return run_dir
-            except Exception:
-                continue
+            stored = generate_trial_hash(compute_computational_trial_config(cfg))
+            if stored == comp_hash:
+                return run_dir
     return None
 
 
@@ -2536,6 +2534,8 @@ class UnifiedProbeAnalyzer:
         if not output_dir.exists():
             comp_hash = generate_trial_hash(compute_computational_trial_config(trial_cfg))
             existing  = find_matching_run_dir(base_output, comp_hash)
+            if existing is None:
+                existing = find_any_matching_run_dir(base_output, comp_hash)
             if existing is not None:
                 self.logger.emit(f"Found existing run with matching config: {existing}")
                 existing.rename(output_dir)
